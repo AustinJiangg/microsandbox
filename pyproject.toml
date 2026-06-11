@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microsandbox"
+version = "0.0.1"
+description = "一个从零实现、逐步逼近 E2B 的学习用代码沙箱"
+readme = "README.md"
+requires-python = ">=3.11"
+# 阶段 0 刻意零运行时依赖，只用标准库，降低初学门槛。
+# 后续阶段按需添加（如阶段 1 的 docker，阶段 2+ 可选的 fastapi/uvicorn）。
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+microsandbox-daemon = "microsandbox.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microsandbox"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
