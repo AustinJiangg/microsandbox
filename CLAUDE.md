@@ -25,16 +25,18 @@
 
 ## 分阶段路线图（当前进度见 docs/ROADMAP.md）
 
-- [x] **阶段 0**：本机子进程后端，跑通 client/protocol/daemon 骨架 ← **当前在这里**
-- [ ] **阶段 1**：Docker 容器后端（真正的隔离起点）
+- [x] **阶段 0**：本机子进程后端，跑通 client/protocol/daemon 骨架
+- [x] **阶段 1**：Docker 容器后端（真正的隔离起点）← **当前在这里**
 - [ ] **阶段 2**：容器内常驻 agent + 有状态 REPL（对齐 E2B 的 envd）
 - [ ] **阶段 3**：Firecracker microVM 后端
 - [ ] **阶段 4**：产品化外围（沙箱池、模板、鉴权等）
 
 ## 开发约定
 
-- Python ≥ 3.11，阶段 0 **零运行时依赖**（只用标准库）。新依赖必须在
+- Python ≥ 3.11，阶段 0/1 **零运行时依赖**（只用标准库）。新依赖必须在
   对应阶段才引入，并写明理由。
+- 阶段 1 决策：调 Docker 走 `docker` CLI + asyncio 子进程，**不引入 docker-py**
+  ——保持零依赖，且 docker-py 是同步库，放进 asyncio daemon 必须套线程池，反而更绕。
 - 注释用中文，解释「为什么」而非「是什么」，尤其标注「未来哪个阶段会替换此处」。
 - 每个阶段都要保证 `tests/` 全绿。测试是跨阶段重构的安全网。
 - 安全红线：阶段 0/1 的隔离不足以运行不可信代码，**严禁**在文档或代码里
@@ -49,11 +51,18 @@ pip install -e ".[dev]"
 # 运行示例（自动起停 daemon）
 python examples/quickstart.py
 
-# 手动单独起 daemon
-python -m microsandbox.server --port 49152
+# 阶段 1 前置（一次性）：拉基础镜像
+docker pull python:3.12-slim
 
-# 跑测试
+# 手动单独起 daemon（--backend docker 用容器隔离，默认 local）
+python -m microsandbox.server --port 49152
+python -m microsandbox.server --backend docker
+
+# 跑测试（自动参数化 local/docker 双后端；无 docker 时容器侧自动 skip）
 pytest
+
+# 清理残留的执行容器（正常情况不会有，daemon 被 kill -9 后可能残留）
+docker ps -a --filter name=microsandbox-exec -q | xargs -r docker rm -f
 
 # 跑单个测试
 pytest tests/test_sandbox.py::test_timeout -v

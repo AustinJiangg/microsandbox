@@ -19,20 +19,26 @@
 
 ---
 
-## ⬜ 阶段 1：Docker 容器隔离
+## ✅ 阶段 1：Docker 容器隔离（已完成）
 
 **学习目标**：第一次真正的隔离。理解文件系统/网络隔离、cgroups 资源限制、容器生命周期。
 
-要做的事：
-1. 新增 `DockerBackend(ExecutionBackend)`，用 docker SDK 或 `subprocess` 调 `docker`。
-2. 每次执行（或每个 Sandbox）对应一个容器：
-   - 镜像：先用官方 `python:3.x-slim`。
-   - 限制：`--memory`、`--cpus`、`--network none`、`--pids-limit`、只读根 + 临时可写层。
-   - 执行：把代码写入容器内文件再跑，或通过 stdin 传入。
-3. `client._spawn_daemon` 改为「创建并启动容器」，地址指向容器。
-4. 超时与清理：超时杀容器，退出时 `docker rm -f`。
+- [x] 新增 `DockerBackend(ExecutionBackend)`：直接用 `docker` CLI + asyncio 子进程
+      （不引入 docker-py——保持零运行时依赖，且 docker-py 是同步库，进 asyncio daemon 反而绕）。
+- [x] 每次执行对应一个一次性容器（per-Sandbox 容器复用属于阶段 2 的有状态化）：
+   - 镜像：官方 `python:3.12-slim`，执行路径 `--pull never`，需先手动 `docker pull`。
+   - 限制：`--memory`/`--memory-swap`、`--cpus`、`--network none`、`--pids-limit`、
+     `--read-only` + `--tmpfs /tmp`（只读根 + 临时可写层）。
+   - 执行：代码经 argv 传入（`python -u -c <code>`，与阶段 0 同构；argv 上限 ~2MB 阶段 1 够用）。
+- [x] daemon 加 `--backend {local,docker}` 开关 + 启动期 Docker 可用性检查；
+      client 加 `Sandbox(backend=...)` 透传。**daemon 本阶段仍留在宿主机**——
+      「daemon 搬进容器」是阶段 2 的事（对应 E2B envd）；本阶段验证的正是
+      「换隔离 = 换 backend，client 与 protocol 不动」。
+- [x] 超时与清理：超时 `docker rm -f` 杀容器（杀 docker run 客户端进程杀不死容器！），
+      finally 幂等兜底；容器统一命名 `microsandbox-exec-*` 便于兜底清理。
 
-**完成标准**：原有测试在 DockerBackend 下全绿；新增「容器内无法访问宿主文件/网络」的隔离测试。
+**完成标准（已达成）**：原有 7 个测试在 local/docker 双后端参数化下全绿（7×2）；
+新增 4 个隔离测试：宿主文件不可见、断网、只读根 + /tmp 可写、超时后无残留容器。
 
 **注意**：容器隔离仍不足以跑完全不可信代码（容器逃逸面较大），文档需如实说明。
 

@@ -9,9 +9,10 @@ SDK 会很有亲切感。典型用法：
         execution = sandbox.run_code("print('hello from sandbox')")
         print(execution.stdout)
 
-阶段 0：Sandbox 直接连本机守护进程（你得先手动起 server，或用 connect=False
-        让它自动拉起一个子进程守护进程，见下）。
-阶段 1+：Sandbox 的职责会扩展为「向控制面申请一个新沙箱、拿到它的地址、
+阶段 0/1：Sandbox 自动在本机拉起 daemon 子进程并连上（spawn_local=True）。
+        阶段 1 用 backend="docker" 让 daemon 把代码放进一次性容器里执行——
+        一行切换隔离方案，run_code 的用法完全不变。
+阶段 2+：Sandbox 的职责会扩展为「向控制面申请一个新沙箱、拿到它的地址、
         再连上去」。但 run_code / 流式消费这套上层 API 对用户保持不变。
 """
 
@@ -41,10 +42,11 @@ class Sandbox:
 
     参数：
         host / port：守护进程地址。
-        spawn_local：阶段 0 便利开关。若为 True，构造时自动在本机拉起一个
-                     守护进程子进程并连上它，退出时自动关闭 —— 让你一行代码
-                     就能跑起来，不用先手动开 server。阶段 1+ 会用真正的
-                     「创建沙箱」逻辑替换它。
+        spawn_local：便利开关。若为 True，构造时自动在本机拉起一个守护进程
+                     子进程并连上它，退出时自动关闭 —— 让你一行代码就能跑起来，
+                     不用先手动开 server。阶段 2+ 会用真正的「创建沙箱」逻辑替换它。
+        backend：执行后端。"local"=本机子进程（无隔离），"docker"=一次性容器
+                 （阶段 1 的隔离）。它只是起 daemon 时带的开关，不进 wire protocol。
     """
 
     def __init__(
@@ -53,10 +55,12 @@ class Sandbox:
         port: int = 49152,
         spawn_local: bool = True,
         timeout_seconds: float = 30.0,
+        backend: str = "local",
     ) -> None:
         self.host = host
         self.port = port
         self.timeout_seconds = timeout_seconds
+        self.backend = backend
         self._proc: subprocess.Popen | None = None
 
         if spawn_local:
@@ -66,22 +70,36 @@ class Sandbox:
     # ----- 生命周期 -----
 
     def _spawn_daemon(self) -> None:
-        """阶段 0：本机拉起守护进程子进程。
+        """本机拉起守护进程子进程（阶段 0/1：daemon 留在宿主机）。
 
-        阶段 1 替换思路：这里改成「调用 Docker SDK 创建容器」；
-        阶段 3 改成「通过 orchestrator 启动 microVM」。返回的地址再传给后续请求。
+        阶段 1 的隔离不发生在这里，而在 daemon 内部的 DockerBackend——
+        client 只负责把 --backend 开关带给 daemon，自己完全不懂 docker。
+        阶段 2 这里才会变成「创建容器并连进去」（对应 E2B 的 envd）；
+        阶段 3 改成「通过 orchestrator 启动 microVM」。
         """
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "microsandbox.server",
              "--host", self.host, "--port", str(self.port),
+             "--backend", self.backend,
              "--log-level", "WARNING"],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            # stderr 留管道：daemon 若启动即失败（如 docker 不可用），要把原因
+            # 带给用户。WARNING 级日志量极小，不会撑满 64KB 的管道缓冲。
+            stderr=subprocess.PIPE,
         )
 
     def _wait_until_healthy(self, attempts: int = 50, delay: float = 0.1) -> None:
         url = f"http://{self.host}:{self.port}/health"
         for _ in range(attempts):
+            # daemon 进程已退出就别傻等满 5 秒了——立刻读出它的 stderr 作为报错。
+            # 例如 docker 后端在镜像缺失时，daemon 启动期检查会直接打印原因并退出。
+            if self._proc is not None and self._proc.poll() is not None:
+                detail = ""
+                if self._proc.stderr is not None:
+                    detail = self._proc.stderr.read().decode(errors="replace").strip()
+                raise RuntimeError(
+                    f"sandbox daemon exited at startup: {detail[-500:] or '(no stderr)'}"
+                )
             try:
                 with _DIRECT_OPENER.open(url, timeout=1) as resp:
                     if resp.status == 200:

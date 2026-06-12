@@ -3,7 +3,7 @@
 它在沙箱「内部」运行，监听 HTTP 请求，把代码交给执行后端跑，
 再用 SSE 把输出流式返回给客户端。
 
-阶段 0：这个进程就跑在你本机。
+阶段 0/1：这个进程跑在你本机（阶段 1 的隔离发生在 backend 起的容器里）。
 阶段 2+：这个进程会被打包进容器/VM 镜像，作为常驻 agent 运行 ——
         对应 E2B 里的 `envd`。届时 client 连接的 URL 从 localhost
         变成容器/VM 的地址，server 代码本身基本不用改。
@@ -20,7 +20,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 
-from .backend import ExecutionBackend, LocalSubprocessBackend
+from .backend import DockerBackend, ExecutionBackend, LocalSubprocessBackend
 from .protocol import EventType, ExecuteRequest, OutputEvent
 
 logger = logging.getLogger("microsandbox.server")
@@ -126,13 +126,30 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=49152)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--backend",
+        choices=["local", "docker"],
+        default="local",
+        help="执行后端：local=本机子进程（无隔离）；docker=一次性容器（阶段 1）",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=args.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    server = SandboxServer()
+
+    if args.backend == "docker":
+        # 启动期就把环境问题（docker 没装/没起/镜像缺失）暴露给起 daemon 的人，
+        # 并给出可操作的中文指引——而不是等第一次执行才埋进 SSE 流里。
+        problem = DockerBackend.check_available()
+        if problem:
+            parser.error(problem)
+        backend: ExecutionBackend = DockerBackend()
+    else:
+        backend = LocalSubprocessBackend()
+
+    server = SandboxServer(backend)
     try:
         asyncio.run(server.serve(args.host, args.port))
     except KeyboardInterrupt:

@@ -14,4 +14,4 @@ __all__ = [
     "EventType",
 ]
 
-__version__ = "0.0.1"  # 阶段 0
+__version__ = "0.1.0"  # 阶段 1（版本语义：0.阶段号.补丁，与 pyproject.toml 手动同步）

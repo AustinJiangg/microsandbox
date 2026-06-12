@@ -1,20 +1,11 @@
-"""阶段 0 端到端测试。
+"""端到端测试（阶段 0 写就，阶段 1 起双后端复用）。
 
 覆盖：基本执行、stdout/stderr 分离、错误捕获、超时。
-这些测试在后续阶段更换后端时应当继续通过（协议契约不变），
-因此它们也充当「重构安全网」。
+sandbox fixture 在 conftest.py 里已参数化为 local / docker 双后端——
+同一套测试体各跑一遍，验证「协议契约不变，隔离方案可换」。
 """
 
-import pytest
-
 from microsandbox import Sandbox
-
-
-@pytest.fixture
-def sandbox():
-    sb = Sandbox()
-    yield sb
-    sb.close()
 
 
 def test_basic_stdout(sandbox: Sandbox) -> None:
