@@ -19,10 +19,13 @@ SDK 会很有亲切感。典型用法：
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -55,6 +58,20 @@ _INNER_BACKEND = {"container": "local", "kernel": "kernel"}
 _CONTAINER_PORT = 49152
 # 容器内挂载源码的位置（2a 不建镜像，把宿主 src/ 只读挂进来即可跑我们的包）。
 _CONTAINER_SRC = "/opt/microsandbox/src"
+
+# ---- 阶段 3：Firecracker microVM 拓扑 ----
+# 与阶段 2 常驻容器同构：client 亲手创建并持有隔离环境（这里是 microVM），daemon 在
+# VM 内常驻、经 vsock 暴露。素材（firecracker 二进制 / 内核 / rootfs）由
+# scripts/build-rootfs.sh 生成在仓库 vendor/ 下（见 docs/STAGE3_DESIGN.md §6/§7）。
+_MICROVM_VSOCK_PORT = 1024   # daemon 在 VM 内监听的 vsock 端口（与 rootfs 的 /init 一致）
+_MICROVM_GUEST_CID = 3       # guest 的 vsock CID（宿主固定为 2）
+_MICROVM_VCPUS = 1
+_MICROVM_MEM_MIB = 512       # VM 内跑 Jupyter kernel，256 偏紧，给 512
+
+
+def _vendor_dir() -> pathlib.Path:
+    """素材目录：client.py 在 src/microsandbox/ 下，仓库根是 parents[2]。"""
+    return pathlib.Path(__file__).resolve().parents[2] / "vendor"
 
 
 def _find_free_port() -> int:
@@ -241,6 +258,9 @@ class Sandbox:
                  - "kernel"（阶段 2b）：同样是常驻容器，但容器内 daemon 托管一个常驻
                    Jupyter kernel——变量跨 run_code 留存，真正的有状态 REPL（对齐 E2B）。
                    需先构建 agent 镜像：docker build -t microsandbox-agent .
+                 - "microvm"（阶段 3）：把 daemon 跑进一台 Firecracker microVM（独立 guest
+                   内核 + KVM 边界，最强隔离），控制通道走 vsock，VM 内用 kernel 后端（有
+                   状态）。需先备好 vendor/ 素材：见 docs/STAGE3_DESIGN.md §6/§7。
     """
 
     def __init__(
@@ -260,6 +280,8 @@ class Sandbox:
         # 传输层（阶段 3 抽象）：默认懒构造成 TCP；microVM 会在 _spawn_microvm 里
         # 预装一个 vsock 传输。把「怎么连」从「连上之后说什么」里拆出来。
         self._transport: _Transport | None = None
+        self._workdir: pathlib.Path | None = None      # microVM 的 per-VM 工作目录（阶段 3）
+        self._console_log: pathlib.Path | None = None  # firecracker/guest 串口日志（诊断用）
 
         # 阶段 2c：文件 / shell 两个命名空间，手感对齐 E2B 的 sandbox.files / sandbox.commands。
         # 它们只在被调用时才用到 host/port，所以这里先建好即可（顺序无所谓）。
@@ -276,7 +298,9 @@ class Sandbox:
             # 语句还没进 __enter__，__exit__ 永远不会触发，已起的容器就成了没人收的
             # 残留。所以这里自己 close 掉再把异常抛上去（close 幂等，安全）。
             try:
-                if backend in _RESIDENT_BACKENDS:
+                if backend == "microvm":
+                    self._spawn_microvm()
+                elif backend in _RESIDENT_BACKENDS:
                     self._spawn_resident_container()
                 else:
                     self._spawn_daemon()
@@ -376,6 +400,90 @@ class Sandbox:
             self._container = None  # 没起成功就别在 close 里去删一个不存在的名字
             raise RuntimeError(f"docker run 启动常驻容器失败：{proc.stderr.strip()}")
 
+    def _spawn_microvm(self) -> None:
+        """阶段 3：启动一台 Firecracker microVM，把 daemon 跑在里面，经 vsock 暴露。
+
+        与上面的 _spawn_resident_container 同构（client 持有隔离环境的生命周期），区别
+        只在两点：① 隔离体从容器换成 microVM（独立 guest 内核 + KVM 边界，最强隔离）；
+        ② 控制通道从 TCP 端口映射换成 vsock。daemon（server.py）与 protocol 一行未改——
+        这正是阶段 3 最想证明的事：换隔离 = 换 client 创建逻辑 + 换传输，协议不动。
+        """
+        vendor = _vendor_dir()
+        fc_bin, kernel, rootfs = (
+            vendor / "firecracker", vendor / "vmlinux", vendor / "rootfs.ext4")
+
+        problem = self._check_microvm_available(fc_bin, kernel, rootfs)
+        if problem:
+            raise RuntimeError(f"无法创建 microVM：{problem}")
+
+        # per-VM 工作目录：config、vsock UDS、api sock、console.log 都放这（close 时整个删）。
+        self._workdir = pathlib.Path(tempfile.mkdtemp(prefix="microsandbox-vm-"))
+        uds = self._workdir / "fc.vsock"
+        self._console_log = self._workdir / "console.log"
+
+        # 一个 JSON 声明整台 VM（学习期用 --config-file 而非逐条 REST，便于一眼读懂）。
+        config = {
+            "boot-source": {
+                "kernel_image_path": str(kernel),
+                # root=/dev/vda 只读根；init=/init 我们的极简 init；MSBACKEND 选 VM 内执行后端。
+                "boot_args": (
+                    "console=ttyS0 reboot=k panic=1 pci=off "
+                    "root=/dev/vda ro init=/init MSBACKEND=kernel"
+                ),
+            },
+            "drives": [{
+                "drive_id": "rootfs",
+                "path_on_host": str(rootfs),
+                "is_root_device": True,
+                "is_read_only": True,   # 只读根，写都去 VM 内 tmpfs /tmp（对齐阶段 2）
+            }],
+            "machine-config": {
+                "vcpu_count": _MICROVM_VCPUS, "mem_size_mib": _MICROVM_MEM_MIB},
+            # Firecracker 把 guest vsock 多路复用到这个 UDS；client 的 _VsockTransport 连它。
+            "vsock": {"guest_cid": _MICROVM_GUEST_CID, "uds_path": str(uds)},
+        }
+        config_path = self._workdir / "config.json"
+        config_path.write_text(json.dumps(config))
+
+        # firecracker 的 stdout/stderr（含 guest 串口 console）落到文件——不能用 PIPE：
+        # guest console 会持续写，PIPE 缓冲填满会卡死 VM。启动失败时读这个文件诊断。
+        with open(self._console_log, "wb") as log_fh:
+            self._proc = subprocess.Popen(
+                [str(fc_bin), "--api-sock", str(self._workdir / "api.sock"),
+                 "--config-file", str(config_path)],
+                stdout=log_fh, stderr=subprocess.STDOUT,
+            )
+        # daemon 在 VM 内监听 vsock 1024；宿主经 uds 连进去。健康检查随后在 __init__ 触发，
+        # 走的就是这个 vsock 传输（_wait_until_healthy 已对传输无感知）。
+        self._transport = _VsockTransport(str(uds), _MICROVM_VSOCK_PORT)
+
+    @staticmethod
+    def _check_microvm_available(
+        fc_bin: pathlib.Path, kernel: pathlib.Path, rootfs: pathlib.Path
+    ) -> str | None:
+        """启动前把环境问题暴露出来并给可操作指引（对照 DockerBackend.check_available）。"""
+        if not fc_bin.exists():
+            return f"缺 firecracker 二进制（{fc_bin}），下载见 docs/STAGE3_DESIGN.md §6"
+        if not kernel.exists():
+            return f"缺内核 vmlinux（{kernel}），下载见 docs/STAGE3_DESIGN.md §6"
+        if not rootfs.exists():
+            return f"缺 rootfs（{rootfs}），请先运行 scripts/build-rootfs.sh"
+        if not os.path.exists("/dev/kvm"):
+            return "/dev/kvm 不存在：本机未开启（嵌套）硬件虚拟化"
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+            return ("无权访问 /dev/kvm：把当前用户加入 kvm 组"
+                    "（sudo usermod -aG kvm $USER）后重启 WSL")
+        return None
+
+    def _microvm_log(self) -> str:
+        """取 microVM 的 firecracker/guest 串口日志尾巴，仅用于启动失败诊断。"""
+        if self._console_log is None:
+            return ""
+        try:
+            return self._console_log.read_text(errors="replace")[-1500:].strip()
+        except OSError:
+            return ""
+
     def _ensure_transport(self) -> _Transport:
         """懒构造传输层。默认 TCP（local/docker/container/kernel 都走它）；阶段 3b 的
         microVM 会在 _spawn_microvm 里预装一个 _VsockTransport，这里便不再覆盖。放在
@@ -393,6 +501,7 @@ class Sandbox:
                 detail = ""
                 if self._proc.stderr is not None:
                     detail = self._proc.stderr.read().decode(errors="replace").strip()
+                detail = detail or self._microvm_log()  # microVM 的 firecracker 日志在文件里
                 raise RuntimeError(
                     f"sandbox daemon exited at startup: {detail[-500:] or '(no stderr)'}"
                 )
@@ -402,9 +511,9 @@ class Sandbox:
                         return
             except Exception:
                 time.sleep(delay)
-        # 没在限定时间内就绪：常驻容器把日志尾巴补进报错，便于排查（宿主 daemon
+        # 没在限定时间内就绪：常驻容器/microVM 把日志尾巴补进报错，便于排查（宿主 daemon
         # 走上面 poll 分支提前抛出，到不了这里）。
-        detail = self._container_logs()
+        detail = self._container_logs() or self._microvm_log()
         raise RuntimeError(
             "sandbox daemon did not become healthy in time"
             + (f": {detail[-500:]}" if detail else "")
@@ -440,6 +549,11 @@ class Sandbox:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             self._container = None
+        if self._workdir is not None:
+            # 上面 self._proc 已杀掉 firecracker 进程（= 销毁 VM）；这里清掉 per-VM 工作目录
+            # （config / vsock UDS / api sock / console.log 都在里面）。ignore_errors 幂等兜底。
+            shutil.rmtree(self._workdir, ignore_errors=True)
+            self._workdir = None
 
     def __enter__(self) -> "Sandbox":
         return self

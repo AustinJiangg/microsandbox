@@ -40,6 +40,33 @@ from .protocol import (
 logger = logging.getLogger("microsandbox.server")
 
 
+def _ensure_loopback_up() -> None:
+    """把 loopback 网卡（lo）置为 UP。
+
+    microVM 里 lo 默认是 down 的，而 kernel 后端的 Jupyter kernel 走 ZMQ over 127.0.0.1
+    跟 daemon 通信——lo 不 up 就连不上（表现为 kernel 启动 60s 超时）。极简 rootfs 里没装
+    ip/ifconfig，所以直接用 SIOCSIFFLAGS ioctl 拉起（等价 `ip link set lo up`）。
+
+    仅在 vsock（= 跑在 microVM 内）路径调用：容器/宿主的 lo 本就 up，无需也不该去动。
+    这件事本质是 init/系统初始化的职责，但我们的 rootfs init 是极简 shell（无网络工具），
+    而 daemon 是现成的 root 进程，放这里最省事且自带条件守卫。
+    """
+    import fcntl
+    import struct
+
+    IFF_UP = 0x1
+    SIOCGIFFLAGS, SIOCSIFFLAGS = 0x8913, 0x8914
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # struct ifreq：char name[16] + flags(short)，整体补齐到 sizeof(ifreq)=40。
+        req = struct.pack("16sH22s", b"lo", 0, b"")
+        flags = struct.unpack("16sH22s", fcntl.ioctl(sock.fileno(), SIOCGIFFLAGS, req))[1]
+        req = struct.pack("16sH22s", b"lo", flags | IFF_UP, b"")
+        fcntl.ioctl(sock.fileno(), SIOCSIFFLAGS, req)
+    finally:
+        sock.close()
+
+
 class SandboxServer:
     """最小 HTTP 守护进程，基于 asyncio。端点：
 
@@ -255,6 +282,11 @@ class SandboxServer:
         # 的 UDS 连进来，见 docs/STAGE3_DESIGN.md §4.1）。除了「监听哪种 socket」不同，
         # handle / 分发 / backend 全不变——这正是「协议稳定、传输可换」的体现。
         if transport == "vsock":
+            # microVM 里 lo 默认 down，kernel 后端要靠它走 ZMQ；best-effort 拉起，失败只告警。
+            try:
+                _ensure_loopback_up()
+            except OSError as exc:
+                logger.warning("无法拉起 loopback（kernel 后端可能不可用）：%s", exc)
             sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
             # VMADDR_CID_ANY：监听本 VM 自己的 vsock；端口固定，client 侧 CONNECT 它。
             sock.bind((socket.VMADDR_CID_ANY, vsock_port))

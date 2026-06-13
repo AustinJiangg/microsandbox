@@ -6,6 +6,7 @@
 """
 
 import functools
+import os
 import pathlib
 import shutil
 import subprocess
@@ -129,3 +130,41 @@ def docker_env():
     if not docker_available():
         pytest.skip("docker 不可用，跳过")
     ensure_image()
+
+
+# ---- 阶段 3：Firecracker microVM ----
+
+
+@functools.lru_cache(maxsize=1)
+def firecracker_available() -> bool:
+    """firecracker 二进制 + 内核就绪、且 /dev/kvm 可读写，才跑 microVM 用例。
+
+    rootfs 不在这里查（可由 ensure_rootfs 现 build）；这三样缺一就整组 skip——
+    别的机器 / CI 上 microVM 用例自动跳过，pytest 仍全绿（与 docker 不可用时同理）。
+    """
+    vendor = pathlib.Path(__file__).resolve().parents[1] / "vendor"
+    if not (vendor / "firecracker").exists() or not (vendor / "vmlinux").exists():
+        return False
+    return os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
+@functools.lru_cache(maxsize=1)
+def ensure_rootfs() -> None:
+    """rootfs.ext4 不在就现 build（首次较慢：docker export + mkfs.ext4 -d）。让 microVM
+    用例在备好 firecracker/内核的机器上也开箱即用；正常用时由开发者预先 build。"""
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    if (repo_root / "vendor" / "rootfs.ext4").exists():
+        return
+    ensure_agent_image()  # rootfs 从 agent 镜像导出，得先有它
+    subprocess.run([str(repo_root / "scripts" / "build-rootfs.sh")], check=True)
+
+
+@pytest.fixture
+def microvm_sandbox():
+    """阶段 3 专用：daemon 跑在 Firecracker microVM 里、经 vsock 连入的沙箱。"""
+    if not firecracker_available():
+        pytest.skip("firecracker/内核/kvm 不全，跳过 microVM 用例")
+    ensure_rootfs()
+    sb = Sandbox(backend="microvm")
+    yield sb
+    sb.close()
