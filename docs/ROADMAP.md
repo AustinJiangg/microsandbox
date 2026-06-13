@@ -82,18 +82,21 @@
 
 ---
 
-## ⬜ 阶段 3：Firecracker microVM 隔离 ← 当前在这里（下一步）
+## 🟩 阶段 3：Firecracker microVM 隔离 ← 核心已完成（3a/3b），3c 收尾中
 
 **学习目标**：理解强隔离原理、microVM、vsock 通信、快照实现毫秒级冷启动。**本阶段慢下来手动理解，别全靠 vibe。**
 
-要做的事：
-1. 准备 kernel 镜像 + rootfs（可从 Docker 镜像导出 rootfs）。
-2. 用 Firecracker REST API 启动 microVM；把阶段 2 的 agent 放进 rootfs。
-3. 宿主↔VM 用 vsock 通信，daemon 监听 vsock 而非 TCP。
-4. 资源限制走 Firecracker 配置（vCPU、内存）。
-5. 进阶：快照/恢复，实现快速冷启动；预热池。
+详细设计与实测记录见 `docs/STAGE3_DESIGN.md`。拆成 3a/3b/3c：
 
-**完成标准**：能在 microVM 里跑代码并拿回结果；测量并记录冷启动时间。
+- [x] **3a**：vsock 传输抽象——client/server 抽出 `Transport` 层，TCP 路径行为字节级不变
+      （既有测试不改即全绿），新增 `_VsockTransport`（CONNECT 握手 + 裸 socket 上的最小 HTTP）。
+- [x] **3b**：从 Docker 镜像导出 rootfs（`mkfs.ext4 -d` 免 root）+ 启动 Firecracker microVM
+      （用 `--config-file` 声明式，非 REST），把阶段 2 的 agent 放进 rootfs，daemon 监听 vsock 而非
+      TCP；端到端 `run_code`，VM 内 kernel 后端有状态；资源限制走 machine-config（vCPU/内存）。
+- [~] **3c**：冷启动测量（~0.94s，已记录）+ 资源限制测试已加；**拉伸**：快照/恢复（毫秒级冷启动）
+      + 预热池——与阶段 4 重叠，按兴趣选做。
+
+**完成标准（核心已达成）**：能在 microVM 里跑代码并拿回结果 ✅；测量并记录冷启动时间 ✅（~0.94s）。
 
 ---
 

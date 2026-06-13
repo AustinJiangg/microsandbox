@@ -37,6 +37,24 @@ def test_independent_guest_filesystem(microvm_sandbox: Sandbox) -> None:
     assert ex.stdout.strip() == "False"
 
 
+def test_machine_config_resource_limits(microvm_sandbox: Sandbox) -> None:
+    """资源限制由 Firecracker machine-config 强制（vcpu_count=1, mem_size_mib=512）。
+
+    对照阶段 1/2 的 cgroup 限额（--cpus/--memory，作用于共享内核里的容器），这里是
+    「VM 配额」：guest 看到的就是一个 1 vCPU、~512MB 的整机——比宿主小得多，证明配额生效。
+    """
+    cpu = microvm_sandbox.run_code("import os; print(os.cpu_count())").stdout.strip()
+    assert cpu == "1"  # 只给 1 个 vCPU（宿主核多得多）
+
+    # /proc/meminfo 首行 MemTotal（KB）→ MB；内核自留一点，故略小于 512。
+    mem_mb = int(
+        microvm_sandbox.run_code(
+            "print(int(open('/proc/meminfo').readline().split()[1]) // 1024)"
+        ).stdout.strip()
+    )
+    assert 300 < mem_mb < 600  # ~512MB，远小于宿主，证明 VM 内存配额生效
+
+
 def test_vm_lifecycle_cleanup(microvm_sandbox: Sandbox) -> None:
     """VM 随 Sandbox 起灭：open 期间 firecracker 在跑，close 后进程退出且工作目录清理。"""
     proc = microvm_sandbox._proc
