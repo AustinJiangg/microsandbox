@@ -6,13 +6,14 @@
 """
 
 import functools
+import pathlib
 import shutil
 import subprocess
 
 import pytest
 
 from microsandbox import Sandbox
-from microsandbox.backend import DEFAULT_DOCKER_IMAGE
+from microsandbox.backend import DEFAULT_AGENT_IMAGE, DEFAULT_DOCKER_IMAGE
 
 
 @functools.lru_cache(maxsize=1)
@@ -43,6 +44,23 @@ def ensure_image() -> None:
     )
     if inspect.returncode != 0:
         subprocess.run(["docker", "pull", DEFAULT_DOCKER_IMAGE], check=True)
+
+
+@functools.lru_cache(maxsize=1)
+def ensure_agent_image() -> None:
+    """阶段 2b 的 agent 镜像不在本地就 docker build 一次（首次较慢，要装 ipykernel）。
+
+    和 ensure_image 一样，是为了「克隆仓库 → pytest」开箱即用；正常使用时镜像
+    由开发者自己 docker build -t microsandbox-agent . 预先构建。
+    """
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", DEFAULT_AGENT_IMAGE], capture_output=True
+    )
+    if inspect.returncode != 0:
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        subprocess.run(
+            ["docker", "build", "-t", DEFAULT_AGENT_IMAGE, str(repo_root)], check=True
+        )
 
 
 requires_docker = pytest.mark.skipif(
@@ -88,6 +106,17 @@ def resident_sandbox():
     sb = Sandbox(backend="container")
     yield sb
     sb.close()  # 若测试已显式 close 过，这里是幂等空操作
+
+
+@pytest.fixture
+def kernel_sandbox():
+    """阶段 2b 专用：daemon 在常驻容器里托管 Jupyter kernel 的有状态沙箱。"""
+    if not docker_available():
+        pytest.skip("docker 不可用，跳过 kernel 后端测试")
+    ensure_agent_image()
+    sb = Sandbox(backend="kernel")
+    yield sb
+    sb.close()
 
 
 @pytest.fixture

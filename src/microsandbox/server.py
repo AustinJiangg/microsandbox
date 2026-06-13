@@ -20,7 +20,12 @@ import json
 import logging
 from collections.abc import AsyncIterator
 
-from .backend import DockerBackend, ExecutionBackend, LocalSubprocessBackend
+from .backend import (
+    DockerBackend,
+    ExecutionBackend,
+    JupyterKernelBackend,
+    LocalSubprocessBackend,
+)
 from .protocol import EventType, ExecuteRequest, OutputEvent
 
 logger = logging.getLogger("microsandbox.server")
@@ -128,9 +133,12 @@ def main() -> None:
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
         "--backend",
-        choices=["local", "docker"],
+        choices=["local", "docker", "kernel"],
         default="local",
-        help="执行后端：local=本机子进程（无隔离）；docker=一次性容器（阶段 1）",
+        help=(
+            "执行后端：local=本机子进程（无隔离）；docker=一次性容器（阶段 1）；"
+            "kernel=常驻 Jupyter kernel，有状态 REPL（阶段 2b，需在 agent 镜像内运行）"
+        ),
     )
     args = parser.parse_args()
 
@@ -146,6 +154,13 @@ def main() -> None:
         if problem:
             parser.error(problem)
         backend: ExecutionBackend = DockerBackend()
+    elif args.backend == "kernel":
+        # 同理，缺 ipykernel/jupyter_client 时启动期就报清楚（一般只会在非 agent
+        # 镜像里误用 --backend kernel 才触发）。实例化只验证依赖，kernel 是懒启动的。
+        try:
+            backend = JupyterKernelBackend()
+        except RuntimeError as exc:
+            parser.error(str(exc))
     else:
         backend = LocalSubprocessBackend()
 

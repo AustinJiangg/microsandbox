@@ -42,10 +42,12 @@ _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # ---- 阶段 2：常驻容器拓扑 ----
 # 这些 backend 取值代表「主从关系反转」：daemon 不再跑在宿主，而是被 client
 # docker run -d 进一个长期存活的容器里常驻（对应 E2B 的 envd）。
-_RESIDENT_BACKENDS = {"container"}          # 2b 会加入 "kernel"（有状态 REPL）
+# "container"（2a）容器内是无状态子进程；"kernel"（2b）容器内是常驻 Jupyter
+# kernel，变量跨 run_code 留存。两者共用同一套「起常驻容器」代码，差别只在
+# 用哪个镜像、以及告诉容器内 daemon 用哪个 --backend（见 _spawn_resident_container）。
+_RESIDENT_BACKENDS = {"container", "kernel"}
 # client 的 backend 取值 → 容器内 daemon 实际用哪个 --backend 启动。
-# 2a 容器内仍是无状态子进程后端；2b 时 "kernel" -> "kernel"。
-_INNER_BACKEND = {"container": "local"}
+_INNER_BACKEND = {"container": "local", "kernel": "kernel"}
 # 容器内 daemon 固定监听这个端口；宿主侧映射到一个随机空闲端口（见 _find_free_port），
 # 这样多个沙箱、以及宿主上可能已存在的 daemon 都不会撞端口。
 _CONTAINER_PORT = 49152
@@ -76,8 +78,11 @@ class Sandbox:
                  - "local"（阶段 0）：宿主子进程，几乎无隔离。
                  - "docker"（阶段 1）：宿主 daemon，每次执行起一个一次性容器。
                  - "container"（阶段 2a）：daemon 搬进一个**常驻容器**里跑（envd 化），
-                   client 负责 docker run 起它、退出时 docker rm -f。容器内暂用无状态
-                   子进程后端；有状态 REPL（"kernel"）是阶段 2b。
+                   client 负责 docker run 起它、退出时 docker rm -f。容器内用无状态
+                   子进程后端。
+                 - "kernel"（阶段 2b）：同样是常驻容器，但容器内 daemon 托管一个常驻
+                   Jupyter kernel——变量跨 run_code 留存，真正的有状态 REPL（对齐 E2B）。
+                   需先构建 agent 镜像：docker build -t microsandbox-agent .
     """
 
     def __init__(
@@ -148,11 +153,18 @@ class Sandbox:
         容器跑我们的包，改代码免重建。等阶段 2b 引入 jupyter 依赖时，才会改用
         Dockerfile 把依赖烘进 agent 镜像。
         """
+        # 按后端选镜像：container 用官方 slim（2a，零依赖）；kernel 用 agent 镜像
+        # （2b，预装了 ipykernel/jupyter_client，需先 docker build -t microsandbox-agent .）。
+        from .backend import DEFAULT_AGENT_IMAGE, DEFAULT_DOCKER_IMAGE, DockerBackend
+
+        image = {
+            "container": DEFAULT_DOCKER_IMAGE,
+            "kernel": DEFAULT_AGENT_IMAGE,
+        }[self.backend]
+
         # 起容器前先把环境问题（docker 没装/没起/镜像缺失）暴露出来并给可操作指引，
         # 而不是等 docker run 失败后从日志里猜。复用阶段 1 的同一套检查。
-        from .backend import DEFAULT_DOCKER_IMAGE, DockerBackend
-
-        problem = DockerBackend.check_available(DEFAULT_DOCKER_IMAGE)
+        problem = DockerBackend.check_available(image)
         if problem:
             raise RuntimeError(f"无法创建常驻沙箱容器：{problem}")
 
@@ -182,7 +194,11 @@ class Sandbox:
             "-e", f"PYTHONPATH={_CONTAINER_SRC}",
             "-e", "PYTHONDONTWRITEBYTECODE=1",            # 只读根下别尝试写 .pyc
             "-e", "PYTHONUNBUFFERED=1",
-            DEFAULT_DOCKER_IMAGE,
+            # HOME 指到可写的 tmpfs：kernel 后端下，Jupyter 要写 kernel 连接文件、
+            # IPython 要写历史 sqlite，默认都落在 HOME 下，而根是 --read-only 的。
+            # 对 container 后端无害。
+            "-e", "HOME=/tmp",
+            image,
             # daemon 必须监听 0.0.0.0 才能被宿主经映射端口连到（默认 127.0.0.1 在容器内
             # 等于谁都连不进来）。这是 server 端唯一的「配置」差异，代码本身不变。
             "python", "-m", "microsandbox.server",

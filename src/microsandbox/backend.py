@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import subprocess
 import sys
@@ -277,3 +278,198 @@ class DockerBackend(ExecutionBackend):
             stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
+
+
+# 阶段 2b 默认 agent 镜像：在 slim 基础上预装了 ipykernel + jupyter_client，
+# 容器内 daemon 用它托管常驻 kernel。需先 docker build（见仓库根 Dockerfile）。
+DEFAULT_AGENT_IMAGE = "microsandbox-agent:latest"
+
+# IPython 的 traceback 自带 ANSI 颜色码，落到我们的纯文本 stderr 前先剥掉。
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+class JupyterKernelBackend(ExecutionBackend):
+    """阶段 2b 后端：在 daemon 进程里托管一个**常驻** Jupyter (IPython) kernel。
+
+    这是阶段 2 的灵魂。和阶段 0/1「每次执行起一个全新解释器、跑完即弃」不同，
+    这里 kernel 长期存活、持有一个 Python 命名空间——所以多次 run_code 之间定义的
+    变量会留存，第二次执行能直接用第一次的结果。这正是 E2B code interpreter 的做法
+    （它底层也是 Jupyter kernel）。
+
+    与 client 的配合：client 用 backend="kernel" 起一个常驻容器（agent 镜像里预装了
+    ipykernel/jupyter_client），容器内 daemon 用 --backend kernel 启动，实例化的就是
+    本类。「换隔离/换执行模型 = 换 backend」，client 与 /execute 协议照旧不动。
+
+    通信机制：通过 jupyter_client 用 ZMQ 跟 kernel 子进程说 Jupyter 消息协议——
+      - execute(code) 在 shell 通道发请求，立刻返回该请求的 msg_id；
+      - kernel 在 iopub 通道流式回吐：stream(stdout/stderr)、execute_result（表达式的
+        值）、error（异常 traceback）、status（busy/idle，idle 表示这次跑完了）。
+    我们把这些消息翻译回项目统一的 OutputEvent，于是 /execute 协议毫不变动。
+    """
+
+    def __init__(self) -> None:
+        # 懒依赖：只有真正用 kernel 后端时才需要 jupyter_client。这样宿主上跑
+        # local/docker/container 后端时，import backend.py 不会要求装 jupyter。
+        try:
+            from jupyter_client.manager import AsyncKernelManager
+        except ImportError as exc:  # pragma: no cover - 仅在缺依赖的环境触发
+            raise RuntimeError(
+                "kernel 后端需要 ipykernel + jupyter_client。请用 agent 镜像"
+                "（docker build -t microsandbox-agent .），"
+                "或本地安装 pip install 'microsandbox[kernel]'。"
+            ) from exc
+        self._AsyncKernelManager = AsyncKernelManager
+        self._km: object | None = None   # AsyncKernelManager
+        self._kc: object | None = None   # AsyncKernelClient
+        # kernel 是共享的有状态资源，一次只能跑一个 cell：用锁把并发的 execute 串行化
+        # （这也正是有状态 REPL 想要的语义——后一次执行能看见前一次的副作用）。
+        self._lock = asyncio.Lock()
+
+    async def _ensure_started(self) -> None:
+        """首次执行时懒启动 kernel，之后复用。冷启动那几秒只在第一次付出。"""
+        if self._kc is not None:
+            return
+        km = self._AsyncKernelManager(kernel_name="python3")
+        await km.start_kernel()
+        kc = km.client()
+        kc.start_channels()
+        await kc.wait_for_ready(timeout=60)
+        self._km, self._kc = km, kc
+
+    async def execute(
+        self, request: ExecuteRequest
+    ) -> AsyncIterator[OutputEvent]:
+        if request.language != "python":
+            yield OutputEvent(
+                type=EventType.ERROR,
+                data=f"unsupported language: {request.language}",
+            )
+            yield OutputEvent(type=EventType.END, exit_code=1)
+            return
+
+        async with self._lock:  # 串行化对共享 kernel 的访问
+            try:
+                await self._ensure_started()
+            except Exception as exc:  # noqa: BLE001 - 启动失败要如实回吐给用户
+                yield OutputEvent(
+                    type=EventType.ERROR, data=f"kernel failed to start: {exc}"
+                )
+                yield OutputEvent(type=EventType.END, exit_code=1)
+                return
+
+            async for event in self._run_one(request):
+                yield event
+
+    async def _run_one(
+        self, request: ExecuteRequest
+    ) -> AsyncIterator[OutputEvent]:
+        kc = self._kc
+        # execute() 是同步方法：立刻在 shell 通道发出请求并返回 msg_id。之后所有
+        # 属于本次执行的 iopub 消息，其 parent_header.msg_id 都等于这个 msg_id。
+        msg_id = kc.execute(request.code, store_history=True, allow_stdin=False)
+
+        had_error = False
+        timed_out = False
+        try:
+            # 超时只罩住「这一个 cell 的执行」，不含上面 kernel 的一次性冷启动。
+            async with asyncio.timeout(request.timeout_seconds):
+                while True:
+                    msg = await kc.get_iopub_msg()
+                    if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                        continue  # 不是本次执行的消息，跳过（过滤更稳）
+                    if msg["header"]["msg_type"] == "error":
+                        had_error = True
+                    event, done = self._translate(msg)
+                    if event is not None:
+                        yield event
+                    if done:
+                        break
+        except TimeoutError:
+            timed_out = True
+            # 关键设计：超时用 interrupt（给 kernel 发 SIGINT）而非杀进程——cell 被
+            # 打断（如 time.sleep 抛 KeyboardInterrupt），但 kernel 和它的命名空间都
+            # 还活着，之前定义的变量不丢。这正是「有状态」的价值，也是与阶段 0/1
+            # 「超时即杀掉整个解释器」最大的语义差别。
+            #
+            # 已知边界：interrupt 靠 SIGINT→KeyboardInterrupt，挡不住「吞掉
+            # KeyboardInterrupt 的代码」或 C 扩展里的硬阻塞——那种情况下 cell 会在
+            # 后台继续跑，拖住后续执行。production（如 E2B）会在 interrupt 失败后
+            # 升级到「重启 kernel」（必死但丢状态）；本项目有意只做 interrupt 保状态。
+            await self._km.interrupt_kernel()
+            await self._drain_until_idle(msg_id)  # 排空被打断产生的残余，保证下次干净
+            yield OutputEvent(
+                type=EventType.ERROR,
+                data=f"execution timed out after {request.timeout_seconds}s",
+            )
+
+        # 收掉本次执行的 shell execute_reply：iopub 之外 kernel 还会在 shell 通道回一条
+        # reply，没人读它就会在通道里越积越多，积到 ZMQ 高水位后 kernel 发 reply 会阻塞。
+        # 正常和超时两条路都会产生 reply，放在 try/except 之外正好都覆盖。
+        await self._drain_shell_reply(msg_id)
+
+        # 退出码对齐阶段 0/1 的语义：正常 0；异常非 0（→ success False）；超时 -1。
+        if timed_out:
+            exit_code = -1
+        else:
+            exit_code = 1 if had_error else 0
+        yield OutputEvent(type=EventType.END, exit_code=exit_code)
+
+    @staticmethod
+    def _translate(msg: dict) -> tuple[OutputEvent | None, bool]:
+        """把一条 iopub 消息翻译成 (OutputEvent | None, 本次执行是否已结束)。"""
+        mtype = msg["header"]["msg_type"]
+        content = msg["content"]
+        if mtype == "stream":
+            etype = (
+                EventType.STDOUT
+                if content.get("name") == "stdout"
+                else EventType.STDERR
+            )
+            return OutputEvent(type=etype, data=content.get("text", "")), False
+        if mtype in ("execute_result", "display_data"):
+            # 表达式的值（REPL 回显，例如直接写 `x` 而非 print(x)）。并入 stdout，
+            # 这样不必给 /execute 协议加新事件类型就能把它带回去。
+            text = content.get("data", {}).get("text/plain")
+            return (
+                (OutputEvent(type=EventType.STDOUT, data=text + "\n"), False)
+                if text
+                else (None, False)
+            )
+        if mtype == "error":
+            tb = _strip_ansi("\n".join(content.get("traceback", [])))
+            return OutputEvent(type=EventType.STDERR, data=tb + "\n"), False
+        if mtype == "status" and content.get("execution_state") == "idle":
+            return None, True  # kernel 回到空闲：本次执行的输出已全部流完
+        return None, False  # execute_input / busy 等无需转发的消息
+
+    async def _drain_until_idle(self, msg_id: str) -> None:
+        """interrupt 后把本次执行残余的 iopub 消息排空到 idle，避免污染下次执行。"""
+        try:
+            async with asyncio.timeout(10):
+                while True:
+                    msg = await self._kc.get_iopub_msg()
+                    if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                        continue
+                    if (
+                        msg["header"]["msg_type"] == "status"
+                        and msg["content"].get("execution_state") == "idle"
+                    ):
+                        return
+        except TimeoutError:
+            return  # 极端情况放弃排空；下次执行靠 parent_header 过滤也能容忍残余
+
+    async def _drain_shell_reply(self, msg_id: str) -> None:
+        """收掉本次执行的 shell execute_reply，避免未读消息在 shell 通道越积越多
+        （积到 ZMQ 高水位后 kernel 发 reply 会阻塞）。最多等一小会儿，收不到就算了。"""
+        try:
+            async with asyncio.timeout(5):
+                while True:
+                    reply = await self._kc.get_shell_msg()
+                    if reply.get("parent_header", {}).get("msg_id") == msg_id:
+                        return
+        except TimeoutError:
+            return

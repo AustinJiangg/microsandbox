@@ -53,18 +53,21 @@
 
 拆成三小步，每步都保持既有测试全绿：
 
-- [ ] **2a envd 化（搬家，状态先不留存）** ← 本轮
+- [x] **2a envd 化（搬家，状态先不留存）**
    - 开发期不建镜像：把 `src/` 只读挂载进 `python:3.12-slim`，
      `python -m microsandbox.server` 跑在容器里。
    - `client` 新增 `backend="container"`：`docker run -d` 起常驻容器、映射端口、
      健康探测、`close` 时 `docker rm -f`。容器内 daemon 仍用无状态的
      `LocalSubprocessBackend`。**`server.py` 一行不改**（已支持 `--host/--port/--backend`）。
-   - 验收：端到端用例在 `local`/`docker`/`container` 三拓扑下参数化全绿（7×3）。
-- [ ] **2b 有状态 REPL** —— 持久解释器用 **Jupyter / IPython kernel**（对齐 E2B）。
-   - **此阶段才引入依赖** `ipykernel` + `jupyter_client`，并引入 Dockerfile 把它们
-     装进 agent 镜像；容器内 daemon 用 `--backend kernel` 启动。
-   - 验收：连续两次 `run_code`，第二次能用第一次定义的变量。
-- [ ] **2c 文件 / shell API** —— `protocol.py` **向后兼容新增** `/files/*`、`/commands`
+   - 验收达成：端到端用例在 `local`/`docker`/`container` 三拓扑下参数化全绿（7×3）。
+- [x] **2b 有状态 REPL** —— 持久解释器用 **Jupyter / IPython kernel**（对齐 E2B）。
+   - 新增 `JupyterKernelBackend`：daemon 托管常驻 kernel，用 ZMQ 走 Jupyter 消息协议，
+     把 iopub 的 stream/execute_result/error/idle 翻译回 `OutputEvent`，`/execute` 协议不变。
+   - **首次引入运行时依赖** `ipykernel` + `jupyter_client`（`[kernel]` 可选 extra，
+     backend 内懒导入）；新增 `Dockerfile` 构建 agent 镜像；`client` 新增 `backend="kernel"`。
+   - 超时用 **interrupt（SIGINT）而非杀进程**：打断当前 cell 但 kernel 与命名空间存活。
+   - 验收达成：变量/函数/import 跨 `run_code` 留存；超时后 kernel 不死、旧变量仍可用。
+- [ ] **2c 文件 / shell API** ← 当前在这里 —— `protocol.py` **向后兼容新增** `/files/*`、`/commands`
    （`/execute` 与既有 dataclass 不动）；client 加 `sandbox.files.*` / `sandbox.commands.*`，
    对齐 E2B 手感。验收：文件读写往返成功；`commands.run` 拿到 shell 输出。
 

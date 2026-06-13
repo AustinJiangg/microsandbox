@@ -33,6 +33,12 @@ with Sandbox() as sandbox:
 with Sandbox(backend="docker") as sandbox:
     ex = sandbox.run_code("import platform; print(platform.node())")
     print(ex.stdout)        # 容器 ID，而不是你的主机名
+
+# 阶段 2b：常驻 Jupyter kernel，变量跨 run_code 留存（真正的有状态 REPL）
+# 需先构建 agent 镜像：docker build -t microsandbox-agent .
+with Sandbox(backend="kernel") as sandbox:
+    sandbox.run_code("x = 41")
+    print(sandbox.run_code("print(x + 1)").stdout)   # 42 —— 第二次能用第一次的变量
 ```
 
 ## 项目结构
@@ -60,7 +66,7 @@ microsandbox/
 |------|----------|------|
 | 0 | 本机子进程 | ✅ |
 | 1 | Docker 容器 | ✅ |
-| 2 | 容器内常驻 agent + 有状态 REPL | 🚧 当前（2a 进行中） |
+| 2 | 容器内常驻 agent + 有状态 REPL | 🚧 当前（2a/2b 完成，2c 进行中） |
 | 3 | Firecracker microVM | ⬜ |
 | 4 | 产品化外围（池化/模板/鉴权） | ⬜ |
 

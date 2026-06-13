@@ -28,7 +28,8 @@
 - [x] **阶段 0**：本机子进程后端，跑通 client/protocol/daemon 骨架
 - [x] **阶段 1**：Docker 容器后端（真正的隔离起点）
 - [ ] **阶段 2**：容器内常驻 agent + 有状态 REPL（对齐 E2B 的 envd）← **当前在这里**
-      （子步骤 2a/2b/2c 见 `docs/STAGE2_DESIGN.md`；2a 进行中：daemon 搬进常驻容器）
+      （见 `docs/STAGE2_DESIGN.md`；2a daemon 搬进常驻容器 ✅、2b 常驻 Jupyter kernel
+      有状态 REPL ✅ 已完成；**当前在 2c：文件 / shell API**）
 - [ ] **阶段 3**：Firecracker microVM 后端
 - [ ] **阶段 4**：产品化外围（沙箱池、模板、鉴权等）
 
@@ -39,8 +40,9 @@
 - 阶段 1 决策：调 Docker 走 `docker` CLI + asyncio 子进程，**不引入 docker-py**
   ——保持零依赖，且 docker-py 是同步库，放进 asyncio daemon 必须套线程池，反而更绕。
 - 阶段 2 决策：2a 仍零依赖（client 走 `docker` CLI 起常驻容器，源码只读挂载进
-  `python:3.12-slim`，免建镜像）；**2b 才首次引入运行时依赖** `ipykernel`+`jupyter_client`
-  （对齐 E2B 的 Jupyter kernel，届时配 Dockerfile 把依赖装进 agent 镜像）。
+  `python:3.12-slim`，免建镜像）；**2b 首次引入运行时依赖** `ipykernel`+`jupyter_client`
+  （对齐 E2B 的 Jupyter kernel，做成 `[kernel]` 可选 extra + backend 内懒导入，
+  非 kernel 路径仍零依赖；依赖装进 `Dockerfile` 构建的 agent 镜像，源码仍只读挂载）。
 - 注释用中文，解释「为什么」而非「是什么」，尤其标注「未来哪个阶段会替换此处」。
 - 每个阶段都要保证 `tests/` 全绿。测试是跨阶段重构的安全网。
 - 安全红线：阶段 0/1 的隔离不足以运行不可信代码，**严禁**在文档或代码里
@@ -58,11 +60,15 @@ python examples/quickstart.py
 # 阶段 1 前置（一次性）：拉基础镜像
 docker pull python:3.12-slim
 
-# 手动单独起 daemon（--backend docker 用容器隔离，默认 local）
+# 阶段 2b 前置（一次性）：构建 agent 镜像（含 ipykernel/jupyter_client）
+docker build -t microsandbox-agent .
+
+# 手动单独起 daemon（--backend docker 用容器隔离，默认 local；kernel 仅在 agent 镜像内有意义）
 python -m microsandbox.server --port 49152
 python -m microsandbox.server --backend docker
 
-# 跑测试（自动参数化 local/docker 双后端；无 docker 时容器侧自动 skip）
+# 跑测试（自动参数化 local/docker/container；kernel 走专属用例。
+# 无 docker 时容器/kernel 侧自动 skip；缺 agent 镜像时测试会自动 docker build）
 pytest
 
 # 清理残留容器（正常情况不会有，进程被 kill -9 后可能残留）：
@@ -71,6 +77,9 @@ docker ps -a --filter name=microsandbox- -q | xargs -r docker rm -f
 
 # 阶段 2a：用常驻容器后端（daemon 搬进容器，状态暂不留存）
 python -c 'from microsandbox import Sandbox; s=Sandbox(backend="container"); print(s.run_code("print(1+1)").stdout); s.close()'
+
+# 阶段 2b：有状态 REPL（变量跨 run_code 留存；需先 docker build agent 镜像）
+python -c 'from microsandbox import Sandbox; s=Sandbox(backend="kernel"); s.run_code("x=41"); print(s.run_code("print(x+1)").stdout); s.close()'
 
 # 跑单个测试
 pytest tests/test_sandbox.py::test_timeout -v
