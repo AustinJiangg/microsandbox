@@ -5,11 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "microsandbox"
 version = "0.1.0"
-description = "一个从零实现、逐步逼近 E2B 的学习用代码沙箱"
+description = "A learning code sandbox, implemented from scratch and progressively approaching E2B"
 readme = "README.md"
 requires-python = ">=3.11"
-# 阶段 0/1 都保持零运行时依赖：阶段 1 调 Docker 走 docker CLI 子进程而非
-# docker-py（同步库进 asyncio daemon 反而绕）。后续阶段按需添加并写明理由。
+# Stages 0/1 both keep zero runtime dependencies: Stage 1 drives Docker via docker
+# CLI subprocesses rather than docker-py (a sync library inside an asyncio daemon
+# only makes things more convoluted). Later stages add dependencies as needed, with a stated reason.
 dependencies = []
 
 [project.optional-dependencies]
@@ -17,10 +18,12 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
-# 阶段 2b 首次引入运行时依赖：常驻 Jupyter kernel（有状态 REPL，对齐 E2B）。
-# 注意这些只在「容器内 daemon」需要——agent 镜像（见 Dockerfile）已预装它们；
-# 宿主上跑 client / local / docker / container 后端都用不到，故做成可选 extra，
-# backend.py 里也对 jupyter_client 做懒导入，保持非 kernel 路径零依赖。
+# Stage 2b introduces runtime dependencies for the first time: a resident Jupyter
+# kernel (stateful REPL, aligned with E2B). Note these are only needed by the
+# "in-container daemon" -- the agent image (see Dockerfile) already pre-installs them;
+# running the client / local / docker / container backends on the host doesn't need
+# them, so they're made an optional extra, and backend.py also lazily imports
+# jupyter_client to keep the non-kernel path dependency-free.
 kernel = [
     "ipykernel>=6",
     "jupyter_client>=8",

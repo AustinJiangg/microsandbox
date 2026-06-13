@@ -1,229 +1,228 @@
-# 阶段 3 设计：Firecracker microVM 隔离
+# Stage 3 Design: Firecracker microVM isolation
 
-> 本文是阶段 3 的设计与实现计划。阶段 3 是整个项目**隔离强度第一次发生质变**的一关——
-> 从「与宿主共享内核的容器」升级到「拥有独立 guest 内核的 microVM」，逃逸面骤降。
-> 建议配合 `docs/ARCHITECTURE.md` 与 `docs/STAGE2_DESIGN.md` 一起读：阶段 3 在架构上
-> 与阶段 2 高度同构（又一次「主从关系反转」），唯一真正的新边界是**传输从 TCP 变成 vsock**。
+> This document is the design and implementation plan for Stage 3. Stage 3 is the stage where the project's **isolation strength changes qualitatively for the first time**—
+> upgrading from "a container that shares the host kernel" to "a microVM with its own guest kernel", with the escape surface dropping sharply.
+> We recommend reading it alongside `docs/ARCHITECTURE.md` and `docs/STAGE2_DESIGN.md`: architecturally, Stage 3 is
+> highly isomorphic to Stage 2 (another "ownership inversion"); the only truly new boundary is **the transport changing from TCP to vsock**.
 
-ROADMAP 给阶段 3 写了一句话：**「本阶段慢下来手动理解，别全靠 vibe。」** 本文就是为了
-让每一步都能被理解而非复制。
+The ROADMAP gives Stage 3 one line: **"Slow down and understand this stage by hand—don't run on vibes alone."** This document exists precisely to
+make every step understandable rather than copy-pasted.
 
 ---
 
-## 1. 这一关在解决什么：隔离强度的质变
+## 1. What this stage solves: a qualitative change in isolation strength
 
-阶段 1/2 的容器与宿主**共享同一个 Linux 内核**。容器的隔离全靠内核的 namespace +
-cgroups——一旦内核本身有漏洞（容器逃逸 CVE 年年有），不可信代码就能捅穿到宿主。
-所以 CLAUDE.md 的安全红线一直写着：**阶段 0/1/2 的隔离都不足以跑完全不可信代码。**
+The Stage 1/2 container and the host **share the same Linux kernel**. The container's isolation relies entirely on the kernel's namespaces +
+cgroups—once the kernel itself has a vulnerability (container-escape CVEs appear every year), untrusted code can punch through to the host.
+That's why CLAUDE.md's safety rule has always said: **the isolation in Stage 0/1/2 is not enough to run fully untrusted code.**
 
-阶段 3 用 **Firecracker microVM** 换掉容器：
+Stage 3 swaps the container out for a **Firecracker microVM**:
 
 ```
-        阶段 2（容器）                         阶段 3（microVM）
+        Stage 2 (container)                    Stage 3 (microVM)
 ┌─────────────────────────┐         ┌─────────────────────────────┐
-│  沙箱代码                 │         │  沙箱代码                     │
+│  sandbox code            │         │  sandbox code                │
 │  ───────────────         │         │  ───────────────             │
-│  容器 = namespace+cgroup │         │  guest 用户态                 │
-│         ↓ 共享内核        │         │  ───────────────             │
-│  宿主 Linux 内核 ◄── 逃逸 │         │  guest 独立 Linux 内核        │ ← 沙箱有自己的内核
-│        面大               │         │  ───────────────             │
-└─────────────────────────┘         │  KVM (/dev/kvm) 硬件虚拟化边界 │ ← 逃逸要先攻破 KVM
+│  container = namespace+cgroup │     │  guest userspace             │
+│         ↓ shared kernel   │         │  ───────────────             │
+│  host Linux kernel ◄── escape │     │  guest's own Linux kernel    │ ← the sandbox has its own kernel
+│        surface large      │         │  ───────────────             │
+└─────────────────────────┘         │  KVM (/dev/kvm) hardware-virt boundary │ ← escaping means first breaking KVM
                                      │  ───────────────             │
-                                     │  宿主 Linux 内核              │
+                                     │  host Linux kernel           │
                                      └─────────────────────────────┘
 ```
 
-- 沙箱里跑的是**一个真正的、独立的 Linux 内核**，由 Firecracker 用 KVM 在硬件虚拟化
-  边界内拉起。不可信代码要逃逸，得先攻破 guest 内核、再攻破 KVM——比攻破一个共享内核
-  的 namespace 难一个数量级。这就是 E2B / AWS Lambda 选 Firecracker 的原因。
-- Firecracker 是「microVM」：砍掉了传统 VM 的 BIOS、PCI、USB 等一大堆模拟设备，只留
-  virtio-net / virtio-block / virtio-vsock 等极少数，所以**冷启动可达上百毫秒级**、
-  内存开销极小。这正是它能做「每个请求一个 VM」的本钱。
+- What runs inside the sandbox is **a real, independent Linux kernel**, brought up by Firecracker via KVM within the hardware-virtualization
+  boundary. For untrusted code to escape, it must first break the guest kernel and then break KVM—an order of magnitude harder than breaking a
+  shared kernel's namespaces. This is why E2B / AWS Lambda chose Firecracker.
+- Firecracker is a "microVM": it cuts out a traditional VM's BIOS, PCI, USB, and a whole pile of emulated devices, keeping only a tiny few like
+  virtio-net / virtio-block / virtio-vsock, so its **cold start can be in the low-hundreds-of-milliseconds range** and its
+  memory overhead is tiny. This is exactly what lets it do "one VM per request".
 
-> 安全红线仍然成立但语气可以变了：阶段 3 是本项目**第一次**拿到「强到可以认真讨论
-> 跑不可信代码」的隔离。但这是**学习实现、未经安全审计**，文档仍须如实标注「不要直接
-> 拿它对外接收任意输入」——真这么用得上 E2B/Fly.io 级别的纵深防御（seccomp-bpf、
-> jailer、网络策略、限速、逃逸监控……），那些属于产品化，不在本阶段。
+> The safety rule still holds but the tone can change: Stage 3 is the **first time** the project gets isolation "strong enough to seriously discuss
+> running untrusted code". But this is a **learning implementation, not security-audited**, so the docs must still honestly note "don't directly
+> use it to accept arbitrary input from the outside"—doing that for real needs E2B/Fly.io-grade defense in depth (seccomp-bpf,
+> jailer, network policy, rate limiting, escape monitoring…), which is productization, out of scope for this stage.
 
 ---
 
-## 2. 与阶段 2 同构：又一次「主从关系反转」，只是 VM 取代容器
+## 2. Isomorphic to Stage 2: another "ownership inversion", just with a VM replacing the container
 
-阶段 2 的灵魂是「daemon 从宿主搬进**常驻容器**，创建隔离环境的职责从 backend 上移到
-client」。**阶段 3 把这句话里的「容器」换成「microVM」，几乎原样复用。**
+The soul of Stage 2 is "the daemon moves out of the host into a **resident container**, and the responsibility of creating the isolated environment moves up
+from the backend to the client". **Stage 3 swaps "container" for "microVM" in that sentence, reusing it almost verbatim.**
 
 ```
-宿主机                              沙箱 microVM（长期存活，一个 Sandbox 一个）
+host                                sandbox microVM (long-lived, one per Sandbox)
 ┌──────────────────┐               ┌──────────────────────────────────┐
-│ client           │   HTTP/SSE    │  daemon (server.py) ← 还是 envd     │
-│  启动 firecracker │   over vsock  │     │  --transport vsock           │
-│  连 vsock UDS     │ ────────────► │     ▼                              │
-│  health 探测      │ ◄──────────── │  JupyterKernelBackend（有状态）     │
-│  kill firecracker │               │     └── 变量跨 run_code 留存         │
+│ client           │   HTTP/SSE    │  daemon (server.py) ← still envd    │
+│  start firecracker │   over vsock  │     │  --transport vsock           │
+│  connect vsock UDS │ ────────────► │     ▼                              │
+│  health probe     │ ◄──────────── │  JupyterKernelBackend (stateful)    │
+│  kill firecracker │               │     └── variables persist across run_code │
 └──────────────────┘               └──────────────────────────────────┘
-   ▲ guest 独立内核 + KVM 边界就在这条竖线上
+   ▲ the guest's own kernel + the KVM boundary sit right on this vertical line
 ```
 
-对照阶段 2 的职责迁移表（`STAGE2_DESIGN.md` §2），阶段 3 改的还是同样三个地方，
-**`server.py` 的业务逻辑和 `protocol.py` 的线缆字节仍然一行不改**：
+Against Stage 2's responsibility migration table (`STAGE2_DESIGN.md` §2), Stage 3 still changes the same three places,
+and **`server.py`'s business logic and `protocol.py`'s wire bytes still don't change one line**:
 
-| 代码位置 | 阶段 2 现在做什么 | 阶段 3 改成什么 |
+| Code location | What Stage 2 does now | What Stage 3 changes it to |
 |----------|------------------|----------------|
-| `client.py:_spawn_resident_container` | `docker run -d` 起常驻容器 | 新增 `_spawn_microvm`：起一个 Firecracker microVM（见 §4.4） |
-| `client.py:_wait_until_healthy` | 轮询 `http://127.0.0.1:port/health` | 轮询 `/health`，但走 **vsock 传输**（见 §4.1） |
-| `client.py:close` | `docker rm -f <容器名>` | kill firecracker 进程 + 清理工作目录 |
-| `client.py` 传输层 | 全程 `urllib` over TCP | **新增 `Transport` 抽象**：TCP 路径不变，新增 vsock 路径（见 §4.1、§5） |
-| `server.py:serve` | `asyncio.start_server(host, port)`（TCP） | 新增 `--transport vsock`：用 `AF_VSOCK` 监听 socket（见 §4.1） |
-| `protocol.py` | `/execute` `/files/*` `/commands` | **字节不变**——HTTP/SSE 的内容原样跑在 vsock 上 |
-| rootfs / 内核 | 用 docker 镜像（`microsandbox-agent`） | 把 agent 镜像 **导出成 ext4 rootfs** + 配一个 guest 内核（见 §4.2/4.3） |
+| `client.py:_spawn_resident_container` | `docker run -d` starts a resident container | add `_spawn_microvm`: start a Firecracker microVM (see §4.4) |
+| `client.py:_wait_until_healthy` | poll `http://127.0.0.1:port/health` | poll `/health`, but over the **vsock transport** (see §4.1) |
+| `client.py:close` | `docker rm -f <container name>` | kill the firecracker process + clean up the working directory |
+| `client.py` transport layer | `urllib` over TCP throughout | **add a `Transport` abstraction**: the TCP path is unchanged, a new vsock path is added (see §4.1, §5) |
+| `server.py:serve` | `asyncio.start_server(host, port)` (TCP) | add `--transport vsock`: listen on a socket using `AF_VSOCK` (see §4.1) |
+| `protocol.py` | `/execute` `/files/*` `/commands` | **bytes unchanged**—the same HTTP/SSE content runs as-is over vsock |
+| rootfs / kernel | use the docker image (`microsandbox-agent`) | **export the agent image into an ext4 rootfs** + pair it with a guest kernel (see §4.2/4.3) |
 
-**关键观察**：阶段 3 的新东西只有两类——①**传输换成 vsock**（动 client 的传输层 +
-server 的监听方式，但协议字节不变）；②**把「容器镜像」换成「内核 + rootfs」这套 VM
-要的素材**。daemon 和 backend 的执行逻辑、protocol 的契约，全都复用阶段 2 的成果。
-
----
-
-## 3. 拆成三小步（每步都保持既有 42 个测试全绿）
-
-阶段 3 比阶段 2 还重（多了 VM 素材构建 + 特权环境），更要拆小、慢走。
-
-### 3a —— vsock 传输抽象（不需要 VM，纯重构 + 新增传输实现）← 第一步，最安全
-
-**目标**：把 client 与 server 里「写死 TCP」的地方抽出一层 `Transport`，让协议字节与
-传输方式解耦。这一步**完全不碰 Firecracker、不需要 /dev/kvm**，因此能在当前环境直接
-跑、且保证既有 42 个测试一字不动地全绿。
-
-- `client.py`：引入 `Transport` 抽象，两个实现：
-  - `TcpTransport`——把现在的 `urllib`/`_DIRECT_OPENER` 逻辑原样包进去，
-    **行为字节级不变**（local/docker/container/kernel 四个拓扑的测试因此照旧全绿）。
-  - `VsockTransport`——连 Firecracker 的 vsock UDS、做 `CONNECT <port>` 握手、
-    然后在裸 socket 上手写极小 HTTP/1.1 客户端（见 §4.1）。本步只写好、先不接 VM。
-  - `_stream` / `_post_json` / `_wait_until_healthy` 改为经 `transport` 收发。
-- `server.py`：`serve()` 增加 `--transport {tcp,vsock}`。`tcp` 走现在的
-  `asyncio.start_server(host, port)`；`vsock` 用 `socket.AF_VSOCK` 建监听 socket 再
-  `asyncio.start_server(sock=...)`。**handle/分发/backend 全不动。**
-
-**验收**：既有 42 个测试全绿（证明 TCP 路径行为没变）；新增针对 `VsockTransport`
-HTTP 帧编解码的**纯单元测试**（不依赖 VM，喂字节验证 request 拼装 / response+SSE 解析）。
-
-> 为什么先做这步：它把阶段 3 风险最高的「改动最神圣的 client/protocol 边界」与「跑通
-> Firecracker」两件事**解耦**。3a 是一次有测试兜底的安全重构，做完再去碰 VM，心里有底。
-> 这正是阶段 2「2a 先证明搬家不改代码」的同款打法。
-
-### 3b —— 构建 microVM 素材 + 启动 Firecracker，端到端 run_code
-
-**目标**：真正在一个 Firecracker microVM 里把 daemon 跑起来，client 经 vsock 连进去
-`run_code` 拿回结果。
-
-- **素材构建**（`scripts/build-rootfs.sh`，见 §4.2/4.3）：
-  1. 内核：下载一个 Firecracker 兼容的 `vmlinux`（含 virtio-vsock 驱动）。
-  2. rootfs：`docker export` agent 镜像的文件系统 → 注入我们的 `src/microsandbox` 和
-     一个极小 `init` → 用 `mkfs.ext4 -d` 打包成 ext4 镜像（**免 root**，见 §6）。
-- `client.py` 新增 `backend="microvm"`：起 firecracker（`--config-file`）、轮询 vsock
-  `/health`、`close` 时 kill 进程 + 清工作目录（对照 `_spawn_resident_container`）。
-- 容器内 daemon 用 `--transport vsock`。**先用 `--backend local`（无状态子进程）跑通**
-  最短路径，确认 VM+vsock+daemon 链路 OK，再切 `--backend kernel`（有状态，agent 镜像
-  里已有 ipykernel）。
-- **此步需要你先完成一次性特权设置**（加 kvm 组 + 下载 firecracker/vmlinux，见 §7）。
-
-**验收**：`Sandbox(backend="microvm").run_code("print(1+1)")` 从一个**真 VM**里拿回
-`2`；切到 kernel 后端后变量跨 `run_code` 留存；`close` 后无残留 firecracker 进程。
-
-### 3c —— 冷启动测量、资源限制，（拉伸）快照/预热
-
-- **冷启动测量**（ROADMAP 的明确验收项）：记录从 `firecracker` 起进程到 `/health`
-  就绪的耗时，写进文档；与阶段 1/2 的容器启动做个对照。
-- **资源限制**走 Firecracker `machine-config`（`vcpu_count` / `mem_size_mib`），对照
-  阶段 2 的 `--memory/--cpus`，理解「VM 配额」与「cgroup 配额」的差别。
-- **网络**：MVP 用 vsock 做控制通道，**guest 完全不配网卡**——比阶段 2「必须开管理
-  端口、连带放开出网」更干净（见 §5 的安全反超）。需要出网是后续/阶段 4 的事。
-- **（拉伸，可滑到阶段 4）快照 / 恢复**：Firecracker 的 snapshot 能把「已启动到就绪」
-  的 VM 状态存盘，恢复时跳过内核引导，做到**毫秒级冷启动**；再叠一个预热池。这部分与
-  阶段 4「沙箱池」重叠，按兴趣选做。
+**Key observation**: the only new things in Stage 3 fall into two categories—① **swapping the transport to vsock** (touches the client's transport
+layer + the server's listening method, but the protocol bytes don't change); ② **swapping the "container image" for the "kernel + rootfs"
+materials a VM needs**. The daemon's and backend's execution logic, and the protocol's contract, all reuse the Stage 2 work.
 
 ---
 
-## 4. 关键技术点详解（带真实代码锚点）
+## 3. Split into three sub-steps (each keeps the existing 42 tests all green)
 
-### 4.1 vsock：宿主与 VM 怎么说话
+Stage 3 is even heavier than Stage 2 (it adds VM-material building + a privileged environment), so all the more reason to split small and walk slowly.
 
-vsock（virtio-vsock）是为「宿主↔VM」设计的 socket，地址是 `(CID, port)` 而非 `(IP,
-port)`：guest 的 CID 我们设成 3，宿主固定是 2。Firecracker 把 vsock **多路复用到宿主
-的一个 Unix domain socket（UDS）**上，协议是文本握手：
+### 3a — vsock transport abstraction (no VM needed, pure refactor + a new transport implementation) ← first step, the safest
 
-- **宿主 → guest（我们 client 要的方向）**：client 连宿主上的 UDS（如
-  `/tmp/microsandbox-vm-xxxx/fc.vsock`），发一行 `CONNECT <port>\n`（如 `CONNECT 1024`），
-  Firecracker 回 `OK <hostport>\n`，之后这条字节流就接到了 guest 里**监听 `AF_VSOCK`
-  端口 1024** 的进程——也就是我们的 daemon。握手之后，**双方说的就是原来那套 HTTP/SSE**。
-- **guest → 宿主**：guest 连 `(CID=2, port=N)`，Firecracker 去连宿主 UDS `{uds}_{N}`。
-  MVP **用不到这个方向**（daemon 是 server，永远 client 先发起），所以不实现，更简单。
+**Goal**: factor out a `Transport` layer from the places in the client and server that "hardcode TCP", decoupling the protocol bytes from the
+transport method. This step **doesn't touch Firecracker at all and doesn't need /dev/kvm**, so it can run directly in the current environment and
+guarantees the existing 42 tests stay all green without a single edit.
 
-guest 内（`server.py`）监听 vsock，标准库就够：
+- `client.py`: introduce a `Transport` abstraction with two implementations:
+  - `TcpTransport`—wrap the current `urllib`/`_DIRECT_OPENER` logic as-is,
+    **behaviorally byte-for-byte unchanged** (so the tests for the four topologies local/docker/container/kernel stay all green as before).
+  - `VsockTransport`—connect to Firecracker's vsock UDS, do the `CONNECT <port>` handshake,
+    then hand-write a minimal HTTP/1.1 client over the raw socket (see §4.1). This step only writes it; it doesn't wire it to a VM yet.
+  - `_stream` / `_post_json` / `_wait_until_healthy` are changed to send and receive through `transport`.
+- `server.py`: `serve()` gains `--transport {tcp,vsock}`. `tcp` uses the current
+  `asyncio.start_server(host, port)`; `vsock` creates a listening socket with `socket.AF_VSOCK` and then
+  `asyncio.start_server(sock=...)`. **handle/dispatch/backend all stay untouched.**
+
+**Acceptance**: the existing 42 tests are all green (proving the TCP path's behavior didn't change); plus new **pure unit tests** for
+`VsockTransport`'s HTTP frame encode/decode (no VM dependency, feed it bytes to verify request assembly / response+SSE parsing).
+
+> Why do this step first: it **decouples** the two highest-risk things in Stage 3—"changing the most sacred client/protocol boundary" and "getting
+> Firecracker working". 3a is a safe refactor backed by tests; once it's done, going to touch the VM, you have a safety margin.
+> This is the same playbook as Stage 2's "2a first proves the relocation didn't change the code".
+
+### 3b — build the microVM materials + launch Firecracker, end-to-end run_code
+
+**Goal**: actually get the daemon running inside a Firecracker microVM, with the client connecting in over vsock to `run_code` and get the result back.
+
+- **Material building** (`scripts/build-rootfs.sh`, see §4.2/4.3):
+  1. Kernel: download a Firecracker-compatible `vmlinux` (with the virtio-vsock driver).
+  2. rootfs: `docker export` the agent image's filesystem → inject our `src/microsandbox` and
+     a minimal `init` → package it into an ext4 image with `mkfs.ext4 -d` (**no root needed**, see §6).
+- `client.py` adds `backend="microvm"`: start firecracker (`--config-file`), poll vsock
+  `/health`, and on `close` kill the process + clean the working directory (mirroring `_spawn_resident_container`).
+- The in-VM daemon uses `--transport vsock`. **First get the shortest path working with `--backend local`** (stateless subprocess),
+  confirm the VM+vsock+daemon chain is OK, then switch to `--backend kernel` (stateful; the agent image
+  already has ipykernel).
+- **This step requires you to do a one-time privileged setup first** (add the kvm group + download firecracker/vmlinux, see §7).
+
+**Acceptance**: `Sandbox(backend="microvm").run_code("print(1+1)")` gets `2` back from a **real VM**;
+after switching to the kernel backend, variables persist across `run_code`; after `close` there's no leftover firecracker process.
+
+### 3c — cold start measurement, resource limits, (stretch) snapshot/warm-up
+
+- **Cold start measurement** (an explicit acceptance item in the ROADMAP): record the time from `firecracker` starting the process to `/health`
+  being ready, write it into the docs; compare it against Stage 1/2's container startup.
+- **Resource limits** go through Firecracker's `machine-config` (`vcpu_count` / `mem_size_mib`); compare against
+  Stage 2's `--memory/--cpus` to understand the difference between "VM quota" and "cgroup quota".
+- **Network**: the MVP uses vsock as the control channel and **the guest has no NIC configured at all**—cleaner than Stage 2's "must open a management
+  port, which drags outbound network open with it" (see §5's "isolation actually gets stronger"). Needing outbound network is a later/Stage 4 thing.
+- **(Stretch, can slide to Stage 4) snapshot / restore**: Firecracker's snapshot can save the "booted-and-ready"
+  VM state to disk; on restore it skips the kernel boot, achieving a **millisecond-scale cold start**; then layer a warm pool on top. This part overlaps with
+  Stage 4's "sandbox pool", pick by interest.
+
+---
+
+## 4. Key technical points in detail (with real code anchors)
+
+### 4.1 vsock: how the host and the VM talk
+
+vsock (virtio-vsock) is a socket designed for "host↔VM"; its address is `(CID, port)` rather than `(IP,
+port)`: we set the guest's CID to 3, and the host is fixed at 2. Firecracker **multiplexes vsock onto a single
+Unix domain socket (UDS) on the host**, with a text-based handshake protocol:
+
+- **host → guest (the direction our client wants)**: the client connects to the UDS on the host (e.g.
+  `/tmp/microsandbox-vm-xxxx/fc.vsock`), sends a line `CONNECT <port>\n` (e.g. `CONNECT 1024`),
+  Firecracker replies `OK <hostport>\n`, and from then on this byte stream is wired through to the process **listening on `AF_VSOCK`
+  port 1024** inside the guest—that is, our daemon. After the handshake, **both sides speak that same HTTP/SSE as before**.
+- **guest → host**: the guest connects to `(CID=2, port=N)`, and Firecracker connects to the host UDS `{uds}_{N}`.
+  The MVP **doesn't need this direction** (the daemon is the server, the client always initiates), so we don't implement it—simpler.
+
+Inside the guest (`server.py`) listening on vsock, the standard library is enough:
 
 ```python
 import socket, asyncio
 s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-s.bind((socket.VMADDR_CID_ANY, 1024))   # 监听本 VM 的 1024 端口
+s.bind((socket.VMADDR_CID_ANY, 1024))   # listen on this VM's port 1024
 s.listen()
-server = await asyncio.start_server(self.handle, sock=s)   # handle 一行不改
+server = await asyncio.start_server(self.handle, sock=s)   # handle doesn't change one line
 ```
 
-宿主侧（`client.py` 的 `VsockTransport`）因为 `urllib` 不会说这套握手，要手写一个**极
-小 HTTP/1.1 客户端**（我们自己既是 client 又是 server，协议简单，几十行够）：
+On the host side (`client.py`'s `VsockTransport`), because `urllib` doesn't speak this handshake, we hand-write a **minimal
+HTTP/1.1 client** (we are both client and server, the protocol is simple, a few dozen lines suffice):
 
 ```python
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(uds_path)
 sock.sendall(b"CONNECT 1024\n")
-# 读 "OK <port>\n"，确认握手成功
-# 然后把 "POST /execute HTTP/1.1\r\n...\r\n\r\n<body>" 写进去，
-# 再按 Content-Length / text/event-stream 流式读回——逐行 yield，复用既有 SSE 解析。
+# read "OK <port>\n", confirm the handshake succeeded
+# then write "POST /execute HTTP/1.1\r\n...\r\n\r\n<body>" into it,
+# and stream the response back per Content-Length / text/event-stream—yield line by line, reusing the existing SSE parsing.
 ```
 
-> 顺带的红利：3a 把 HTTP 帧收发抽出来后，TCP 路径其实也能脱离 `urllib`。但为了让既有
-> 42 个测试**零行为变化**地全绿，3a 里 `TcpTransport` **仍包着现在的 `urllib`**——
-> 统一成裸 socket 是可选的后续清理，不在阶段 3 的关键路径上。
+> A side dividend: after 3a factors out the HTTP frame send/receive, the TCP path could actually drop `urllib` too. But to keep the existing
+> 42 tests all green with **zero behavior change**, `TcpTransport` in 3a **still wraps the current `urllib`**—
+> unifying everything onto raw sockets is an optional follow-up cleanup, not on Stage 3's critical path.
 
-### 4.2 rootfs：从 docker 镜像导出，免 root 打包
+### 4.2 rootfs: export from the docker image, package without root
 
-Firecracker 要一个 **ext4 磁盘镜像**当根文件系统。我们不从零做，而是复用阶段 2 已经
-build 好的 `microsandbox-agent` 镜像（里面有 Python + ipykernel + jupyter_client）：
+Firecracker needs an **ext4 disk image** as the root filesystem. We don't build it from scratch; instead we reuse the
+`microsandbox-agent` image already built in Stage 2 (it has Python + ipykernel + jupyter_client):
 
 ```
-docker create microsandbox-agent           # 造一个不启动的容器，拿它的 rootfs
-docker export <id> | tar -x -C rootfs/      # 导出整个文件系统树到 rootfs/ 目录
-cp -r src/microsandbox rootfs/opt/.../       # 注入我们的包（阶段 2 是运行时挂载，VM 里得放进去）
-install init  rootfs/init                    # 放一个极小 init（见 §4.3）
-mkfs.ext4 -d rootfs/ microsandbox.ext4 512M  # ★ 用目录直接打包成 ext4，全程不挂载、免 root
+docker create microsandbox-agent           # make a non-started container, to grab its rootfs
+docker export <id> | tar -x -C rootfs/      # export the whole filesystem tree into the rootfs/ directory
+cp -r src/microsandbox rootfs/opt/.../       # inject our package (Stage 2 mounts it at runtime, in the VM it has to be put in)
+install init  rootfs/init                    # place a minimal init (see §4.3)
+mkfs.ext4 -d rootfs/ microsandbox.ext4 512M  # ★ package the directory directly into ext4, never mounting, no root
 ```
 
-`mkfs.ext4 -d <dir>` 是关键：它把一个目录树**直接写进新 ext4 镜像**，不需要 `mount`，
-因此**整条 rootfs 构建链路无需 root**（`docker`/`tar`/`mkfs.ext4 -d` 当前用户都能跑）。
-镜像里文件属主是构建用户（uid 1000），但 guest 内 daemon 以 root 跑，root 能读一切，
-无碍。
+`mkfs.ext4 -d <dir>` is the key: it **writes a directory tree directly into a new ext4 image** without `mount`,
+so **the entire rootfs build chain needs no root** (`docker`/`tar`/`mkfs.ext4 -d` all run as the current user).
+The files in the image are owned by the build user (uid 1000), but the in-guest daemon runs as root, root can read everything,
+no issue.
 
-### 4.3 init：guest 里的 PID 1
+### 4.3 init: PID 1 inside the guest
 
-内核引导完会执行 `init`（PID 1）。我们放一个**极小的 shell init**，挂好伪文件系统就
-`exec` 我们的 daemon（`exec` 让 daemon 接管 PID 1，省一层进程）：
+After the kernel finishes booting it executes `init` (PID 1). We place a **minimal shell init** that mounts the pseudo-filesystems and then
+`exec`s our daemon (`exec` lets the daemon take over PID 1, saving a process layer):
 
 ```sh
 #!/bin/sh
 mount -t proc     proc /proc
 mount -t sysfs    sys  /sys
-mount -t devtmpfs dev  /dev      2>/dev/null   # 可能内核已自动挂
-mount -t tmpfs    tmp  /tmp                    # 唯一可写区，对齐阶段 2 的 --tmpfs /tmp
+mount -t devtmpfs dev  /dev      2>/dev/null   # the kernel may already have mounted it
+mount -t tmpfs    tmp  /tmp                    # the only writable area, matching Stage 2's --tmpfs /tmp
 export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 exec python3 -m microsandbox.server --transport vsock --vsock-port 1024 --backend kernel
 ```
 
-内核引导参数（kernel boot args）里用 `init=/init` 指到它；root 设备是
-`/dev/vda`（我们挂的那块 ext4），`ro` 只读根（写都去 tmpfs /tmp，和阶段 2 一致）。
+In the kernel boot args we use `init=/init` to point to it; the root device is
+`/dev/vda` (the ext4 we attached), with `ro` for a read-only root (all writes go to tmpfs /tmp, same as Stage 2).
 
-### 4.4 启动 Firecracker：声明式 config-file
+### 4.4 Launching Firecracker: declarative config-file
 
-起 VM 有两种方式：REST API（先起进程再一条条 PUT 配置）和 `--config-file`（一个 JSON
-声明所有东西）。**学习期选 `--config-file`**，因为一个文件就能读懂整台 VM 长什么样：
+There are two ways to start a VM: the REST API (start the process first, then PUT configs one by one) and `--config-file` (a single JSON
+declaring everything). **For the learning phase, choose `--config-file`**, because a single file lets you read off what the whole VM looks like:
 
 ```json
 {
@@ -236,145 +235,143 @@ exec python3 -m microsandbox.server --transport vsock --vsock-port 1024 --backen
 }
 ```
 
-`client._spawn_microvm` 干的事，和阶段 2 的 `_spawn_resident_container` 一一对应：
-建一个 per-VM 工作目录 → 写好上面的 config（uds/路径都在该目录）→
+What `client._spawn_microvm` does maps one-to-one to Stage 2's `_spawn_resident_container`:
+create a per-VM working directory → write the above config (uds/paths all inside that directory) →
 `subprocess.Popen(["firecracker", "--config-file", cfg, "--api-sock", api])` →
-`_wait_until_healthy`（走 vsock）→ `close` 时 `proc.terminate()`/`kill()` + 删工作目录。
+`_wait_until_healthy` (over vsock) → on `close`, `proc.terminate()`/`kill()` + delete the working directory.
 
 ---
 
-## 5. 协议/传输演进原则 & 安全反超
+## 5. Protocol/transport evolution principle & "isolation actually gets stronger"
 
-**协议（protocol.py）字节不变**，这条主线在阶段 3 依旧成立——我们只是把同一串 HTTP/SSE
-字节从「TCP 连接」搬到「vsock UDS 连接」上。client 因为传输方式真的变了，**第一次需要
-动**（引入 `Transport` 抽象），但变更被关在传输层，`run_code` 等上层 API 对用户不变；
-`server.py` 的请求处理逻辑、`backend.py` 的执行逻辑全不动。
+**The protocol (protocol.py) bytes are unchanged**, and this main thread still holds in Stage 3—we are only moving the same string of HTTP/SSE
+bytes from a "TCP connection" onto a "vsock UDS connection". Because the transport method really changed, the client **needs to change for the first
+time** (introducing the `Transport` abstraction), but the change is confined to the transport layer; upper-level APIs like `run_code` are unchanged for the user,
+and `server.py`'s request handling logic and `backend.py`'s execution logic all stay put.
 
-**安全：阶段 3 第一次出现「隔离反超」而非「为了管理通道而弱化」。**
-阶段 2 为了让 client 连上容器内 daemon，**必须开一个 TCP 管理端口**，连带把 guest 出网
-也放开了（`STAGE2_DESIGN.md` §6 如实记了这个倒退）。阶段 3 用 vsock 做控制通道，**根本
-不需要给 VM 配网卡**——管理通道走 virtio-vsock，与「有没有网络」正交。于是可以：
+**Security: Stage 3 is the first time "isolation actually gets stronger" appears, rather than "weakened for the sake of a management channel".**
+In Stage 2, to let the client connect to the in-container daemon, it **must open a TCP management port**, which incidentally also opens up the guest's outbound
+network (`STAGE2_DESIGN.md` §6 honestly records this regression). Stage 3 uses vsock as the control channel, so it **fundamentally
+doesn't need to give the VM a NIC**—the management channel goes over virtio-vsock, orthogonal to "whether there's a network". So we can:
 
-- guest **完全不配 virtio-net** → 沙箱代码彻底无网络（回到阶段 1 的断网强度），
-  同时**保留**管理通道。阶段 2 做不到的「既能管又断网」，阶段 3 因 vsock 自然达成。
-- 叠加 guest 独立内核 → 这是项目至此最强的隔离组合。
+- The guest has **no virtio-net at all** → the sandbox code is completely network-less (back to Stage 1's cut-off strength),
+  while **keeping** the management channel. The "manage and yet cut off the network" that Stage 2 couldn't do, Stage 3 achieves naturally thanks to vsock.
+- Stack the guest's own kernel on top → this is the strongest isolation combination in the project so far.
 
 ---
 
-## 6. 本机（WSL2）可行性与一次性特权设置
+## 6. Feasibility on this machine (WSL2) and the one-time privileged setup
 
-环境探测结论（2026-06，本机）：
+Environment-probe conclusions (2026-06, this machine):
 
-| 检查项 | 结果 | 影响 |
+| Check | Result | Impact |
 |--------|------|------|
-| `/dev/kvm` | **存在**（`crw-rw---- root kvm`） | WSL2 嵌套虚拟化已开，Firecracker 有戏 |
-| 架构 | x86_64 | 下载 x86_64 的 firecracker / vmlinux |
-| 当前用户开 `/dev/kvm` | **被拒**（不在 `kvm` 组） | 需加组或 sudo——见下方一次性设置 |
-| 免密 sudo | **不可用** | 我（Claude）无法非交互 sudo，特权步骤须你亲自跑 |
-| `mkfs.ext4` / `docker` / `curl` | 都在 | rootfs 构建链路齐备，且可**免 root**（`mkfs.ext4 -d`） |
-| 磁盘 / 内存 | 919G / 14G 可用 | 充裕 |
+| `/dev/kvm` | **exists** (`crw-rw---- root kvm`) | WSL2 nested virtualization is on, Firecracker has a chance |
+| Architecture | x86_64 | download the x86_64 firecracker / vmlinux |
+| Current user opening `/dev/kvm` | **denied** (not in the `kvm` group) | needs a group add or sudo—see the one-time setup below |
+| Passwordless sudo | **unavailable** | I (Claude) can't sudo non-interactively, so the privileged steps you must run yourself |
+| `mkfs.ext4` / `docker` / `curl` | all present | the rootfs build chain is complete, and can run **without root** (`mkfs.ext4 -d`) |
+| Disk / memory | 919G / 14G available | ample |
 
-**一次性特权设置（请你在终端用 `! <cmd>` 跑，或自己的 shell 里跑）**：
+**One-time privileged setup (please run it in a terminal with `! <cmd>`, or in your own shell)**:
 
 ```bash
-# 1) 把自己加进 kvm 组，让 firecracker 免 sudo 能开 /dev/kvm（一次性）
+# 1) add yourself to the kvm group so firecracker can open /dev/kvm without sudo (one-time)
 sudo usermod -aG kvm $USER
-# 2) 重启 WSL 让组生效：在 Windows PowerShell 里 `wsl --shutdown`，再重开终端
-#    （重开后 `id` 里应能看到 kvm 组，python 直接 open(/dev/kvm) 不再 PermissionError）
+# 2) restart WSL to apply the group: in Windows PowerShell run `wsl --shutdown`, then reopen the terminal
+#    (after reopening, `id` should show the kvm group, and python's open(/dev/kvm) no longer raises PermissionError)
 ```
 
-下载素材（**无需 sudo**，我可以代跑，但放这便于你核对来源）：
+Download the materials (**no sudo needed**, I can run it for you, but it's placed here so you can verify the sources):
 
 ```bash
-# firecracker 静态二进制（GitHub release）
-# vmlinux：Firecracker CI 提供的、含 virtio-vsock 的内核镜像
-# 具体版本号在 3b 落地时确定并写进 scripts/，避免本文档里的 URL 过期
+# firecracker static binary (GitHub release)
+# vmlinux: a kernel image provided by Firecracker CI, with virtio-vsock
+# the exact version numbers are pinned when 3b lands and written into scripts/, to avoid the URLs in this doc going stale
 ```
 
-**过了 kvm 组这一关之后，阶段 3 后续我能全程自动化**：rootfs 走 `mkfs.ext4 -d` 免 root，
-firecracker 加组后免 sudo，测试也能在本机真跑。仍待 3b 启动时**实测验证**的两件事：
-①WSL2 的嵌套 KVM 能被 Firecracker 正常使用；②下载的 vmlinux 里 virtio-vsock 驱动可用。
-这俩是「极可能成、但必须开机见真章」的点，本文不打包票。
+**Once past the kvm-group hurdle, I can fully automate the rest of Stage 3**: the rootfs goes through `mkfs.ext4 -d` without root,
+firecracker needs no sudo after the group add, and the tests can really run on this machine. Two things still pending **hands-on verification when 3b launches**:
+① WSL2's nested KVM can be used normally by Firecracker; ② the virtio-vsock driver in the downloaded vmlinux works.
+These two are "very likely to work, but must be proven by powering on"; this doc doesn't make guarantees.
 
 ---
 
-## 7. 兼容性：阶段 3 是「新增拓扑」，不动旧的
+## 7. Compatibility: Stage 3 is a "new topology", the old ones are untouched
 
-和阶段 2 一样，阶段 3 **新增** `backend="microvm"`，与 `local/docker/container/kernel`
-并存，旧的一个都不删——既有 42 个测试是安全网，必须原样全绿。
+As with Stage 2, Stage 3 **adds** `backend="microvm"`, coexisting with `local/docker/container/kernel`,
+and removes none of the old ones—the existing 42 tests are the safety net and must stay all green as-is.
 
-`tests/conftest.py` 加一个 `requires_firecracker` skip 守卫（检查 firecracker 二进制 +
-`/dev/kvm` 可读 + 素材就绪），缺任一就像 docker 不可用时那样**整组 skip**——这样别的
-机器 / CI 上 `pytest` 仍全绿，本机备齐后才真跑 microVM 用例。`backend` 取值表延伸为：
+`tests/conftest.py` adds a `requires_firecracker` skip guard (checking the firecracker binary +
+`/dev/kvm` readable + materials ready); missing any one **skips the whole group**, just like when docker is unavailable—this way on other
+machines / CI, `pytest` stays all green, and the microVM cases really run only once this machine is set up. The `backend` value table extends to:
 
-| `backend` | 拓扑 | guest/容器内执行后端 | 隔离强度 | 阶段 |
+| `backend` | topology | guest/in-container execution backend | isolation strength | stage |
 |-----------|------|----------------------|----------|------|
-| `local` | 宿主 daemon | 子进程（无隔离） | 无 | 0 |
-| `docker` | 宿主 daemon | 每次一个临时容器 | 共享内核 | 1 |
-| `container` | 常驻容器 | 容器内子进程（无状态） | 共享内核 | 2a |
-| `kernel` | 常驻容器 | Jupyter kernel（有状态） | 共享内核 | 2b |
-| **`microvm`** | **常驻 microVM** | **VM 内 Jupyter kernel（有状态）** | **独立内核+KVM** | **3** |
+| `local` | host daemon | subprocess (no isolation) | none | 0 |
+| `docker` | host daemon | a throwaway container per execution | shared kernel | 1 |
+| `container` | resident container | in-container subprocess (stateless) | shared kernel | 2a |
+| `kernel` | resident container | Jupyter kernel (stateful) | shared kernel | 2b |
+| **`microvm`** | **resident microVM** | **in-VM Jupyter kernel (stateful)** | **own kernel + KVM** | **3** |
 
 ---
 
-## 8. 阶段 3 验收标准
+## 8. Stage 3 acceptance criteria
 
-- [x] **3a**：传输抽象落地；既有 42 个测试零改动全绿（+3 个 vsock 单测 = 45）；
-      `VsockTransport` 的 CONNECT 握手 + HTTP 帧编解码 + SSE 解析有纯单元测试覆盖（不依赖 VM）。
-- [x] **3b**：`backend="microvm"` 端到端跑通——从真 Firecracker microVM 里 `run_code`
-      拿回结果；VM 内 kernel 后端变量跨 `run_code` 留存；`close` 后无残留进程/工作目录。
-      （见 §9 实测记录；`tests/test_microvm.py` 4 项，缺素材自动 skip。）
-- [x] **3c**：冷启动 ~0.94s 已记录；资源限制经 `machine-config` 生效（`test_microvm` 已验）；
-      guest 不配网卡仍可管理（隔离反超已落实）；**拉伸已做**：快照恢复毫秒级冷启动（见 §9）。
-      预热池（一份快照 fork 出 N 台）→ 阶段 4。
-- [ ] 全程 `pytest` 全绿（本机真跑 microVM 用例，无 firecracker 的环境自动 skip）。
+- [x] **3a**: the transport abstraction lands; the existing 42 tests are all green with zero changes (+3 vsock unit tests = 45);
+      `VsockTransport`'s CONNECT handshake + HTTP frame encode/decode + SSE parsing are covered by pure unit tests (no VM dependency).
+- [x] **3b**: `backend="microvm"` works end to end—`run_code` from a real Firecracker microVM
+      gets the result back; the in-VM kernel backend persists variables across `run_code`; after `close` there's no leftover process/working directory.
+      (See §9 for measured records; `tests/test_microvm.py` has 4 items, auto-skipped when materials are missing.)
+- [x] **3c**: cold start ~0.94s recorded; resource limits take effect through `machine-config` (`test_microvm` verifies it);
+      the guest has no NIC yet is still manageable ("isolation actually gets stronger" delivered); **the stretch is done**: snapshot restore gives millisecond-scale cold start (see §9).
+      Warm pool (one snapshot forked into N VMs) → Stage 4.
+- [ ] `pytest` is all green throughout (the microVM cases really run on this machine; environments without firecracker auto-skip).
 
-**与阶段 2 一脉相承的纪律**：新增 backend/传输实现，protocol 字节不变，改动尽量挡在
-client 传输层之外；`tests/` 全绿是跨阶段重构的安全网。
+**The same discipline carried over from Stage 2**: add backend/transport implementations, keep the protocol bytes unchanged, and keep the changes out of
+the client transport layer as much as possible; `tests/` all green is the safety net for cross-stage refactoring.
 
 ---
 
-## 9. 3b 实测记录（本机 WSL2，2026-06）
+## 9. 3b measured records (this machine, WSL2, 2026-06)
 
-跑通了，记录关键事实与踩到的坑（对学习最有价值的部分）：
+It works; recording the key facts and the pitfalls hit (the part most valuable for learning):
 
-- **素材**：firecracker v1.16.0 静态二进制 + Firecracker CI 的 vmlinux 6.1.155（vsock /
-  virtio-blk / ext4 / devtmpfs 全为内建 `=y`，下载前先用 `.config` 验明）。rootfs 由
-  `scripts/build-rootfs.sh` 从 agent 镜像 `docker export` + `mkfs.ext4 -d` 免 root 打包（~250MB）。
-- **冷启动**：`Sandbox(backend="microvm")` 构造到 daemon 就绪稳定 **~0.94s**（含 firecracker
-  起进程 + 内核引导 + python 启动 + daemon 监听 vsock）。多了一整个 guest 内核仍是亚秒级——
-  microVM「砍掉传统 VM 的 BIOS/PCI/USB、只留 virtio」的本钱。（快照做到毫秒级冷启动留给 3c。）
-- **坑 1 · `sys.executable` 为空**：daemon 作为 PID 1 启动、init 没设 `PATH` 时，Python 算不出
-  自己的可执行路径，`local` 后端 `create_subprocess_exec("")` 报 PermissionError。修法：init 里
-  显式 `export PATH=...` 并用绝对路径 exec python（见 `scripts/build-rootfs.sh` 的 /init）。
-- **坑 2 · loopback 默认 down**：kernel 后端的 Jupyter kernel 走 ZMQ over 127.0.0.1，而 microVM
-  的 `lo` 默认 down，导致「kernel 启动 60s 超时」。极简 rootfs 无 ip/ifconfig，故在 daemon 的
-  vsock 启动路径里用 `SIOCSIFFLAGS` ioctl 拉起 `lo`（见 `server._ensure_loopback_up`）。
-- **隔离反超已落实**：guest 只配了 vsock、**没有 virtio-net**——`/sys/class/net` 里只有 `lo`，
-  连 1.1.1.1 直接 OSError（无外网）。即「管理通道走 vsock + 沙箱代码彻底断网」同时成立，
-  正是阶段 2「为开管理端口被迫放开出网」做不到的（§5）。
+- **Materials**: the firecracker v1.16.0 static binary + Firecracker CI's vmlinux 6.1.155 (vsock /
+  virtio-blk / ext4 / devtmpfs all built-in `=y`, verified against `.config` before downloading). The rootfs is built by
+  `scripts/build-rootfs.sh` from the agent image via `docker export` + `mkfs.ext4 -d`, packaged without root (~250MB).
+- **Cold start**: from constructing `Sandbox(backend="microvm")` to the daemon being ready, stably **~0.94s** (including firecracker
+  starting the process + kernel boot + python startup + the daemon listening on vsock). Even with a whole extra guest kernel it's still sub-second—
+  the payoff of the microVM "cutting out a traditional VM's BIOS/PCI/USB, keeping only virtio". (Snapshots achieving millisecond cold start are left to 3c.)
+- **Pitfall 1 · `sys.executable` is empty**: when the daemon starts as PID 1 and init doesn't set `PATH`, Python can't compute
+  its own executable path, and the `local` backend's `create_subprocess_exec("")` raises PermissionError. Fix: in init,
+  explicitly `export PATH=...` and exec python with an absolute path (see `scripts/build-rootfs.sh`'s /init).
+- **Pitfall 2 · loopback is down by default**: the kernel backend's Jupyter kernel speaks ZMQ over 127.0.0.1, but in the microVM
+  `lo` is down by default, causing "kernel startup 60s timeout". The minimal rootfs has no ip/ifconfig, so in the daemon's
+  vsock startup path we bring `lo` up using a `SIOCSIFFLAGS` ioctl (see `server._ensure_loopback_up`).
+- **"Isolation actually gets stronger" delivered**: the guest is configured with only vsock and **no virtio-net**—`/sys/class/net` has only `lo`,
+  and connecting to 1.1.1.1 directly raises OSError (no outbound network). That is, "the management channel goes over vsock + the sandbox code is fully cut off"
+  both hold at once, exactly what Stage 2's "forced to open outbound to expose a management port" couldn't do (§5).
 
-### 快照恢复（3c 拉伸，已实现）
+### Snapshot restore (3c stretch, implemented)
 
-Firecracker 的看家本领：把「已启动并预热」的 VM 状态存盘，恢复时跳过内核引导，毫秒级就绪。
+Firecracker's signature trick: save the "booted and warmed-up" VM state to disk, and on restore skip the kernel boot for millisecond-scale readiness.
 
-- **怎么建**（`scripts/build-snapshot.sh`）：boot 一台 base VM → 预热 Jupyter kernel（跑一段
-  `pass` 强制起 kernel）→ `PATCH /vm {Paused}` → `PUT /snapshot/create {Full}`。产物两份：
-  `vendor/snapshot/vmstate`（~13KB 设备/CPU 状态）+ `memfile`（512MB guest 内存，**含热 kernel**）。
-- **怎么恢复**（`Sandbox(backend="microvm", from_snapshot=True)` → `_restore_microvm`）：起一台
-  空 firecracker → 经 REST API `PUT /snapshot/load` + `resume_vm` 把状态灌回。快照 load/create
-  只能走 API（`--config-file` 表达不了），client 用 `_firecracker_api`（HTTP over AF_UNIX）驱动。
-- **实测对照**（本机）：
+- **How to build** (`scripts/build-snapshot.sh`): boot a base VM → warm up the Jupyter kernel (run a chunk of
+  `pass` to force the kernel up) → `PATCH /vm {Paused}` → `PUT /snapshot/create {Full}`. Two artifacts:
+  `vendor/snapshot/vmstate` (~13KB device/CPU state) + `memfile` (512MB guest memory, **including the hot kernel**).
+- **How to restore** (`Sandbox(backend="microvm", from_snapshot=True)` → `_restore_microvm`): start an
+  empty firecracker → drive the state back in via the REST API `PUT /snapshot/load` + `resume_vm`. Snapshot load/create
+  can only go through the API (`--config-file` can't express it), and the client drives it with `_firecracker_api` (HTTP over AF_UNIX).
+- **Measured comparison** (this machine):
 
-  | 路径 | 就绪 | 首次 run_code | 到首个结果 |
+  | Path | Ready | First run_code | To first result |
   |------|------|---------------|-----------|
-  | 冷启动（`_spawn_microvm`） | ~0.94s | ~0.8s（含 kernel 冷启动） | ~1.77s |
-  | 快照恢复（`_restore_microvm`） | **~0.03–0.04s** | ~0.13s（kernel 已热） | **~0.17s** |
+  | Cold start (`_spawn_microvm`) | ~0.94s | ~0.8s (incl. kernel cold start) | ~1.77s |
+  | Snapshot restore (`_restore_microvm`) | **~0.03–0.04s** | ~0.13s (kernel already hot) | **~0.17s** |
 
-  到首个结果约 **10× 加速**；就绪本身约 30×。
-- **磁盘**：快照只存内存 + 设备状态，**磁盘内容仍由宿主 `rootfs.ext4` 提供**——恢复时它必须
-  还在原路径（恢复路径里 `_check_microvm_available` 仍校验 rootfs 正因如此）。
-- **已知限制（单实例）**：快照里 vsock 的 uds 路径是固定的，同一时刻只能恢复一台。**并发恢复
-  + 预热池**（一份基准快照 fork 出 N 台秒级沙箱）需 per-VM 的 uds override，留到阶段 4。
-</content>
-</invoke>
+  To first result, about **10× speedup**; readiness itself about 30×.
+- **Disk**: a snapshot only stores memory + device state, **the disk contents are still provided by the host's `rootfs.ext4`**—on restore it must
+  still be at the original path (which is why the restore path's `_check_microvm_available` still validates the rootfs).
+- **Known limitation (single instance)**: the vsock uds path in the snapshot is fixed, so only one VM can be restored at a time. **Concurrent restore
+  + a warm pool** (one base snapshot forked into N second-scale sandboxes) needs a per-VM uds override, left to Stage 4.

@@ -1,8 +1,10 @@
-"""阶段 1 隔离测试（docker 后端专属）。
+"""Stage 1 isolation tests (docker backend only).
 
-这些断言对 local 后端不成立（它能看见宿主文件、能上网），所以不走参数化的
-sandbox fixture，单独用 docker_sandbox。每条测试对应 docker run 的一个隔离
-flag——跑通它们，「隔离」就不再是一个抽象词，而是看得见的行为差异。
+These assertions don't hold for the local backend (it can see host files and
+reach the network), so they don't use the parametrized sandbox fixture but
+docker_sandbox on its own. Each test corresponds to one of docker run's isolation
+flags -- once they pass, "isolation" is no longer an abstract word but a visible
+behavioral difference.
 """
 
 import pathlib
@@ -12,21 +14,23 @@ from microsandbox import Sandbox
 
 
 def test_host_filesystem_invisible(docker_sandbox: Sandbox) -> None:
-    """容器有独立的根文件系统（mount namespace）：宿主路径在容器内不存在。
+    """The container has its own root filesystem (mount namespace): the host path doesn't exist inside the container.
 
-    对比：一模一样的代码在 local 后端下会打印 True——这层对比就是文件系统隔离。
+    For comparison: the exact same code under the local backend prints True --
+    that comparison is filesystem isolation.
     """
-    host_path = str(pathlib.Path(__file__).resolve())  # 本仓库内真实存在的文件
+    host_path = str(pathlib.Path(__file__).resolve())  # a file that genuinely exists within this repo
     ex = docker_sandbox.run_code(f"import os; print(os.path.exists({host_path!r}))")
     assert ex.success
     assert ex.stdout.strip() == "False"
 
 
 def test_network_disabled(docker_sandbox: Sandbox) -> None:
-    """--network none：容器没有网卡和路由，连外网立刻失败。
+    """--network none: the container has no NIC or routes, so reaching the internet fails immediately.
 
-    故意用 IP 直连（1.1.1.1）避免 DNS 解析挂起；无路由时 connect 抛
-    OSError: Network is unreachable——是快速失败，不会等满 settimeout。
+    Deliberately connect by raw IP (1.1.1.1) to avoid DNS resolution hanging; with
+    no route, connect raises OSError: Network is unreachable -- a fast failure that
+    doesn't wait out the full settimeout.
     """
     ex = docker_sandbox.run_code(
         "import socket\n"
@@ -39,7 +43,7 @@ def test_network_disabled(docker_sandbox: Sandbox) -> None:
 
 
 def test_readonly_root_but_tmp_writable(docker_sandbox: Sandbox) -> None:
-    """--read-only 让根文件系统只读；--tmpfs /tmp 留出唯一可写区（内存盘）。"""
+    """--read-only makes the root filesystem read-only; --tmpfs /tmp leaves the only writable area (a RAM disk)."""
     ex = docker_sandbox.run_code(
         "try:\n"
         "    open('/etc/hacked', 'w')\n"
@@ -54,10 +58,11 @@ def test_readonly_root_but_tmp_writable(docker_sandbox: Sandbox) -> None:
 
 
 def test_timeout_cleans_up_container(docker_sandbox: Sandbox) -> None:
-    """超时路径的生命周期回归：docker rm -f 真的把容器杀掉并删除了。
+    """Lifecycle regression for the timeout path: docker rm -f really does kill and delete the container.
 
-    杀掉 docker run 客户端进程并不能杀死容器（见 DockerBackend 注释），
-    若清理链路失效，这里会看到残留的 microsandbox-exec-* 容器。
+    Killing the docker run client process does not kill the container (see the
+    DockerBackend comments); if the cleanup chain fails, you'd see leftover
+    microsandbox-exec-* containers here.
     """
     docker_sandbox.timeout_seconds = 0.5
     ex = docker_sandbox.run_code("import time; time.sleep(30)")
@@ -69,4 +74,4 @@ def test_timeout_cleans_up_container(docker_sandbox: Sandbox) -> None:
         capture_output=True,
         text=True,
     )
-    assert leftovers.stdout.strip() == "", "超时后不应有残留容器"
+    assert leftovers.stdout.strip() == "", "there should be no leftover container after a timeout"

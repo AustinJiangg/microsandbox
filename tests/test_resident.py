@@ -1,12 +1,15 @@
-"""阶段 2a 测试：daemon 搬进常驻容器（envd 化）。
+"""Stage 2a tests: the daemon moves into a resident container (becoming envd-like).
 
-验证阶段 2 的「主从关系反转」真的发生了：
-  - daemon 不再跑在宿主，而在一个由 client 创建并长期持有的容器里——
-    所以容器内看不见宿主文件（mount namespace 隔离）；
-  - 这个容器随 Sandbox 创建而起、随 close 而灭（生命周期 + 清理）。
+Verifies that Stage 2's "master/slave inversion" really happened:
+  - the daemon no longer runs on the host, but inside a container created and
+    held long-term by the client -- so host files are invisible inside the
+    container (mount namespace isolation);
+  - this container is born when the Sandbox is created and dies on close
+    (lifecycle + cleanup).
 
-注意：状态留存（连续两次 run_code 共享变量的「真 REPL」）是阶段 2b 的事，
-这里还不测——2a 容器内仍是每次执行一个无状态子进程。
+Note: state persistence (a "real REPL" where two consecutive run_code calls
+share variables) is a Stage 2b matter and isn't tested here yet -- inside 2a the
+container still runs a stateless subprocess per execution.
 """
 
 import pathlib
@@ -18,7 +21,7 @@ from microsandbox import Sandbox
 
 
 def _container_ids(name: str, *, include_stopped: bool = False) -> str:
-    """按名字查容器 id；include_stopped=True 时连已停止的也算（用 -a）。"""
+    """Look up a container id by name; with include_stopped=True, stopped ones count too (uses -a)."""
     cmd = ["docker", "ps", "--filter", f"name={name}", "-q"]
     if include_stopped:
         cmd.insert(2, "-a")
@@ -26,11 +29,13 @@ def _container_ids(name: str, *, include_stopped: bool = False) -> str:
 
 
 def test_daemon_runs_inside_container(resident_sandbox: Sandbox) -> None:
-    """daemon 真的在容器里：宿主上真实存在的文件，在沙箱里看不见。
+    """The daemon really is inside the container: a file that genuinely exists on the host is invisible inside the sandbox.
 
-    对比 backend="local"（daemon 在宿主）跑同样代码会打印 True——这层差异
-    就是「daemon 搬进容器」的直接证据。注意 2a 只把 src/ 只读挂进容器，
-    本测试文件不在挂载范围内，所以它的宿主路径在容器内不存在。
+    For comparison, running the same code under backend="local" (daemon on the
+    host) prints True -- this difference is direct evidence that "the daemon moved
+    into the container." Note 2a only read-only-mounts src/ into the container;
+    this test file is not within the mount, so its host path doesn't exist inside
+    the container.
     """
     host_path = str(pathlib.Path(__file__).resolve())
     ex = resident_sandbox.run_code(
@@ -41,29 +46,31 @@ def test_daemon_runs_inside_container(resident_sandbox: Sandbox) -> None:
 
 
 def test_container_lifecycle(resident_sandbox: Sandbox) -> None:
-    """常驻容器随 Sandbox 起灭：open 期间在跑，close 后被删除（不留残留）。"""
+    """The resident container lives and dies with the Sandbox: running while open, deleted after close (no leftovers)."""
     name = resident_sandbox._container
     assert name is not None
-    assert _container_ids(name), "Sandbox 打开期间，常驻容器应当在运行"
+    assert _container_ids(name), "while the Sandbox is open, the resident container should be running"
 
     resident_sandbox.close()
-    assert not _container_ids(name, include_stopped=True), "close 后不应有残留容器"
+    assert not _container_ids(name, include_stopped=True), "there should be no leftover container after close"
 
 
 def test_failed_startup_cleans_up_container(docker_env, monkeypatch) -> None:
-    """回归：构造期健康检查失败时，已起的容器要被兜底清理掉，不能泄漏。
+    """Regression: when the health check fails during construction, the already-started container must be cleaned up as a safety net and not leak.
 
-    背景：__init__ 里 _spawn_resident_container 成功后容器就已经在跑了，若紧接着
-    _wait_until_healthy 抛异常，异常会从 __init__ 穿出去——此时 with 还没进
-    __enter__，__exit__/close 不会触发。若 __init__ 不自己兜底，就会留下没人收的
-    残留容器。这里故意让健康检查必失败，验证兜底 close 真的把容器删了。
+    Background: inside __init__, once _spawn_resident_container succeeds the
+    container is already running; if _wait_until_healthy then raises, the
+    exception propagates out of __init__ -- at this point `with` hasn't entered
+    __enter__, so __exit__/close won't fire. If __init__ doesn't clean up itself,
+    it leaves an orphaned leftover container. Here we deliberately force the health
+    check to fail, verifying the safety-net close really deletes the container.
     """
     captured: dict[str, str] = {}
     real_spawn = Sandbox._spawn_resident_container
 
     def spy_spawn(self: Sandbox) -> None:
-        real_spawn(self)                   # 真的把容器起起来
-        captured["name"] = self._container  # 记下容器名，待会儿核对它被删了
+        real_spawn(self)                   # actually bring the container up
+        captured["name"] = self._container  # record the container name to later confirm it was deleted
 
     def boom(self: Sandbox) -> None:
         raise RuntimeError("forced health-check failure")
@@ -74,6 +81,6 @@ def test_failed_startup_cleans_up_container(docker_env, monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="forced health-check failure"):
         Sandbox(backend="container")
 
-    assert "name" in captured, "容器应当已经起来过（否则没测到泄漏路径）"
+    assert "name" in captured, "the container should have come up (otherwise the leak path wasn't exercised)"
     assert not _container_ids(captured["name"], include_stopped=True), \
-        "构造失败后应兜底清理掉已起的容器，不留残留"
+        "after a failed construction the already-started container should be cleaned up as a safety net, leaving no leftover"

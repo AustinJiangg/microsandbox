@@ -1,45 +1,46 @@
-"""阶段 0 快速上手示例。
+"""Stage 0 quickstart example.
 
-直接运行：
+Run it directly:
     python examples/quickstart.py
 
-它会自动在本机拉起一个沙箱守护进程，跑几段代码，然后清理。
+It automatically spins up a sandbox daemon locally, runs a few snippets of code,
+and then cleans up.
 """
 
 from microsandbox import Sandbox
 
 
 def main() -> None:
-    # spawn_local=True（默认）会自动起一个本机守护进程并在退出时关闭。
+    # spawn_local=True (the default) automatically starts a local daemon and shuts it down on exit.
     with Sandbox() as sandbox:
-        print("=== 1. 基本输出 ===")
+        print("=== 1. Basic output ===")
         ex = sandbox.run_code("print('hello from the sandbox')")
         print("stdout:", ex.stdout.strip())
         print("exit_code:", ex.exit_code, "success:", ex.success)
         print()
 
-        print("=== 2. 多行计算 ===")
+        print("=== 2. Multi-line computation ===")
         ex = sandbox.run_code(
             "total = sum(range(101))\n"
-            "print(f'0..100 求和 = {total}')"
+            "print(f'sum of 0..100 = {total}')"
         )
         print("stdout:", ex.stdout.strip())
         print()
 
-        print("=== 3. 流式输出（边跑边收）===")
+        print("=== 3. Streaming output (received as it runs) ===")
         sandbox.run_code(
             "import time\n"
             "for i in range(3):\n"
             "    print(f'tick {i}')\n"
             "    time.sleep(0.3)\n",
-            on_stdout=lambda chunk: print("  [实时]", chunk.strip()),
+            on_stdout=lambda chunk: print("  [live]", chunk.strip()),
         )
         print()
 
-        print("=== 4. 捕获错误 ===")
-        ex = sandbox.run_code("raise ValueError('故意出错')")
+        print("=== 4. Capturing errors ===")
+        ex = sandbox.run_code("raise ValueError('intentional error')")
         print("success:", ex.success)
-        print("stderr 末尾:", ex.stderr.strip().splitlines()[-1] if ex.stderr else "")
+        print("stderr tail:", ex.stderr.strip().splitlines()[-1] if ex.stderr else "")
         print("exit_code:", ex.exit_code)
 
 

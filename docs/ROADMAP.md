@@ -1,120 +1,120 @@
-# 路线图（ROADMAP）
+# Roadmap (ROADMAP)
 
-每个阶段都列出：**学习目标**、**要做的事**、**完成标准**。
-建议每完成一项就在这里勾选，并同步更新 `CLAUDE.md` 顶部的「当前在这里」。
-
----
-
-## ✅ 阶段 0：进程级骨架（已完成）
-
-**学习目标**：理解 client↔daemon 的 RPC / 流式通信模型，把三层骨架立起来。
-
-- [x] 定义协议（ExecuteRequest / OutputEvent / Execution）
-- [x] LocalSubprocessBackend：子进程执行 + 超时 + stdout/stderr 分离
-- [x] daemon：HTTP + SSE 流式
-- [x] client SDK：run_code + 流式回调 + 自动起停 daemon
-- [x] 测试与示例
-
-**完成标准**：`python examples/quickstart.py` 跑通；`pytest` 全绿。
+Each stage lists: **learning goal**, **what to do**, **acceptance criteria**.
+The recommendation is to check off each item here as you finish it, and keep the "You are here" marker at the top of `CLAUDE.md` in sync.
 
 ---
 
-## ✅ 阶段 1：Docker 容器隔离（已完成）
+## ✅ Stage 0: Process-level skeleton (done)
 
-**学习目标**：第一次真正的隔离。理解文件系统/网络隔离、cgroups 资源限制、容器生命周期。
+**Learning goal**: Understand the RPC / streaming communication model between client↔daemon, and stand up the three-layer skeleton.
 
-- [x] 新增 `DockerBackend(ExecutionBackend)`：直接用 `docker` CLI + asyncio 子进程
-      （不引入 docker-py——保持零运行时依赖，且 docker-py 是同步库，进 asyncio daemon 反而绕）。
-- [x] 每次执行对应一个一次性容器（per-Sandbox 容器复用属于阶段 2 的有状态化）：
-   - 镜像：官方 `python:3.12-slim`，执行路径 `--pull never`，需先手动 `docker pull`。
-   - 限制：`--memory`/`--memory-swap`、`--cpus`、`--network none`、`--pids-limit`、
-     `--read-only` + `--tmpfs /tmp`（只读根 + 临时可写层）。
-   - 执行：代码经 argv 传入（`python -u -c <code>`，与阶段 0 同构；argv 上限 ~2MB 阶段 1 够用）。
-- [x] daemon 加 `--backend {local,docker}` 开关 + 启动期 Docker 可用性检查；
-      client 加 `Sandbox(backend=...)` 透传。**daemon 本阶段仍留在宿主机**——
-      「daemon 搬进容器」是阶段 2 的事（对应 E2B envd）；本阶段验证的正是
-      「换隔离 = 换 backend，client 与 protocol 不动」。
-- [x] 超时与清理：超时 `docker rm -f` 杀容器（杀 docker run 客户端进程杀不死容器！），
-      finally 幂等兜底；容器统一命名 `microsandbox-exec-*` 便于兜底清理。
+- [x] Define the protocol (ExecuteRequest / OutputEvent / Execution)
+- [x] LocalSubprocessBackend: subprocess execution + timeout + stdout/stderr separation
+- [x] daemon: HTTP + SSE streaming
+- [x] client SDK: run_code + streaming callback + auto start/stop of the daemon
+- [x] Tests and examples
 
-**完成标准（已达成）**：原有 7 个测试在 local/docker 双后端参数化下全绿（7×2）；
-新增 4 个隔离测试：宿主文件不可见、断网、只读根 + /tmp 可写、超时后无残留容器。
-
-**注意**：容器隔离仍不足以跑完全不可信代码（容器逃逸面较大），文档需如实说明。
+**Acceptance criteria**: `python examples/quickstart.py` runs end to end; `pytest` is all green.
 
 ---
 
-## ✅ 阶段 2：容器内常驻 agent + 有状态 REPL（已完成）
+## ✅ Stage 1: Docker container isolation (done)
 
-**学习目标**：对齐 E2B 核心架构 —— 沙箱内常驻一个 agent（envd），支持跨调用保留状态。
+**Learning goal**: The first real isolation. Understand filesystem/network isolation, cgroups resource limits, and the container lifecycle.
 
-**核心是一次「主从关系反转」**：daemon 从宿主搬进**长期存活**的容器里常驻，
-「创建隔离环境」的职责从 backend 上移到 client。详细设计见 `docs/STAGE2_DESIGN.md`。
+- [x] Add `DockerBackend(ExecutionBackend)`: drive the `docker` CLI directly via asyncio subprocesses
+      (no docker-py—to keep zero runtime dependencies, and because docker-py is a synchronous library that would only get more convoluted inside an asyncio daemon).
+- [x] Each execution maps to a single throwaway container (per-Sandbox container reuse is the stateful work in Stage 2):
+   - Image: the official `python:3.12-slim`; the execution path uses `--pull never`, so you must `docker pull` it beforehand.
+   - Limits: `--memory`/`--memory-swap`, `--cpus`, `--network none`, `--pids-limit`,
+     `--read-only` + `--tmpfs /tmp` (read-only root + a temporary writable layer).
+   - Execution: code is passed via argv (`python -u -c <code>`, structurally the same as Stage 0; the ~2MB argv limit is enough for Stage 1).
+- [x] The daemon gets a `--backend {local,docker}` switch + a startup-time Docker availability check;
+      the client gets `Sandbox(backend=...)` to pass it through. **The daemon still lives on the host in this stage**—
+      "move the daemon into the container" is Stage 2's job (corresponding to E2B's envd); what this stage validates is precisely
+      "swapping isolation = swapping the backend, while the client and protocol stay untouched".
+- [x] Timeout and cleanup: on timeout, `docker rm -f` kills the container (killing the docker run client process does not kill the container!),
+      with an idempotent fallback in `finally`; containers are uniformly named `microsandbox-exec-*` to make fallback cleanup easy.
 
-拆成三小步，每步都保持既有测试全绿：
+**Acceptance criteria (met)**: the original 7 tests pass under parametrization across both the local/docker backends (7×2);
+plus 4 new isolation tests: host files invisible, no network, read-only root + writable /tmp, and no leftover container after a timeout.
 
-- [x] **2a envd 化（搬家，状态先不留存）**
-   - 开发期不建镜像：把 `src/` 只读挂载进 `python:3.12-slim`，
-     `python -m microsandbox.server` 跑在容器里。
-   - `client` 新增 `backend="container"`：`docker run -d` 起常驻容器、映射端口、
-     健康探测、`close` 时 `docker rm -f`。容器内 daemon 仍用无状态的
-     `LocalSubprocessBackend`。**`server.py` 一行不改**（已支持 `--host/--port/--backend`）。
-   - 验收达成：端到端用例在 `local`/`docker`/`container` 三拓扑下参数化全绿（7×3）。
-- [x] **2b 有状态 REPL** —— 持久解释器用 **Jupyter / IPython kernel**（对齐 E2B）。
-   - 新增 `JupyterKernelBackend`：daemon 托管常驻 kernel，用 ZMQ 走 Jupyter 消息协议，
-     把 iopub 的 stream/execute_result/error/idle 翻译回 `OutputEvent`，`/execute` 协议不变。
-   - **首次引入运行时依赖** `ipykernel` + `jupyter_client`（`[kernel]` 可选 extra，
-     backend 内懒导入）；新增 `Dockerfile` 构建 agent 镜像；`client` 新增 `backend="kernel"`。
-   - 超时用 **interrupt（SIGINT）而非杀进程**：打断当前 cell 但 kernel 与命名空间存活。
-   - 验收达成：变量/函数/import 跨 `run_code` 留存；超时后 kernel 不死、旧变量仍可用。
-- [x] **2c 文件 / shell API** —— `protocol.py` **向后兼容新增** `/files/{read,write,list}`、
-   `/commands`（`/execute` 与既有 dataclass 不动）；client 加 `sandbox.files.*` /
-   `sandbox.commands.*`，对齐 E2B 手感。
-   - 关键设计：文件/命令由 **daemon 直接在自身 FS 上完成、不经 ExecutionBackend**——
-     对齐 E2B envd（文件/进程服务与跑代码的 kernel 是分开的）。
-   - 验收达成：写读往返、文件对 `run_code` 可见、列目录、`commands.run` 拿到 shell 输出
-     （含非零退出码）。常驻容器 `--read-only` 根，写仅限 `/tmp`，写别处如实报错。
-
-**注意（网络/安全弱化）**：阶段 2 容器要开管理端口给 client，故**不能再 `--network none`**，
-容器内代码的对外网络随之放开——这一点**隔离反而弱于阶段 1**。强隔离仍要等阶段 3。
-
-**完成标准**：连续两次 `run_code`，第二次能用第一次定义的变量；文件 API 往返成功；全程 `pytest` 全绿。
+**Note**: container isolation is still not enough to run fully untrusted code (the container escape surface is fairly large); the docs must say so honestly.
 
 ---
 
-## ✅ 阶段 3：Firecracker microVM 隔离（已完成）
+## ✅ Stage 2: Resident agent inside the container + stateful REPL (done)
 
-**学习目标**：理解强隔离原理、microVM、vsock 通信、快照实现毫秒级冷启动。**本阶段慢下来手动理解，别全靠 vibe。**
+**Learning goal**: Align with E2B's core architecture—a resident agent (envd) lives inside the sandbox and supports preserving state across calls.
 
-详细设计与实测记录见 `docs/STAGE3_DESIGN.md`。拆成 3a/3b/3c：
+**The core is one "ownership inversion"**: the daemon moves out of the host and into a **long-lived** container where it stays resident,
+and the responsibility of "creating the isolated environment" moves up from the backend to the client. See `docs/STAGE2_DESIGN.md` for the detailed design.
 
-- [x] **3a**：vsock 传输抽象——client/server 抽出 `Transport` 层，TCP 路径行为字节级不变
-      （既有测试不改即全绿），新增 `_VsockTransport`（CONNECT 握手 + 裸 socket 上的最小 HTTP）。
-- [x] **3b**：从 Docker 镜像导出 rootfs（`mkfs.ext4 -d` 免 root）+ 启动 Firecracker microVM
-      （用 `--config-file` 声明式，非 REST），把阶段 2 的 agent 放进 rootfs，daemon 监听 vsock 而非
-      TCP；端到端 `run_code`，VM 内 kernel 后端有状态；资源限制走 machine-config（vCPU/内存）。
-- [x] **3c**：冷启动 ~0.94s 已记录、资源限制测试已加；**拉伸已做**——Firecracker 快照恢复
-      毫秒级冷启动（~30ms 就绪、10× 到首个结果，见 STAGE3_DESIGN §9）。预热池归阶段 4。
+Split into three sub-steps, each keeping the existing tests all green:
 
-**完成标准（已达成）**：能在 microVM 里跑代码并拿回结果 ✅；测量并记录冷启动时间 ✅
-（冷启动 ~0.94s，快照恢复 ~30ms）。
+- [x] **2a envd-ification (relocation, state not yet preserved)**
+   - No image build during development: mount the host's `src/` read-only into `python:3.12-slim` and
+     run `python -m microsandbox.server` inside the container.
+   - `client` adds `backend="container"`: `docker run -d` to start a resident container, map the port,
+     do a health probe, and `docker rm -f` on `close`. The in-container daemon still uses the stateless
+     `LocalSubprocessBackend`. **Not a single line of `server.py` changes** (it already supports `--host/--port/--backend`).
+   - Acceptance met: the end-to-end cases pass under parametrization across the three topologies `local`/`docker`/`container` (7×3).
+- [x] **2b stateful REPL** — the persistent interpreter uses a **Jupyter / IPython kernel** (aligned with E2B).
+   - Add `JupyterKernelBackend`: the daemon hosts a resident kernel, speaks the Jupyter messaging protocol over ZMQ, and
+     translates iopub's stream/execute_result/error/idle back into `OutputEvent`s; the `/execute` protocol is unchanged.
+   - **First introduction of runtime dependencies**: `ipykernel` + `jupyter_client` (a `[kernel]` optional extra,
+     lazily imported inside the backend); a new `Dockerfile` builds the agent image; `client` adds `backend="kernel"`.
+   - Timeout uses **interrupt (SIGINT) rather than killing the process**: it aborts the current cell but the kernel and its namespace survive.
+   - Acceptance met: variables/functions/imports persist across `run_code`; after a timeout the kernel does not die and old variables are still usable.
+- [x] **2c file / shell API** — `protocol.py` gets a **backward-compatible addition** of `/files/{read,write,list}` and
+   `/commands` (`/execute` and the existing dataclasses are untouched); the client adds `sandbox.files.*` /
+   `sandbox.commands.*`, matching the E2B feel.
+   - Key design: files/commands are handled **by the daemon directly on its own FS, without going through the ExecutionBackend**—
+     aligned with E2B's envd (the file/process services are separate from the kernel that runs code).
+   - Acceptance met: write-then-read round-trip, files visible to `run_code`, directory listing, and `commands.run` returning shell output
+     (including a non-zero exit code). The resident container has a `--read-only` root, writes are limited to `/tmp`, and writing elsewhere reports an honest error.
+
+**Note (network/security weakening)**: a Stage 2 container has to open a management port for the client, so it **can no longer use `--network none`**,
+which in turn opens up the in-container code's outbound network—on this point the **isolation is actually weaker than Stage 1**. Strong isolation still has to wait for Stage 3.
+
+**Acceptance criteria**: across two consecutive `run_code` calls, the second can use a variable defined by the first; the file API round-trips successfully; `pytest` is all green throughout.
 
 ---
 
-## ⬜ 阶段 4：产品化外围（按兴趣选做）
+## ✅ Stage 3: Firecracker microVM isolation (done)
 
-**学习目标**：把「一个沙箱」做成「沙箱服务」。
+**Learning goal**: Understand the principles of strong isolation, microVMs, vsock communication, and how snapshots achieve millisecond-scale cold starts. **Slow down and understand this stage by hand—don't run on vibes alone.**
 
-候选项：
-- [ ] 控制面 API：`POST /sandboxes` 创建、`DELETE` 销毁、列表。
-- [ ] 沙箱池预热，降低冷启动。
-- [ ] 自定义模板/镜像（预装依赖）。
-- [ ] 鉴权与配额、超时回收、用量统计。
-- [ ] 多语言 backend（node、bash）。
+See `docs/STAGE3_DESIGN.md` for the detailed design and measured records. Split into 3a/3b/3c:
+
+- [x] **3a**: vsock transport abstraction—client/server factor out a `Transport` layer, with the TCP path byte-for-byte unchanged
+      (existing tests pass with no edits), plus a new `_VsockTransport` (CONNECT handshake + minimal HTTP over a raw socket).
+- [x] **3b**: export a rootfs from the Docker image (`mkfs.ext4 -d`, no root needed) + launch a Firecracker microVM
+      (declaratively via `--config-file`, not REST), put the Stage 2 agent into the rootfs, and have the daemon listen on vsock instead of
+      TCP; end-to-end `run_code`, with the in-VM kernel backend stateful; resource limits go through machine-config (vCPU/memory).
+- [x] **3c**: cold start ~0.94s recorded, resource-limit tests added; **the stretch goal is done**—Firecracker snapshot restore gives
+      millisecond-scale cold starts (~30ms to ready, 10× to first result, see STAGE3_DESIGN §9). The warm pool belongs to Stage 4.
+
+**Acceptance criteria (met)**: able to run code inside a microVM and get the result back ✅; cold start time measured and recorded ✅
+(cold start ~0.94s, snapshot restore ~30ms).
 
 ---
 
-## 对照学习建议
+## ⬜ Stage 4: Productization periphery (pick by interest)
 
-完成阶段 2 后，回头读 E2B 源码的 `envd` 与编排部分，会非常有共鸣。
-跳过 SDK 多语言绑定、dashboard、billing —— 那些是产品外围，不是核心机制。
+**Learning goal**: Turn "a sandbox" into "a sandbox service".
+
+Candidates:
+- [ ] Control-plane API: `POST /sandboxes` to create, `DELETE` to destroy, plus list.
+- [ ] Sandbox pool warm-up to reduce cold start.
+- [ ] Custom templates/images (with dependencies pre-installed).
+- [ ] Authentication and quotas, timeout-based reclamation, usage statistics.
+- [ ] Multi-language backends (node, bash).
+
+---
+
+## Suggested comparative study
+
+After finishing Stage 2, go back and read the `envd` and orchestration parts of the E2B source—it will resonate strongly.
+Skip the SDK's multi-language bindings, the dashboard, and billing—those are productization periphery, not the core mechanism.

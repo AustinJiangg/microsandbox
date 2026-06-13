@@ -1,6 +1,7 @@
-"""microsandbox —— 一个从零实现、逐步逼近 E2B 的学习用代码沙箱。
+"""microsandbox -- a from-scratch, learning-oriented code sandbox that incrementally approaches E2B.
 
-公开 API 只暴露 SDK 层，底层 server / backend 视为实现细节。
+The public API exposes only the SDK layer; the underlying server / backend are
+implementation details.
 """
 
 from .client import Sandbox
@@ -14,4 +15,4 @@ __all__ = [
     "EventType",
 ]
 
-__version__ = "0.1.0"  # 阶段 1（版本语义：0.阶段号.补丁，与 pyproject.toml 手动同步）
+__version__ = "0.1.0"  # version scheme: 0.<stage>.<patch>, kept in sync with pyproject.toml by hand

@@ -1,99 +1,137 @@
-# 架构（ARCHITECTURE）
+# Architecture
 
-本文件解释 `microsandbox` 的设计，以及为什么这样设计能支撑「分阶段逼近 E2B」。
+This document explains the design of `microsandbox` and why it can support
+"approaching E2B in stages".
 
-## 全局数据流
+## Global data flow
 
 ```
-   你的程序
+   your program
       │  sandbox.run_code("print(1)")
       ▼
 ┌───────────────┐   HTTP POST /execute        ┌────────────────────────┐
-│  client (SDK) │ ───────────────────────────▶│   daemon (守护进程)      │
+│  client (SDK) │ ───────────────────────────▶│   daemon                │
 │  client.py    │                              │   server.py            │
 │               │ ◀─────────────────────────── │                        │
-└───────────────┘   SSE 流: OutputEvent...      │   ┌──────────────────┐ │
-      ▲                                         │   │ backend (执行后端) │ │
+└───────────────┘   SSE stream: OutputEvent... │   ┌──────────────────┐ │
+      ▲                                         │   │ backend           │ │
       │ Execution(stdout/stderr/exit_code)      │   │ backend.py        │ │
-   聚合返回                                       │   └──────────────────┘ │
+   aggregated result                            │   └──────────────────┘ │
                                                 └────────────────────────┘
-                                                  ↑ 隔离边界在这里逐阶段加强
+                                                  ↑ the isolation boundary
+                                                    hardens here, stage by stage
 ```
 
-## 三个组件的职责
+The transport under that arrow starts as TCP and becomes vsock at Stage 3, but
+the HTTP/SSE bytes flowing over it stay the same (see "Transport abstraction").
 
-### 1. protocol.py —— 契约（最重要）
+## Responsibilities of the three components
 
-定义 client 与 daemon 之间传什么：
-- `ExecuteRequest`：要跑的代码、语言、超时。
-- `OutputEvent`：一条流式输出（stdout / stderr / error / end）。
-- `Execution`：client 把多条 event 聚合成的最终结果对象。
+### 1. protocol.py — the contract (most important)
 
-**为什么单独抽出来**：隔离层在阶段 0→3 会彻底换三次，但只要这份协议稳定，
-client 几乎不用改。这是整个项目能「渐进演进」的支点。E2B 也是靠稳定的
-client↔envd 协议来解耦 SDK 与底层运行时。
+Defines what travels between client and daemon:
+- `ExecuteRequest`: the code to run, the language, the timeout.
+- `OutputEvent`: one streamed output (stdout / stderr / error / end).
+- `Execution`: the final result object the client builds by aggregating events.
 
-### 2. client.py —— SDK
+**Why it's pulled out separately**: the isolation layer is swapped several times
+across Stages 0→3, but as long as this protocol stays stable, the client barely
+changes. This is the pivot that lets the whole project evolve incrementally. E2B
+likewise decouples its SDK from the underlying runtime via a stable client↔envd
+protocol.
 
-用户唯一需要直接接触的层。提供 `Sandbox` 类、`run_code()`、流式回调。
+### 2. client.py — the SDK
 
-- 阶段 0/1：`Sandbox` 构造时在本机拉起一个 daemon 子进程（`spawn_local`）。
-  阶段 1 只是多了 `Sandbox(backend="docker")` 一个透传开关，client 自己完全不懂 docker。
-- 阶段 2+：`spawn_local` 的逻辑替换为「向控制面申请一个沙箱（容器/VM），
-  拿到地址再连上去」。但 `run_code` 这层 API 对用户保持不变。
+The only layer a user touches directly. Provides the `Sandbox` class,
+`run_code()`, and streaming callbacks.
 
-### 3. server.py + backend.py —— daemon 与隔离层
+- Stage 0/1: `Sandbox` spawns a daemon subprocess locally (`spawn_local`). Stage 1
+  just adds a `Sandbox(backend="docker")` pass-through switch; the client itself
+  knows nothing about docker.
+- Stage 2+: the spawn logic becomes "ask for a sandbox (container / VM), get its
+  address, then connect to it" — but the `run_code` API stays the same for users.
+- Stage 3 adds a **transport abstraction** (below): the client also owns the VM
+  lifecycle (`_spawn_microvm` / `_restore_microvm`), mirroring how Stage 2 owns
+  the resident container.
 
-- `server.py`（daemon）：在沙箱**内部**运行的常驻进程，监听 HTTP，
-  把请求转交 backend，再把输出 SSE 流式回吐。对应 E2B 的 `envd`。
-- `backend.py`（backend）：真正执行代码的地方，也是**隔离强度所在**。
-  通过抽象基类 `ExecutionBackend` 解耦：
+### 3. server.py + backend.py — the daemon and the isolation layer
+
+- `server.py` (daemon): a resident process running **inside** the sandbox,
+  listening over HTTP, handing requests to the backend, and streaming output back
+  via SSE. Corresponds to E2B's `envd`. It listens on TCP, or on `AF_VSOCK` when
+  `--transport vsock` (Stage 3, inside the microVM).
+- `backend.py` (backend): where code actually runs — **where isolation strength
+  lives**. Decoupled via the abstract base class `ExecutionBackend`:
 
 ```
-ExecutionBackend (抽象)
-├── LocalSubprocessBackend   # 阶段 0：本机子进程，几乎无隔离
-├── DockerBackend            # 阶段 1：一次性容器（已实现）
-└── FirecrackerBackend       # 阶段 3：microVM（待实现）
+ExecutionBackend (abstract)
+├── LocalSubprocessBackend    # Stage 0: a host subprocess (also reused inside containers/VMs)
+├── DockerBackend             # Stage 1: one throwaway container per execution
+└── JupyterKernelBackend      # Stage 2b: a resident Jupyter kernel (stateful REPL)
 ```
 
-### DockerBackend 的隔离手段（阶段 1）
+Note: the Stage 3 microVM is **not** a new backend. Strong isolation comes from
+*where the daemon runs* (host → resident container → microVM) and *how the client
+connects* (TCP → vsock), which are client/server concerns. Inside the VM, the
+daemon reuses an existing backend (`LocalSubprocessBackend` or, by default,
+`JupyterKernelBackend`).
 
-每个 `docker run` flag 对应一种内核隔离机制：
+### Transport abstraction (new in Stage 3)
 
-| flag | 内核机制 | 挡住什么 |
-|------|----------|----------|
-| 默认（容器自身） | mount namespace | 容器有独立根文件系统，看不见宿主文件 |
-| `--network none` | network namespace | 没有网卡和路由，彻底断网 |
-| `--memory` / `--cpus` | cgroups | 内存/CPU 上限，超内存被 OOM kill（exit 137） |
-| `--pids-limit` | pids cgroup | fork 炸弹 |
-| `--read-only` + `--tmpfs /tmp` | 只读挂载 + 内存盘 | 篡改容器内文件系统（只留 /tmp 可写） |
+Stage 3 factors out a `Transport` in the client/server so that "what to say" (the
+protocol) is decoupled from "how to connect":
 
-生命周期上的关键设计：**杀掉 `docker run` 客户端进程并不能杀死容器**——
-它只是连着 docker daemon 的「遥控器」，容器进程由 daemon 托管。所以超时清理
-必须走 `docker rm -f <容器名>`，并在 finally 里幂等兜底（正常路径 `--rm` 已自动删除）。
+- `_TcpTransport` — HTTP over TCP (Stages 0–2), wrapping the existing `urllib`
+  path with byte-for-byte identical behavior.
+- `_VsockTransport` — HTTP over vsock for the microVM: it connects Firecracker's
+  vsock Unix-domain socket, does the `CONNECT <port>` handshake, then speaks a
+  minimal hand-written HTTP/1.1 over the raw socket.
 
-注意：容器与宿主**共享内核**，逃逸面仍然不小——阶段 1 的隔离仍不足以跑
-完全不可信的代码，内核级强隔离要等阶段 3 的 microVM。
+The protocol bytes are identical on both; only the pipe differs.
 
-## 跨阶段演进策略
+### DockerBackend's isolation mechanisms (Stage 1)
 
-| 阶段 | 隔离层 | 主要改动文件 | client 是否需改 |
-|------|--------|--------------|------------------|
-| 0 | 本机子进程 | backend.py | — |
-| 1 | Docker 容器 | 新增 DockerBackend（daemon 仍在宿主机） | 仅新增 `backend=` 透传 |
-| 2 | 容器内常驻 agent + 有状态 REPL | daemon 打包进镜像（envd 化）；backend 改用持久 kernel | 连接地址变为容器 |
-| 3 | Firecracker microVM | 新增 FirecrackerBackend + vsock | 连接方式改为 vsock/网络 |
-| 4 | 产品化外围 | 新增控制面、池化、鉴权 | 新增 create/connect 流程 |
+Each `docker run` flag maps to a kernel isolation mechanism:
 
-每次演进都遵循同一纪律：**新增 backend 实现，保持 protocol 稳定，
-把改动尽量挡在 client 之外。** `tests/` 作为安全网，演进后必须全绿。
+| flag | kernel mechanism | what it blocks |
+|------|------------------|----------------|
+| (the container itself) | mount namespace | the container has its own root filesystem; host files are invisible |
+| `--network none` | network namespace | no NIC and no routes — fully offline |
+| `--memory` / `--cpus` | cgroups | memory/CPU caps; over-memory gets OOM-killed (exit 137) |
+| `--pids-limit` | pids cgroup | fork bombs |
+| `--read-only` + `--tmpfs /tmp` | read-only mount + ramdisk | tampering with the container filesystem (only /tmp stays writable) |
 
-## 与 E2B 的对应关系（学完可对照阅读其源码）
+A key lifecycle detail: **killing the `docker run` client process does not kill
+the container** — it is just the "remote control" connected to the docker daemon;
+the container process is owned by the daemon. So timeout cleanup must go through
+`docker rm -f <name>`, with an idempotent fallback in `finally` (the happy path's
+`--rm` already removes it).
 
-| 本项目 | E2B 对应 | 说明 |
-|--------|----------|------|
-| client.py | E2B SDK（python/js） | 用户接口 |
-| protocol.py | envd 的 gRPC/HTTP 协议 | 通信契约 |
-| server.py (daemon) | `envd` | 沙箱内常驻 agent |
-| backend.py | Firecracker 编排 + 沙箱运行时 | 隔离与执行 |
-| 阶段 4 控制面 | orchestrator / API | 沙箱生命周期管理 |
+Note: the container **shares the host kernel**, so the escape surface is still
+non-trivial — Stage 1 isolation is not enough to run fully untrusted code;
+kernel-level strong isolation waits for the Stage 3 microVM.
+
+## Cross-stage evolution strategy
+
+| Stage | Isolation layer | Main files changed | Does the client change? |
+|-------|-----------------|--------------------|--------------------------|
+| 0 | Host subprocess | backend.py | — |
+| 1 | Docker container | add DockerBackend (daemon still on host) | only a `backend=` pass-through |
+| 2 | Resident in-container agent + stateful REPL | daemon packaged into the image (envd-ification); backend uses a persistent kernel | connection address becomes the container |
+| 3 | Firecracker microVM | add a Transport abstraction (TCP→vsock) + client owns the VM lifecycle; in-VM daemon reuses an existing backend | connection becomes vsock; client boots/restores the VM |
+| 4 | Productization | add a control plane, pooling, auth | add a create/connect flow |
+
+Every step follows the same discipline: **add a new backend/transport
+implementation, keep the protocol stable, and keep the changes out of the client
+as much as possible.** `tests/` is the safety net and must stay all green after
+each step.
+
+## Mapping to E2B (read its source alongside, once you're done)
+
+| This project | E2B equivalent | Notes |
+|--------------|----------------|-------|
+| client.py | E2B SDK (python/js) | user interface |
+| protocol.py | envd's gRPC/HTTP protocol | communication contract |
+| server.py (daemon) | `envd` | resident agent inside the sandbox |
+| backend.py | Firecracker orchestration + sandbox runtime | isolation and execution |
+| Stage 4 control plane | orchestrator / API | sandbox lifecycle management |

@@ -1,11 +1,14 @@
-"""阶段 3c 测试：Firecracker 快照恢复（毫秒级冷启动）。
+"""Stage 3c tests: Firecracker snapshot restore (millisecond cold start).
 
-从一份预热好的快照（含已就绪的 Jupyter kernel）恢复 microVM——跳过内核引导与 kernel
-冷启动。需要 vendor/snapshot/{vmstate,memfile}（scripts/build-snapshot.sh 生成，缺则现
-build）+ 可访问的 /dev/kvm；缺 firecracker/内核则整组 skip。
+Restore a microVM from a pre-warmed snapshot (containing an already-ready Jupyter
+kernel) -- skipping kernel boot and kernel cold start. Requires
+vendor/snapshot/{vmstate,memfile} (produced by scripts/build-snapshot.sh, built on
+demand if absent) + an accessible /dev/kvm; if firecracker/kernel are missing the
+whole group is skipped.
 
-注意：快照的 vsock uds 路径固定，故同一时刻只能恢复一台（pytest 默认顺序跑，无碍）。
-并发恢复 + 预热池属于阶段 4。
+Note: the snapshot's vsock uds path is fixed, so only one can be restored at a time
+(pytest runs in order by default, so this is fine). Concurrent restore + a warm pool
+belong to Stage 4.
 """
 
 import time
@@ -14,7 +17,7 @@ from microsandbox import Sandbox
 
 
 def test_restore_runs_and_is_stateful(snapshot_sandbox: Sandbox) -> None:
-    """恢复出来的 VM 里 kernel 已热：首跑即出结果，且变量跨 run_code 留存。"""
+    """In the restored VM the kernel is already warm: the first run yields a result immediately, and variables persist across run_code calls."""
     ex = snapshot_sandbox.run_code("print(6 * 7)")
     assert ex.success
     assert ex.stdout.strip() == "42"
@@ -26,10 +29,12 @@ def test_restore_runs_and_is_stateful(snapshot_sandbox: Sandbox) -> None:
 
 
 def test_restore_is_fast(snapshot_ready) -> None:
-    """恢复就绪远快于冷启动（冷启动 ~0.94s；恢复实测 ~30-40ms）。
+    """Restore-to-ready is far faster than cold start (cold start ~0.94s; restore measured ~30-40ms).
 
-    自己掐表：从 Sandbox(from_snapshot=True) 构造到就绪的耗时。用宽松上限（< 0.6s）
-    避免机器抖动 flaky——光这条就足以证明「跳过内核引导」带来的量级差。
+    Time it ourselves: the elapsed time from constructing Sandbox(from_snapshot=True)
+    until ready. Use a generous upper bound (< 0.6s) to avoid flakiness from machine
+    jitter -- this one assertion alone suffices to prove the order-of-magnitude gap
+    from "skipping kernel boot."
     """
     t0 = time.time()
     sb = Sandbox(backend="microvm", from_snapshot=True)
@@ -38,4 +43,4 @@ def test_restore_is_fast(snapshot_ready) -> None:
         assert sb.run_code("print(1)").stdout.strip() == "1"
     finally:
         sb.close()
-    assert ready < 0.6, f"恢复就绪耗时 {ready * 1000:.0f}ms，超出预期（冷启动才 ~940ms）"
+    assert ready < 0.6, f"restore-to-ready took {ready * 1000:.0f}ms, exceeding expectation (cold start is only ~940ms)"

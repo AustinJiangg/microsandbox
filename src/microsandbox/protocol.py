@@ -1,15 +1,18 @@
-"""客户端 <-> 沙箱守护进程之间的线缆协议（wire protocol）。
+"""The wire protocol between the client and the sandbox daemon.
 
-为什么单独抽一个模块：
-    这是整个项目最重要的「边界」。阶段 0 里守护进程只是本机的一个子进程，
-    但从阶段 1 开始它会跑在 Docker 容器里、阶段 3 跑在 Firecracker microVM 里。
-    无论底层隔离怎么变，只要这份协议保持稳定，client（SDK）就几乎不用改。
-    这正是 E2B 的设计哲学：把「执行什么」和「在哪执行」解耦。
+Why this is its own module:
+    This is the single most important boundary in the whole project. In Stage 0
+    the daemon is just a local subprocess, but from Stage 1 on it runs inside a
+    Docker container, and in Stage 3 inside a Firecracker microVM. No matter how
+    the underlying isolation changes, as long as this protocol stays stable the
+    client (SDK) barely needs to change. This is exactly E2B's design philosophy:
+    decouple "what to execute" from "where to execute it".
 
-协议本身很简单：
-    - 客户端 POST 一段代码到守护进程
-    - 守护进程以 SSE（Server-Sent Events）流式返回若干 OutputEvent
-    - 每个 event 是一行 JSON，描述一段 stdout / stderr / 或最终的结束状态
+The protocol itself is simple:
+    - The client POSTs a piece of code to the daemon
+    - The daemon streams back a series of OutputEvents via SSE (Server-Sent Events)
+    - Each event is a single line of JSON describing a chunk of stdout / stderr,
+      or the final end-of-execution status
 """
 
 from __future__ import annotations
@@ -21,20 +24,20 @@ from typing import Any
 
 
 class EventType(str, Enum):
-    """守护进程流式返回给客户端的事件种类。"""
+    """The kinds of events the daemon streams back to the client."""
 
-    STDOUT = "stdout"      # 一段标准输出
-    STDERR = "stderr"      # 一段标准错误
-    ERROR = "error"        # 执行层面的错误（例如代码抛异常、超时）
-    END = "end"            # 本次执行结束，携带退出码
+    STDOUT = "stdout"      # a chunk of standard output
+    STDERR = "stderr"      # a chunk of standard error
+    ERROR = "error"        # an execution-level error (e.g. code raised an exception, or timeout)
+    END = "end"            # this execution finished, carries the exit code
 
 
 @dataclass
 class ExecuteRequest:
-    """客户端请求执行一段代码。
+    """The client's request to execute a piece of code.
 
-    language 目前只支持 python，但预留字段，方便阶段 1+ 扩展到
-    javascript / bash 等。
+    `language` currently only supports python, but the field is reserved so it
+    can be extended to javascript / bash / etc. in Stage 1+.
     """
 
     code: str
@@ -56,14 +59,14 @@ class ExecuteRequest:
 
 @dataclass
 class OutputEvent:
-    """守护进程 -> 客户端 的单个流式事件。
+    """A single streamed event, daemon -> client.
 
-    用 SSE 时，每个事件序列化成一行 JSON 跟在 `data: ` 后面。
+    With SSE, each event is serialized into a single line of JSON following `data: `.
     """
 
     type: EventType
-    data: str = ""                      # stdout/stderr/error 的文本内容
-    exit_code: int | None = None        # 仅 END 事件携带
+    data: str = ""                      # the text content of stdout/stderr/error
+    exit_code: int | None = None        # only carried by the END event
 
     def to_sse(self) -> str:
         payload = {"type": self.type.value, "data": self.data}
@@ -83,9 +86,10 @@ class OutputEvent:
 
 @dataclass
 class Execution:
-    """一次执行的聚合结果，由客户端把流式事件收集汇总而成。
+    """The aggregated result of one execution, assembled by the client from the
+    collected streamed events.
 
-    这是 SDK 返回给用户的对象，类似 E2B 的 Execution 结果。
+    This is the object the SDK returns to the user, similar to E2B's Execution result.
     """
 
     stdout: str = ""
@@ -106,22 +110,27 @@ class Execution:
         )
 
 
-# ---- 阶段 2c：文件 / shell API（向后兼容新增；上面 /execute 的三个类型一律不动）----
+# ---- Stage 2c: file / shell API (backward-compatible additions; the three /execute types above stay untouched) ----
 #
-# 设计要点：这些操作由 daemon **直接在自己所在的文件系统上**完成，不经过
-# ExecutionBackend——对 container/kernel 后端就是容器内（= 沙箱里），对 local 后端
-# 就是宿主。这对齐 E2B 的 envd：文件服务、进程服务与「跑代码的 kernel」是分开的
-# 三套东西，而不是都塞进代码执行通道。
+# Design point: these operations are performed by the daemon **directly on its
+# own filesystem**, bypassing the ExecutionBackend -- for the container/kernel
+# backends that means inside the container (= inside the sandbox), and for the
+# local backend it means the host. This aligns with E2B's envd: the file service,
+# the process service, and the "code-running kernel" are three separate things,
+# rather than all being stuffed into the code-execution channel.
 #
-# 端点与响应形状（响应沿用项目既有的「简单 JSON dict」风格，不再为每个都造 dataclass）：
+# Endpoints and response shapes (responses follow the project's existing "simple
+# JSON dict" style; we don't build a dataclass for each one):
 #   POST /files/read   <- {"path"}                       -> {"content": str}
 #   POST /files/write  <- {"path","content"}             -> {"ok": true}
 #   POST /files/list   <- {"path"}                       -> {"entries":[{"name":str,"is_dir":bool},...]}
 #   POST /commands     <- {"command","timeout_seconds"}  -> {"stdout":str,"stderr":str,"exit_code":int}
-# 出错统一返回 {"error": str} + 非 200 状态码，client 收到后抛 RuntimeError。
+# On error, all uniformly return {"error": str} plus a non-200 status code; on
+# receiving it the client raises RuntimeError.
 #
-# 注意（与隔离设计一致）：常驻容器是 --read-only 根 + 仅 /tmp 可写，所以 files.write
-# 只能写到 /tmp，写别处会得到 OSError。
+# Note (consistent with the isolation design): the resident container has a
+# --read-only root and only /tmp is writable, so files.write can only write to
+# /tmp; writing elsewhere yields an OSError.
 
 
 @dataclass
@@ -140,7 +149,7 @@ class WriteFileRequest:
 
 @dataclass
 class PathRequest:
-    """read / list 共用：只需要一个路径。"""
+    """Shared by read / list: only a path is needed."""
 
     path: str
 

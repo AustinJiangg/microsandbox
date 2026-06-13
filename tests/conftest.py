@@ -1,8 +1,10 @@
-"""测试公共设施：后端参数化。
+"""Shared test infrastructure: backend parametrization.
 
-核心思路：同一套测试体，分别在 local 和 docker 两个后端下各跑一遍——
-这是「协议契约不变、隔离方案可换」承诺的直接证明。
-没装 Docker 的机器上 docker 侧用例整组 skip，local 侧照常全绿。
+Core idea: run the same test bodies once under the local backend and once under
+the docker backend -- this is the direct proof of the promise that "the protocol
+contract stays fixed while the isolation scheme can be swapped."
+On machines without Docker the docker-side cases are skipped as a group, while
+the local side stays fully green as usual.
 """
 
 import functools
@@ -19,10 +21,11 @@ from microsandbox.backend import DEFAULT_AGENT_IMAGE, DEFAULT_DOCKER_IMAGE
 
 @functools.lru_cache(maxsize=1)
 def docker_available() -> bool:
-    """探测 docker 是否可用。
+    """Probe whether docker is available.
 
-    做成模块级缓存函数而非 fixture：下面的 skipif 标记在「测试收集」阶段
-    就要求值，那时 fixture 体系还没建立；lru_cache 保证整个会话只探测一次。
+    Made a module-level cached function rather than a fixture: the skipif marks
+    below need a value at "test collection" time, when the fixture system isn't
+    set up yet; lru_cache guarantees the probe runs only once per session.
     """
     if shutil.which("docker") is None:
         return False
@@ -35,10 +38,11 @@ def docker_available() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def ensure_image() -> None:
-    """镜像不在本地就拉一次（首跑约 30-60 秒），让 pytest 开箱即用。
+    """Pull the image once if it isn't local (first run ~30-60s), so pytest works out of the box.
 
-    正常执行路径上是 --pull never（绝不隐式拉镜像吃掉超时预算），
-    测试里例外地预拉，是为了「克隆仓库 → pytest」一步到位。
+    On the normal execution path we use --pull never (never implicitly pull an
+    image and eat into the timeout budget); the tests pre-pull as an exception,
+    so that "clone repo -> pytest" works in one step.
     """
     inspect = subprocess.run(
         ["docker", "image", "inspect", DEFAULT_DOCKER_IMAGE], capture_output=True
@@ -49,10 +53,11 @@ def ensure_image() -> None:
 
 @functools.lru_cache(maxsize=1)
 def ensure_agent_image() -> None:
-    """阶段 2b 的 agent 镜像不在本地就 docker build 一次（首次较慢，要装 ipykernel）。
+    """docker build the Stage 2b agent image once if it isn't local (first build is slow, has to install ipykernel).
 
-    和 ensure_image 一样，是为了「克隆仓库 → pytest」开箱即用；正常使用时镜像
-    由开发者自己 docker build -t microsandbox-agent . 预先构建。
+    Like ensure_image, this is for "clone repo -> pytest" out of the box; in
+    normal use the image is pre-built by the developer with
+    docker build -t microsandbox-agent .
     """
     inspect = subprocess.run(
         ["docker", "image", "inspect", DEFAULT_AGENT_IMAGE], capture_output=True
@@ -65,7 +70,7 @@ def ensure_agent_image() -> None:
 
 
 requires_docker = pytest.mark.skipif(
-    not docker_available(), reason="docker 不可用，跳过容器后端用例"
+    not docker_available(), reason="docker unavailable, skipping container backend cases"
 )
 
 
@@ -73,13 +78,15 @@ requires_docker = pytest.mark.skipif(
     params=[
         "local",
         pytest.param("docker", marks=requires_docker),
-        # 阶段 2a：daemon 搬进常驻容器后，同一套端到端用例在这个新拓扑下再跑一遍——
-        # 把「协议不变、隔离/部署可换」的承诺从「换 backend」扩展到「换整个部署形态」。
+        # Stage 2a: after the daemon moves into a resident container, the same
+        # end-to-end cases run again under this new topology -- extending the
+        # promise of "protocol fixed, isolation/deployment swappable" from
+        # "swap the backend" to "swap the entire deployment form."
         pytest.param("container", marks=requires_docker),
     ]
 )
 def sandbox(request: pytest.FixtureRequest):
-    """参数化的沙箱 fixture：每个用它的测试自动变成 [local]/[docker]/[container] 三个用例。"""
+    """Parametrized sandbox fixture: every test that uses it automatically becomes three cases [local]/[docker]/[container]."""
     if request.param in ("docker", "container"):
         ensure_image()
     sb = Sandbox(backend=request.param)
@@ -89,9 +96,9 @@ def sandbox(request: pytest.FixtureRequest):
 
 @pytest.fixture
 def docker_sandbox():
-    """隔离测试专用：只在 docker 后端上跑（隔离断言对 local 后端不成立）。"""
+    """Isolation tests only: runs on the docker backend only (isolation assertions don't hold for the local backend)."""
     if not docker_available():
-        pytest.skip("docker 不可用，跳过隔离测试")
+        pytest.skip("docker unavailable, skipping isolation tests")
     ensure_image()
     sb = Sandbox(backend="docker")
     yield sb
@@ -100,20 +107,20 @@ def docker_sandbox():
 
 @pytest.fixture
 def resident_sandbox():
-    """阶段 2a 专用：daemon 跑在常驻容器里的沙箱（backend="container"）。"""
+    """Stage 2a only: a sandbox whose daemon runs inside a resident container (backend="container")."""
     if not docker_available():
-        pytest.skip("docker 不可用，跳过常驻容器测试")
+        pytest.skip("docker unavailable, skipping resident-container tests")
     ensure_image()
     sb = Sandbox(backend="container")
     yield sb
-    sb.close()  # 若测试已显式 close 过，这里是幂等空操作
+    sb.close()  # if the test already closed it explicitly, this is an idempotent no-op
 
 
 @pytest.fixture
 def kernel_sandbox():
-    """阶段 2b 专用：daemon 在常驻容器里托管 Jupyter kernel 的有状态沙箱。"""
+    """Stage 2b only: a stateful sandbox whose daemon hosts a Jupyter kernel inside a resident container."""
     if not docker_available():
-        pytest.skip("docker 不可用，跳过 kernel 后端测试")
+        pytest.skip("docker unavailable, skipping kernel backend tests")
     ensure_agent_image()
     sb = Sandbox(backend="kernel")
     yield sb
@@ -122,25 +129,28 @@ def kernel_sandbox():
 
 @pytest.fixture
 def docker_env():
-    """只确保 docker 环境就绪（不可用则 skip、并预拉镜像），不替你创建 Sandbox。
+    """Only ensures the docker environment is ready (skip if unavailable, and pre-pull the image); does not create a Sandbox for you.
 
-    给需要自己掌控 Sandbox 构造过程的测试用——例如要故意让构造失败、
-    验证错误路径行为的回归测试。
+    For tests that need to control the Sandbox construction process themselves --
+    e.g. regression tests that deliberately make construction fail to verify
+    error-path behavior.
     """
     if not docker_available():
-        pytest.skip("docker 不可用，跳过")
+        pytest.skip("docker unavailable, skipping")
     ensure_image()
 
 
-# ---- 阶段 3：Firecracker microVM ----
+# ---- Stage 3: Firecracker microVM ----
 
 
 @functools.lru_cache(maxsize=1)
 def firecracker_available() -> bool:
-    """firecracker 二进制 + 内核就绪、且 /dev/kvm 可读写，才跑 microVM 用例。
+    """Run microVM cases only when the firecracker binary + kernel are ready and /dev/kvm is readable/writable.
 
-    rootfs 不在这里查（可由 ensure_rootfs 现 build）；这三样缺一就整组 skip——
-    别的机器 / CI 上 microVM 用例自动跳过，pytest 仍全绿（与 docker 不可用时同理）。
+    The rootfs is not checked here (ensure_rootfs can build it on demand); if any
+    of these three is missing the whole group is skipped -- on other machines / CI
+    the microVM cases skip automatically and pytest stays green (same as when
+    docker is unavailable).
     """
     vendor = pathlib.Path(__file__).resolve().parents[1] / "vendor"
     if not (vendor / "firecracker").exists() or not (vendor / "vmlinux").exists():
@@ -150,20 +160,20 @@ def firecracker_available() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def ensure_rootfs() -> None:
-    """rootfs.ext4 不在就现 build（首次较慢：docker export + mkfs.ext4 -d）。让 microVM
-    用例在备好 firecracker/内核的机器上也开箱即用；正常用时由开发者预先 build。"""
+    """Build rootfs.ext4 on demand if absent (first time is slow: docker export + mkfs.ext4 -d). Lets the
+    microVM cases work out of the box on machines with firecracker/kernel ready; in normal use the developer pre-builds it."""
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     if (repo_root / "vendor" / "rootfs.ext4").exists():
         return
-    ensure_agent_image()  # rootfs 从 agent 镜像导出，得先有它
+    ensure_agent_image()  # the rootfs is exported from the agent image, so it must exist first
     subprocess.run([str(repo_root / "scripts" / "build-rootfs.sh")], check=True)
 
 
 @pytest.fixture
 def microvm_sandbox():
-    """阶段 3 专用：daemon 跑在 Firecracker microVM 里、经 vsock 连入的沙箱。"""
+    """Stage 3 only: a sandbox whose daemon runs inside a Firecracker microVM, connected over vsock."""
     if not firecracker_available():
-        pytest.skip("firecracker/内核/kvm 不全，跳过 microVM 用例")
+        pytest.skip("firecracker/kernel/kvm incomplete, skipping microVM cases")
     ensure_rootfs()
     sb = Sandbox(backend="microvm")
     yield sb
@@ -172,29 +182,29 @@ def microvm_sandbox():
 
 @functools.lru_cache(maxsize=1)
 def ensure_snapshot() -> None:
-    """快照不在就现 build（boot VM + 预热 kernel + snapshot，~10s，产出 512MB memfile）。
-    让快照用例在备好素材的机器上开箱即用；正常用时由开发者预先 build-snapshot.sh。"""
+    """Build the snapshot on demand if absent (boot VM + warm up kernel + snapshot, ~10s, produces a 512MB memfile).
+    Lets the snapshot cases work out of the box on machines with the materials ready; in normal use the developer pre-runs build-snapshot.sh."""
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     snap = repo_root / "vendor" / "snapshot"
     if (snap / "vmstate").exists() and (snap / "memfile").exists():
         return
-    ensure_rootfs()  # 快照基于 rootfs，先确保它在
+    ensure_rootfs()  # the snapshot is based on the rootfs, so make sure it exists first
     subprocess.run([str(repo_root / "scripts" / "build-snapshot.sh")], check=True)
 
 
 @pytest.fixture
 def snapshot_ready():
-    """只确保快照就绪（不可用则 skip），不替你构造 Sandbox——给要自己掐表的用例。"""
+    """Only ensures the snapshot is ready (skip if unavailable); does not construct a Sandbox for you -- for cases that time things themselves."""
     if not firecracker_available():
-        pytest.skip("firecracker/内核/kvm 不全，跳过快照用例")
+        pytest.skip("firecracker/kernel/kvm incomplete, skipping snapshot cases")
     ensure_snapshot()
 
 
 @pytest.fixture
 def snapshot_sandbox():
-    """阶段 3c 专用：从快照毫秒级恢复的 microVM 沙箱（VM 内 kernel 已热）。"""
+    """Stage 3c only: a microVM sandbox restored from a snapshot in milliseconds (the kernel inside the VM is already warm)."""
     if not firecracker_available():
-        pytest.skip("firecracker/内核/kvm 不全，跳过快照用例")
+        pytest.skip("firecracker/kernel/kvm incomplete, skipping snapshot cases")
     ensure_snapshot()
     sb = Sandbox(backend="microvm", from_snapshot=True)
     yield sb

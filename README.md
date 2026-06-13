@@ -1,20 +1,22 @@
 # microsandbox
 
-一个**从零实现、逐步逼近 [E2B](https://github.com/e2b-dev/E2B) 的学习用代码沙箱**。
+A **from-scratch, learning-oriented code sandbox that incrementally approaches
+[E2B](https://github.com/e2b-dev/E2B)**.
 
-目标不是做产品，而是搞懂「AI 代码沙箱到底是怎么实现的」。项目分阶段演进，
-从最简单的本机子进程，一路做到 Firecracker microVM。**阶段 2（容器内常驻 agent +
-有状态 REPL + 文件/shell API）已完成**，下一步阶段 3（microVM）。
+The goal is not to ship a product, but to understand *how an AI code sandbox is
+actually built*. The project evolves in stages, from the simplest host
+subprocess all the way to a Firecracker microVM. **Stages 0–3 are done** (up to
+microVM isolation with snapshot restore); Stage 4 (productization) is next.
 
-## 快速开始
+## Quick start
 
 ```bash
 pip install -e ".[dev]"
-docker pull python:3.12-slim   # 阶段 1 容器后端的基础镜像（一次性）
+docker pull python:3.12-slim   # base image for the Stage 1 container backend (one-time)
 python examples/quickstart.py
 ```
 
-用起来像这样（手感对齐 E2B SDK）：
+It feels like this (modeled on the E2B SDK):
 
 ```python
 from microsandbox import Sandbox
@@ -24,64 +26,84 @@ with Sandbox() as sandbox:
     print(ex.stdout)        # hello from the sandbox
     print(ex.success)       # True
 
-    # 流式拿输出
+    # stream output as it arrives
     sandbox.run_code(
         "for i in range(3): print(i)",
         on_stdout=lambda chunk: print("live:", chunk.strip()),
     )
 
-# 阶段 1：一行切换到 Docker 容器隔离，run_code 用法完全不变
+# Stage 1: switch to Docker container isolation in one line; run_code is unchanged
 with Sandbox(backend="docker") as sandbox:
     ex = sandbox.run_code("import platform; print(platform.node())")
-    print(ex.stdout)        # 容器 ID，而不是你的主机名
+    print(ex.stdout)        # the container ID, not your hostname
 
-# 阶段 2b：常驻 Jupyter kernel，变量跨 run_code 留存（真正的有状态 REPL）
-# 需先构建 agent 镜像：docker build -t microsandbox-agent .
+# Stage 2b: a resident Jupyter kernel — variables persist across run_code (a real stateful REPL)
+# build the agent image first: docker build -t microsandbox-agent .
 with Sandbox(backend="kernel") as sandbox:
     sandbox.run_code("x = 41")
-    print(sandbox.run_code("print(x + 1)").stdout)   # 42 —— 第二次能用第一次的变量
+    print(sandbox.run_code("print(x + 1)").stdout)   # 42 — the 2nd call sees the 1st call's variable
 
-# 阶段 2c：文件 / shell API（手感对齐 E2B 的 sandbox.files / sandbox.commands）
+# Stage 2c: file / shell API (modeled on E2B's sandbox.files / sandbox.commands)
 with Sandbox(backend="container") as sandbox:
-    sandbox.files.write("/tmp/data.txt", "42")        # 常驻容器仅 /tmp 可写
+    sandbox.files.write("/tmp/data.txt", "42")        # the resident container is writable only under /tmp
     print(sandbox.files.read("/tmp/data.txt"))        # 42
     print(sandbox.commands.run("ls /tmp").stdout)     # data.txt
+
+# Stage 3: a Firecracker microVM — strongest isolation (its own guest kernel + KVM boundary),
+# control channel over vsock. Needs vendor/ artifacts first: scripts/build-rootfs.sh (one-time).
+with Sandbox(backend="microvm") as sandbox:
+    print(sandbox.run_code("print(1 + 1)").stdout)    # 2, from inside a real VM (~0.94s cold start)
+
+# Stage 3c: snapshot restore — millisecond cold start (needs scripts/build-snapshot.sh)
+with Sandbox(backend="microvm", from_snapshot=True) as sandbox:
+    print(sandbox.run_code("print(6 * 7)").stdout)    # 42, ready in ~30ms with a warm kernel
 ```
 
-## 项目结构
+## Project structure
 
 ```
 microsandbox/
-├── CLAUDE.md                  # Claude Code 项目记忆（约定、进度、架构）
+├── CLAUDE.md                  # Claude Code project memory (conventions, progress, pointers)
 ├── README.md
 ├── pyproject.toml
+├── Dockerfile                 # Stage 2b agent image (Jupyter kernel runtime)
 ├── docs/
-│   ├── ARCHITECTURE.md        # 三层解耦设计与跨阶段演进策略
-│   └── ROADMAP.md             # 分阶段路线图（每阶段的目标与步骤）
+│   ├── ARCHITECTURE.md        # the three-layer design and cross-stage evolution strategy
+│   ├── ROADMAP.md             # staged roadmap (goals and steps per stage)
+│   ├── STAGE2_DESIGN.md       # Stage 2 design journal (resident agent + stateful REPL)
+│   └── STAGE3_DESIGN.md       # Stage 3 design journal (microVM, vsock, snapshots)
 ├── src/microsandbox/
-│   ├── protocol.py            # client↔daemon 协议（最重要的稳定边界）
-│   ├── client.py              # SDK：Sandbox / run_code
-│   ├── server.py              # daemon：HTTP + SSE（对应 E2B 的 envd）
-│   └── backend.py             # 执行后端（隔离层，逐阶段替换）
+│   ├── protocol.py            # client↔daemon protocol (the most important stable boundary)
+│   ├── client.py              # SDK: Sandbox / run_code / transports
+│   ├── server.py              # daemon: HTTP + SSE (corresponds to E2B's envd)
+│   └── backend.py             # execution backends (the isolation layer, swapped per stage)
+├── scripts/
+│   ├── build-rootfs.sh        # export an ext4 rootfs from the agent image (Stage 3b)
+│   └── build-snapshot.sh      # build a warm Firecracker snapshot (Stage 3c)
 ├── examples/quickstart.py
-└── tests/                     # 双后端参数化 e2e 测试 + 容器隔离测试
+└── tests/                     # parametrized end-to-end tests + isolation / microVM / snapshot tests
 ```
 
-## 演进路线
+## Evolution path
 
-| 阶段 | 隔离方式 | 状态 |
-|------|----------|------|
-| 0 | 本机子进程 | ✅ |
-| 1 | Docker 容器 | ✅ |
-| 2 | 容器内常驻 agent + 有状态 REPL + 文件/shell API | ✅ |
-| 3 | Firecracker microVM | ⬜ 下一步 |
-| 4 | 产品化外围（池化/模板/鉴权） | ⬜ |
+| Stage | Isolation | Status |
+|-------|-----------|--------|
+| 0 | Host subprocess | ✅ |
+| 1 | Docker container | ✅ |
+| 2 | Resident in-container agent + stateful REPL + file/shell API | ✅ |
+| 3 | Firecracker microVM (vsock transport, resource limits, snapshot restore) | ✅ |
+| 4 | Productization (pooling / templates / auth) | ⬜ next |
 
-详见 `docs/ROADMAP.md`。
+See `docs/ROADMAP.md` for details.
 
-## ⚠️ 安全须知
+## ⚠️ Safety note
 
-默认的 `local` 后端（本机子进程）**几乎没有隔离**，代码能访问你本机的文件、
-网络、环境变量。阶段 1 的 `docker` 后端有了文件系统/网络隔离和资源限制，
-但容器与宿主**共享内核、逃逸面不小**，仍不足以执行完全不可信的代码。
-**本项目仅供本地学习**，切勿对外提供服务。内核级强隔离从阶段 3（microVM）起。
+The default `local` backend (host subprocess) has **almost no isolation**: code
+can read your local files, network, and environment variables. The Stage 1
+`docker` backend adds filesystem/network isolation and resource limits, but the
+container **shares the host kernel and has a non-trivial escape surface**, so it
+is still not enough to run fully untrusted code. The Stage 3 `microvm` backend
+gives each sandbox **its own guest kernel behind a KVM boundary** — the first
+isolation strong enough to seriously discuss untrusted code — but this is a
+**learning implementation, not security-audited**. **This project is for local
+learning only**; do not expose it as a service or feed it arbitrary input.

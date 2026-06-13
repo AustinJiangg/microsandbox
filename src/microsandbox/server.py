@@ -1,15 +1,19 @@
-"""沙箱守护进程（daemon / server）。
+"""Sandbox daemon (daemon / server).
 
-它在沙箱「内部」运行，监听 HTTP 请求，把代码交给执行后端跑，
-再用 SSE 把输出流式返回给客户端。
+It runs *inside* the sandbox, listens for HTTP requests, hands code off to an
+execution backend to run, then streams the output back to the client over SSE.
 
-阶段 0/1：这个进程跑在你本机（阶段 1 的隔离发生在 backend 起的容器里）。
-阶段 2+：这个进程会被打包进容器/VM 镜像，作为常驻 agent 运行 ——
-        对应 E2B 里的 `envd`。届时 client 连接的 URL 从 localhost
-        变成容器/VM 的地址，server 代码本身基本不用改。
+Stage 0/1: this process runs on your local machine (in Stage 1 the isolation
+happens inside the container the backend spins up).
+Stage 2+: this process gets baked into the container/VM image and runs as a
+        resident agent -- the counterpart of E2B's `envd`. At that point the
+        URL the client connects to changes from localhost to the container/VM
+        address, while the server code itself barely needs to change.
 
-只用标准库实现，避免阶段 0 就引入一堆依赖。阶段 1+ 若觉得手写 HTTP
-太繁琐，可以换成 FastAPI/uvicorn，接口契约（协议）保持不变即可。
+Implemented with the standard library only, to avoid pulling in a pile of
+dependencies as early as Stage 0. From Stage 1 onward, if hand-rolling HTTP
+feels too tedious, you can switch to FastAPI/uvicorn -- just keep the interface
+contract (the wire protocol) unchanged.
 """
 
 from __future__ import annotations
@@ -41,15 +45,20 @@ logger = logging.getLogger("microsandbox.server")
 
 
 def _ensure_loopback_up() -> None:
-    """把 loopback 网卡（lo）置为 UP。
+    """Bring the loopback interface (lo) UP.
 
-    microVM 里 lo 默认是 down 的，而 kernel 后端的 Jupyter kernel 走 ZMQ over 127.0.0.1
-    跟 daemon 通信——lo 不 up 就连不上（表现为 kernel 启动 60s 超时）。极简 rootfs 里没装
-    ip/ifconfig，所以直接用 SIOCSIFFLAGS ioctl 拉起（等价 `ip link set lo up`）。
+    Inside a microVM, lo defaults to down, but the kernel backend's Jupyter
+    kernel talks to the daemon over ZMQ on 127.0.0.1 -- if lo isn't up the
+    connection fails (manifesting as a 60s kernel-startup timeout). The minimal
+    rootfs has no ip/ifconfig installed, so we bring it up directly via the
+    SIOCSIFFLAGS ioctl (equivalent to `ip link set lo up`).
 
-    仅在 vsock（= 跑在 microVM 内）路径调用：容器/宿主的 lo 本就 up，无需也不该去动。
-    这件事本质是 init/系统初始化的职责，但我们的 rootfs init 是极简 shell（无网络工具），
-    而 daemon 是现成的 root 进程，放这里最省事且自带条件守卫。
+    Only called on the vsock path (= running inside a microVM): the lo of a
+    container/host is already up, so there's no need -- and no business -- to
+    touch it. Strictly speaking this is init/system-bootstrap's job, but our
+    rootfs init is a minimal shell (no networking tools), whereas the daemon is
+    an already-running root process, so doing it here is the least-effort spot
+    and comes with a built-in conditional guard.
     """
     import fcntl
     import struct
@@ -58,7 +67,7 @@ def _ensure_loopback_up() -> None:
     SIOCGIFFLAGS, SIOCSIFFLAGS = 0x8913, 0x8914
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # struct ifreq：char name[16] + flags(short)，整体补齐到 sizeof(ifreq)=40。
+        # struct ifreq: char name[16] + flags(short), padded out to sizeof(ifreq)=40.
         req = struct.pack("16sH22s", b"lo", 0, b"")
         flags = struct.unpack("16sH22s", fcntl.ioctl(sock.fileno(), SIOCGIFFLAGS, req))[1]
         req = struct.pack("16sH22s", b"lo", flags | IFF_UP, b"")
@@ -68,21 +77,23 @@ def _ensure_loopback_up() -> None:
 
 
 class SandboxServer:
-    """最小 HTTP 守护进程，基于 asyncio。端点：
+    """Minimal asyncio-based HTTP daemon. Endpoints:
 
-        GET  /health        健康检查（阶段 2+ 用来探测沙箱是否就绪）
-        POST /execute       执行代码，SSE 流式返回 OutputEvent
-        POST /files/read    读文件        （阶段 2c）
-        POST /files/write   写文件        （阶段 2c）
-        POST /files/list    列目录        （阶段 2c）
-        POST /commands      跑 shell 命令  （阶段 2c）
+        GET  /health        Health check (used from Stage 2+ to probe whether the sandbox is ready)
+        POST /execute       Execute code, stream OutputEvent back over SSE
+        POST /files/read    Read a file       (Stage 2c)
+        POST /files/write   Write a file      (Stage 2c)
+        POST /files/list    List a directory  (Stage 2c)
+        POST /commands      Run a shell command (Stage 2c)
 
-    阶段 2c 的文件/命令端点由 daemon 直接在自身文件系统上完成（不经 backend）——
-    对齐 E2B envd：文件/进程服务与跑代码的 kernel 是分开的。
+    The Stage 2c file/command endpoints are served by the daemon directly against
+    its own filesystem (not through the backend) -- mirroring E2B's envd: the
+    file/process services are separate from the kernel that runs code.
     """
 
     def __init__(self, backend: ExecutionBackend | None = None) -> None:
-        # 依赖抽象接口而非具体实现：换隔离方案时只改这一行的默认值。
+        # Depend on the abstract interface rather than a concrete implementation:
+        # switching isolation schemes only changes this line's default value.
         self.backend = backend or LocalSubprocessBackend()
 
     async def handle(
@@ -94,7 +105,7 @@ class SandboxServer:
                 return
             method, path, _ = request_line.decode().split(" ", 2)
 
-            # 读 headers，拿到 Content-Length 以便读 body
+            # Read the headers to get Content-Length, so we can read the body
             headers: dict[str, str] = {}
             while True:
                 line = await reader.readline()
@@ -108,7 +119,7 @@ class SandboxServer:
                 return
 
             if method == "POST":
-                # 所有 POST 端点都带 JSON body，统一读一次再按 path 分发。
+                # Every POST endpoint carries a JSON body, so read it once and then dispatch by path.
                 length = int(headers.get("content-length", "0"))
                 body = (await reader.readexactly(length) if length else b"{}").decode()
                 if path == "/execute":
@@ -128,7 +139,7 @@ class SandboxServer:
                     return
 
             await self._write_json(writer, 404, {"error": "not found"})
-        except Exception as exc:  # noqa: BLE001 - 守护进程不应因单个请求崩溃
+        except Exception as exc:  # noqa: BLE001 - a single request must not crash the daemon
             logger.exception("request handling failed")
             try:
                 await self._write_json(writer, 500, {"error": str(exc)})
@@ -147,7 +158,7 @@ class SandboxServer:
             await self._write_json(writer, 400, {"error": f"bad request: {exc}"})
             return
 
-        # 先写 SSE 响应头，然后逐事件 flush，实现流式。
+        # Write the SSE response headers first, then flush event by event to achieve streaming.
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/event-stream\r\n"
@@ -161,14 +172,20 @@ class SandboxServer:
             writer.write(event.to_sse().encode())
             await writer.drain()
 
-    # ----- 阶段 2c：文件 / shell 端点 -----
-    # 都由 daemon 直接在自身所在的文件系统/环境里完成（不经 ExecutionBackend）——
-    # 对 container/kernel 后端就是容器内（沙箱里），对 local 后端就是宿主。
+    # ----- Stage 2c: file / shell endpoints -----
+    # All served by the daemon directly against the filesystem/environment it
+    # lives in (not through the ExecutionBackend) -- for the container/kernel
+    # backends that's inside the container (in the sandbox), and for the local
+    # backend that's the host.
     #
-    # 路径限制：这里**有意不做**任何路径白名单/校验。container/kernel 后端下 daemon
-    # 只能看到容器自己的文件，「容器边界」就是天然的 confinement，再加人为限制反而会
-    # 挡掉合法读取（如 /etc/os-release）。唯一不安全的是 local 后端（能碰宿主任意文件）
-    # ——这与 local 一贯「无隔离、严禁对外」的定位一致，不是这里的新问题。
+    # Path restrictions: we *deliberately* do no path allowlisting/validation
+    # here. Under the container/kernel backends the daemon can only see the
+    # container's own files; the "container boundary" is the natural confinement,
+    # and adding artificial restrictions on top would instead block legitimate
+    # reads (e.g. /etc/os-release). The only unsafe case is the local backend
+    # (which can touch any file on the host) -- consistent with local's
+    # longstanding "no isolation, never expose externally" positioning, not a
+    # new problem introduced here.
 
     async def _handle_file_read(
         self, writer: asyncio.StreamWriter, raw_body: str
@@ -179,7 +196,7 @@ class SandboxServer:
             await self._write_json(writer, 400, {"error": f"bad request: {exc}"})
             return
         try:
-            # 小文件直接读，阻塞极短。大文件/高并发再考虑 run_in_executor（阶段 4）。
+            # Small files: read directly, the blocking is negligible. For large files / high concurrency, consider run_in_executor (Stage 4).
             content = pathlib.Path(req.path).read_text()
         except OSError as exc:
             await self._write_json(writer, 404, {"error": str(exc)})
@@ -196,10 +213,10 @@ class SandboxServer:
             return
         try:
             p = pathlib.Path(req.path)
-            p.parent.mkdir(parents=True, exist_ok=True)  # 顺手建中间目录（如写 /tmp/a/b.txt）
+            p.parent.mkdir(parents=True, exist_ok=True)  # create intermediate dirs along the way (e.g. when writing /tmp/a/b.txt)
             p.write_text(req.content)
         except OSError as exc:
-            # 常见：常驻容器 --read-only 根，写 /tmp 之外会到这里。如实回吐原因。
+            # Common case: a resident container with a --read-only root, so writing outside /tmp lands here. Report the reason verbatim.
             await self._write_json(writer, 400, {"error": str(exc)})
             return
         await self._write_json(writer, 200, {"ok": True})
@@ -230,8 +247,8 @@ class SandboxServer:
         except (json.JSONDecodeError, KeyError) as exc:
             await self._write_json(writer, 400, {"error": f"bad request: {exc}"})
             return
-        # 在 daemon 所在环境跑 shell（container/kernel 后端 = 容器内 = 沙箱里）。
-        # 非流式：跑完一次性把 stdout/stderr/exit_code 收回去（流式可作为后续扩展）。
+        # Run the shell in the daemon's own environment (container/kernel backend = inside the container = in the sandbox).
+        # Non-streaming: once it finishes, collect stdout/stderr/exit_code all at once (streaming can be a later extension).
         proc = await asyncio.create_subprocess_shell(
             req.command,
             stdout=asyncio.subprocess.PIPE,
@@ -278,17 +295,19 @@ class SandboxServer:
         transport: str = "tcp",
         vsock_port: int = 1024,
     ) -> None:
-        # 阶段 3：daemon 跑在 microVM 里时，控制通道走 vsock 而非 TCP（宿主经 Firecracker
-        # 的 UDS 连进来，见 docs/STAGE3_DESIGN.md §4.1）。除了「监听哪种 socket」不同，
-        # handle / 分发 / backend 全不变——这正是「协议稳定、传输可换」的体现。
+        # Stage 3: when the daemon runs inside a microVM, the control channel goes
+        # over vsock rather than TCP (the host connects in via Firecracker's UDS,
+        # see docs/STAGE3_DESIGN.md §4.1). Apart from "which kind of socket to
+        # listen on", handle / dispatch / backend are all unchanged -- this is
+        # exactly the embodiment of "stable protocol, swappable transport".
         if transport == "vsock":
-            # microVM 里 lo 默认 down，kernel 后端要靠它走 ZMQ；best-effort 拉起，失败只告警。
+            # Inside a microVM lo defaults to down, and the kernel backend relies on it for ZMQ; bring it up best-effort, warn only on failure.
             try:
                 _ensure_loopback_up()
             except OSError as exc:
-                logger.warning("无法拉起 loopback（kernel 后端可能不可用）：%s", exc)
+                logger.warning("could not bring up loopback (kernel backend may be unavailable): %s", exc)
             sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-            # VMADDR_CID_ANY：监听本 VM 自己的 vsock；端口固定，client 侧 CONNECT 它。
+            # VMADDR_CID_ANY: listen on this VM's own vsock; the port is fixed, the client side CONNECTs to it.
             sock.bind((socket.VMADDR_CID_ANY, vsock_port))
             server = await asyncio.start_server(self.handle, sock=sock)
             addr = f"vsock:cid=ANY,port={vsock_port}"
@@ -310,23 +329,24 @@ def main() -> None:
         choices=["local", "docker", "kernel"],
         default="local",
         help=(
-            "执行后端：local=本机子进程（无隔离）；docker=一次性容器（阶段 1）；"
-            "kernel=常驻 Jupyter kernel，有状态 REPL（阶段 2b，需在 agent 镜像内运行）"
+            "execution backend: local=local subprocess (no isolation); docker=one-shot container (Stage 1); "
+            "kernel=resident Jupyter kernel, stateful REPL (Stage 2b, must run inside the agent image)"
         ),
     )
-    # 阶段 3：传输方式与执行后端正交——backend 决定「怎么跑代码」，transport 决定
-    # 「client 怎么连进来」。microVM 内用 vsock，容器/宿主仍用 tcp。
+    # Stage 3: transport is orthogonal to the execution backend -- the backend
+    # decides "how to run code", the transport decides "how the client connects
+    # in". Inside a microVM use vsock; for container/host still use tcp.
     parser.add_argument(
         "--transport",
         choices=["tcp", "vsock"],
         default="tcp",
-        help="控制通道：tcp=HTTP over TCP（阶段 0~2）；vsock=HTTP over vsock（阶段 3 microVM 内）",
+        help="control channel: tcp=HTTP over TCP (Stage 0~2); vsock=HTTP over vsock (Stage 3, inside the microVM)",
     )
     parser.add_argument(
         "--vsock-port",
         type=int,
         default=1024,
-        help="vsock 传输时 daemon 监听的 vsock 端口（client 侧 CONNECT 它）",
+        help="the vsock port the daemon listens on under vsock transport (the client side CONNECTs to it)",
     )
     args = parser.parse_args()
 
@@ -336,15 +356,17 @@ def main() -> None:
     )
 
     if args.backend == "docker":
-        # 启动期就把环境问题（docker 没装/没起/镜像缺失）暴露给起 daemon 的人，
-        # 并给出可操作的中文指引——而不是等第一次执行才埋进 SSE 流里。
+        # Surface environment problems (docker not installed / not running / image missing) to
+        # whoever starts the daemon right at startup, with actionable guidance -- rather than
+        # burying them in the SSE stream only on the first execution.
         problem = DockerBackend.check_available()
         if problem:
             parser.error(problem)
         backend: ExecutionBackend = DockerBackend()
     elif args.backend == "kernel":
-        # 同理，缺 ipykernel/jupyter_client 时启动期就报清楚（一般只会在非 agent
-        # 镜像里误用 --backend kernel 才触发）。实例化只验证依赖，kernel 是懒启动的。
+        # Likewise, when ipykernel/jupyter_client is missing, report it clearly at startup
+        # (this generally only triggers when --backend kernel is misused outside the agent
+        # image). Instantiation only validates dependencies; the kernel is started lazily.
         try:
             backend = JupyterKernelBackend()
         except RuntimeError as exc:

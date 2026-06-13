@@ -1,8 +1,9 @@
-"""端到端测试（阶段 0 写就，阶段 1 起双后端复用）。
+"""End-to-end tests (written in Stage 0, reused across both backends from Stage 1).
 
-覆盖：基本执行、stdout/stderr 分离、错误捕获、超时。
-sandbox fixture 在 conftest.py 里已参数化为 local / docker 双后端——
-同一套测试体各跑一遍，验证「协议契约不变，隔离方案可换」。
+Covers: basic execution, stdout/stderr separation, error capture, timeout.
+The sandbox fixture in conftest.py is already parametrized over the local /
+docker backends -- the same test bodies run once each, verifying that "the
+protocol contract stays fixed while the isolation scheme can be swapped."
 """
 
 from microsandbox import Sandbox

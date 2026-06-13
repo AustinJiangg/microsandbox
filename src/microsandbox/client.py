@@ -1,7 +1,8 @@
-"""客户端 SDK —— 用户实际编写代码时面对的接口。
+"""Client SDK -- the interface users actually face when writing code.
 
-设计目标：手感尽量贴近 E2B，这样你学完自己的实现后，回头看 E2B 的
-SDK 会很有亲切感。典型用法：
+Design goal: keep the feel as close to E2B as possible, so that after you've
+studied your own implementation, going back to E2B's SDK feels familiar.
+Typical usage:
 
     from microsandbox import Sandbox
 
@@ -9,11 +10,13 @@ SDK 会很有亲切感。典型用法：
         execution = sandbox.run_code("print('hello from sandbox')")
         print(execution.stdout)
 
-阶段 0/1：Sandbox 自动在本机拉起 daemon 子进程并连上（spawn_local=True）。
-        阶段 1 用 backend="docker" 让 daemon 把代码放进一次性容器里执行——
-        一行切换隔离方案，run_code 的用法完全不变。
-阶段 2+：Sandbox 的职责会扩展为「向控制面申请一个新沙箱、拿到它的地址、
-        再连上去」。但 run_code / 流式消费这套上层 API 对用户保持不变。
+Stage 0/1: Sandbox automatically spawns a daemon subprocess locally and connects
+        to it (spawn_local=True). At Stage 1, backend="docker" makes the daemon
+        run the code inside a one-shot container -- switch isolation strategies
+        with a single line, and run_code's usage stays exactly the same.
+Stage 2+: Sandbox's responsibility expands to "request a new sandbox from the
+        control plane, obtain its address, then connect to it." But the upper-level
+        API of run_code / streaming consumption stays unchanged for the user.
 """
 
 from __future__ import annotations
@@ -36,51 +39,63 @@ from typing import Any
 
 from .protocol import EventType, Execution, ExecuteRequest, OutputEvent
 
-# client 与守护进程之间是点对点的内部信道，绝不应被环境代理截胡。
-# urllib 默认会读取 http_proxy 等环境变量，而 Python 对 no_proxy 只做
-# 精确/后缀匹配，不认 Windows 风格通配符（如 "127.*"、"<local>"）——
-# 在 WSL2 这类继承宿主代理配置的环境里，连 127.0.0.1 的请求都会被转给
-# 本地代理，代理收尾连接时偶发 RST，导致测试随机 ConnectionResetError。
-# 这里显式构造「无代理」opener，client 的所有请求都走它。
+# The channel between client and daemon is a point-to-point internal channel; it
+# should never be intercepted by an environment proxy. By default urllib reads
+# env vars like http_proxy, and Python only does exact/suffix matching for
+# no_proxy -- it does not understand Windows-style wildcards (e.g. "127.*",
+# "<local>"). In environments like WSL2 that inherit the host's proxy config, even
+# requests to 127.0.0.1 get forwarded to the local proxy, and the proxy
+# occasionally RSTs as it closes the connection, causing random
+# ConnectionResetError in tests. Here we explicitly build a "no proxy" opener, and
+# all of the client's requests go through it.
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# ---- 阶段 2：常驻容器拓扑 ----
-# 这些 backend 取值代表「主从关系反转」：daemon 不再跑在宿主，而是被 client
-# docker run -d 进一个长期存活的容器里常驻（对应 E2B 的 envd）。
-# "container"（2a）容器内是无状态子进程；"kernel"（2b）容器内是常驻 Jupyter
-# kernel，变量跨 run_code 留存。两者共用同一套「起常驻容器」代码，差别只在
-# 用哪个镜像、以及告诉容器内 daemon 用哪个 --backend（见 _spawn_resident_container）。
+# ---- Stage 2: resident-container topology ----
+# These backend values represent the "ownership inversion": the daemon no longer
+# runs on the host, but is run by the client via docker run -d as a long-lived
+# resident inside a long-running container (corresponding to E2B's envd).
+# "container" (2a): inside the container is a stateless subprocess; "kernel" (2b):
+# inside the container is a resident Jupyter kernel, where variables persist across
+# run_code calls. Both share the same "start a resident container" code; the only
+# difference is which image to use and which --backend to tell the in-container
+# daemon to use (see _spawn_resident_container).
 _RESIDENT_BACKENDS = {"container", "kernel"}
-# client 的 backend 取值 → 容器内 daemon 实际用哪个 --backend 启动。
+# client's backend value -> which --backend the in-container daemon actually starts with.
 _INNER_BACKEND = {"container": "local", "kernel": "kernel"}
-# 容器内 daemon 固定监听这个端口；宿主侧映射到一个随机空闲端口（见 _find_free_port），
-# 这样多个沙箱、以及宿主上可能已存在的 daemon 都不会撞端口。
+# The in-container daemon always listens on this port; the host side maps it to a
+# random free port (see _find_free_port), so that multiple sandboxes -- and any
+# daemon that may already exist on the host -- don't collide on ports.
 _CONTAINER_PORT = 49152
-# 容器内挂载源码的位置（2a 不建镜像，把宿主 src/ 只读挂进来即可跑我们的包）。
+# Where the source is mounted inside the container (2a builds no image; mounting the
+# host's src/ read-only is enough to run our package).
 _CONTAINER_SRC = "/opt/microsandbox/src"
 
-# ---- 阶段 3：Firecracker microVM 拓扑 ----
-# 与阶段 2 常驻容器同构：client 亲手创建并持有隔离环境（这里是 microVM），daemon 在
-# VM 内常驻、经 vsock 暴露。素材（firecracker 二进制 / 内核 / rootfs）由
-# scripts/build-rootfs.sh 生成在仓库 vendor/ 下（见 docs/STAGE3_DESIGN.md §6/§7）。
-_MICROVM_VSOCK_PORT = 1024   # daemon 在 VM 内监听的 vsock 端口（与 rootfs 的 /init 一致）
-_MICROVM_GUEST_CID = 3       # guest 的 vsock CID（宿主固定为 2）
+# ---- Stage 3: Firecracker microVM topology ----
+# Isomorphic to Stage 2's resident container: the client hand-creates and owns the
+# isolation environment (here a microVM), and the daemon resides inside the VM,
+# exposed via vsock. The artifacts (firecracker binary / kernel / rootfs) are
+# generated by scripts/build-rootfs.sh under the repo's vendor/ (see
+# docs/STAGE3_DESIGN.md §6/§7).
+_MICROVM_VSOCK_PORT = 1024   # vsock port the daemon listens on inside the VM (matches the rootfs's /init)
+_MICROVM_GUEST_CID = 3       # guest's vsock CID (host is fixed at 2)
 _MICROVM_VCPUS = 1
-_MICROVM_MEM_MIB = 512       # VM 内跑 Jupyter kernel，256 偏紧，给 512
+_MICROVM_MEM_MIB = 512       # a Jupyter kernel runs inside the VM; 256 is tight, so give 512
 
 
 def _vendor_dir() -> pathlib.Path:
-    """素材目录：client.py 在 src/microsandbox/ 下，仓库根是 parents[2]。"""
+    """Artifacts directory: client.py is under src/microsandbox/, so the repo root is parents[2]."""
     return pathlib.Path(__file__).resolve().parents[2] / "vendor"
 
 
 def _firecracker_api(
     sock_path: str, method: str, path: str, body: dict, timeout: float = 15.0
 ) -> int:
-    """对 Firecracker 的 REST API（HTTP over AF_UNIX）发一个请求，返回状态码。
+    """Send one request to Firecracker's REST API (HTTP over AF_UNIX), returning the status code.
 
-    快照 load/create 这类操作 --config-file 表达不了，只能走 API。api.sock 可能还没被
-    firecracker 创建出来，所以连不上时轮询重试到 timeout。只读状态行（不关心 body）。
+    Operations like snapshot load/create can't be expressed via --config-file, so they
+    must go through the API. api.sock may not yet have been created by firecracker, so
+    poll and retry until timeout when the connection fails. Only the status line is read
+    (the body is ignored).
     """
     payload = json.dumps(body).encode()
     head = (
@@ -108,38 +123,48 @@ def _firecracker_api(
 
 
 def _find_free_port() -> int:
-    """绑到 :0 让内核分配一个空闲端口，立刻释放，把端口号交给 docker -p 用。
+    """Bind to :0 to let the kernel allocate a free port, release it immediately, and hand the port number to docker -p.
 
-    释放到 docker 真正绑定之间有极小的竞态窗口；阶段 2a 够用，
-    更稳的端口/沙箱池管理是阶段 4 的事。
+    There's a tiny race window between releasing and docker actually binding; good
+    enough for Stage 2a, while more robust port / sandbox-pool management is a Stage 4
+    matter.
     """
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-# ---- 阶段 3：传输层抽象（Transport）----
+# ---- Stage 3: transport-layer abstraction (Transport) ----
 #
-# 阶段 0~2 里 client 与 daemon 之间一直是「HTTP/SSE over TCP」，写死在 urllib 调用里。
-# 阶段 3 的 microVM 把控制通道换成 vsock（宿主经 Firecracker 的 UDS 连进 VM，见
-# docs/STAGE3_DESIGN.md §4.1）——传输方式第一次真的变了。为了让「协议字节不变、只换
-# 底层管道」这条主线继续成立，这里把「怎么把一次 HTTP 往返送到 daemon」抽成 Transport：
-#   - _TcpTransport ：原样包住既有的 urllib over TCP，行为字节级不变（local/docker/
-#     container/kernel 四个拓扑、既有 42 个测试因此一字不改地全绿）。
-#   - _VsockTransport：连 Firecracker 的 vsock UDS、做 CONNECT 握手、在裸 socket 上手写
-#     最小 HTTP/1.1（阶段 3b 接 microVM 时用；本步先写好并单测，暂不接真 VM）。
-# Sandbox 的 _stream / _post_json / _wait_until_healthy 都改为经 transport 收发，
-# 自己不再直接碰 urllib——传输细节被这层挡住，上层逻辑对 TCP/vsock 完全一致。
+# In Stages 0~2, the channel between client and daemon was always "HTTP/SSE over TCP",
+# hardcoded into urllib calls. Stage 3's microVM switches the control channel to vsock
+# (the host connects into the VM via Firecracker's UDS, see docs/STAGE3_DESIGN.md §4.1)
+# -- the transport actually changes for the first time. To keep the main thread of
+# "protocol bytes unchanged, only the underlying pipe swapped" valid, here we abstract
+# "how to send one HTTP round-trip to the daemon" into Transport:
+#   - _TcpTransport: wraps the existing urllib over TCP as-is, byte-for-byte identical
+#     behavior (the four topologies local/docker/container/kernel, and the existing 42
+#     tests, therefore all pass green without a single change).
+#   - _VsockTransport: connects to Firecracker's vsock UDS, does the CONNECT handshake,
+#     and hand-writes a minimal HTTP/1.1 over the raw socket (used at Stage 3b when
+#     wiring up the microVM; this step writes and unit-tests it first, not yet against a
+#     real VM).
+# Sandbox's _stream / _post_json / _wait_until_healthy are all changed to send/receive
+# via transport and no longer touch urllib directly -- the transport details are
+# blocked off by this layer, so the upper-level logic is completely identical for
+# TCP/vsock.
 
 
 class _Response:
-    """一次 HTTP 往返被传输层归一化后的响应：状态码 + 一个 file-like。
+    """A response after one HTTP round-trip is normalized by the transport layer: a status code + a file-like.
 
-    两种用法共用它，区别只在调用方怎么读 fp：
-      - 流式(SSE)：`for line in resp:` 逐行消费，直到连接关闭（EOF）；
-      - 单发(JSON)：`resp.read()` 一次读完 body。
-    fp 对 _TcpTransport 是 urllib 的响应对象，对 _VsockTransport 是 socket 的读文件——
-    两者都支持「按行迭代」和 read()，所以上层逻辑对两种传输无差别。
+    Both usages share it; the only difference is how the caller reads fp:
+      - streaming (SSE): `for line in resp:` consumes line by line until the connection
+        closes (EOF);
+      - single-shot (JSON): `resp.read()` reads the whole body at once.
+    fp is urllib's response object for _TcpTransport, and the socket's read file for
+    _VsockTransport -- both support "line-by-line iteration" and read(), so the
+    upper-level logic is indistinguishable across the two transports.
     """
 
     def __init__(
@@ -170,8 +195,9 @@ class _Response:
 
 
 class _Transport(ABC):
-    """「怎么把一次 HTTP 请求送到 daemon、取回响应」的抽象。换隔离/换部署形态时，
-    需要换的只是这层（TCP→vsock），protocol 与上层 API 都不动。"""
+    """The abstraction of "how to send one HTTP request to the daemon and get the response back".
+    When switching isolation/deployment form, all that needs to change is this layer
+    (TCP->vsock); neither the protocol nor the upper-level API moves."""
 
     @abstractmethod
     def request(
@@ -182,13 +208,14 @@ class _Transport(ABC):
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> _Response:
-        """发一次 HTTP 请求，返回 _Response。timeout=None 表示不设超时（阻塞）。"""
+        """Send one HTTP request, returning a _Response. timeout=None means no timeout (blocking)."""
         raise NotImplementedError
 
 
 class _TcpTransport(_Transport):
-    """HTTP over TCP（阶段 0~2 的老路）。内部仍用 urllib + 无代理 opener，行为与重构前
-    字节级一致——这正是既有测试不改即全绿的依据。"""
+    """HTTP over TCP (the old path of Stages 0~2). Internally still uses urllib + the
+    no-proxy opener, byte-for-byte identical behavior to before the refactor -- this is
+    precisely why the existing tests pass green without modification."""
 
     def __init__(self, host: str, port: int) -> None:
         self._base = f"http://{host}:{port}"
@@ -205,28 +232,33 @@ class _TcpTransport(_Transport):
             self._base + path, data=body, headers=headers or {}, method=method
         )
         try:
-            # timeout=None 时不传该参数，完全复刻重构前 _DIRECT_OPENER.open(req) 的行为
-            # （urllib 里「不传」走全局默认，与显式 None 有微妙差别，这里保持原样最稳）。
+            # When timeout=None, don't pass that argument, exactly replicating the
+            # pre-refactor behavior of _DIRECT_OPENER.open(req) (in urllib, "not passing"
+            # uses the global default, which differs subtly from an explicit None, so
+            # keeping it as-is is the safest).
             resp = (
                 _DIRECT_OPENER.open(req)
                 if timeout is None
                 else _DIRECT_OPENER.open(req, timeout=timeout)
             )
         except urllib.error.HTTPError as exc:
-            # 非 2xx 在 urllib 里是异常；归一化成 _Response，让上层（_post_json）统一按
-            # status 处理，与 vsock 路径行为一致。HTTPError 本身就是个 file-like，能 read()。
+            # Non-2xx is an exception in urllib; normalize it into a _Response so the
+            # upper layer (_post_json) handles it uniformly by status, consistent with the
+            # vsock path. HTTPError is itself a file-like that supports read().
             return _Response(exc.code, exc)
         return _Response(resp.status, resp)
 
 
 class _VsockTransport(_Transport):
-    """HTTP over vsock（阶段 3 的 microVM 控制通道）。
+    """HTTP over vsock (Stage 3's microVM control channel).
 
-    Firecracker 把 guest 的 vsock 多路复用到宿主的一个 Unix domain socket（UDS）上，
-    握手是文本协议：连上 UDS 后发 `CONNECT <port>\\n`，Firecracker 回 `OK <hostport>\\n`，
-    之后这条字节流就接到了 guest 里监听该 vsock 端口的 daemon。握手完，双方说的还是原来
-    那套 HTTP/SSE——所以这里只需在裸 socket 上手写一个最小 HTTP/1.1 客户端。
-    （urllib 不会说这套 CONNECT 握手，故不能复用 _TcpTransport。）
+    Firecracker multiplexes the guest's vsock onto a single Unix domain socket (UDS) on
+    the host. The handshake is a text protocol: after connecting to the UDS, send
+    `CONNECT <port>\\n`, Firecracker replies `OK <hostport>\\n`, and from then on this
+    byte stream is wired to the daemon listening on that vsock port inside the guest.
+    Once the handshake is done, both sides still speak the same original HTTP/SSE -- so
+    here we only need to hand-write a minimal HTTP/1.1 client over the raw socket.
+    (urllib doesn't speak this CONNECT handshake, so _TcpTransport can't be reused.)
     """
 
     def __init__(self, uds_path: str, vsock_port: int) -> None:
@@ -242,17 +274,17 @@ class _VsockTransport(_Transport):
         timeout: float | None = None,
     ) -> _Response:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(timeout)  # None=阻塞（流式 /execute 用）；健康检查传 1s
+        sock.settimeout(timeout)  # None=blocking (used by streaming /execute); health check passes 1s
         try:
             sock.connect(self._uds)
-            # ① Firecracker vsock 握手：CONNECT <port> -> OK <hostport>
+            # 1. Firecracker vsock handshake: CONNECT <port> -> OK <hostport>
             sock.sendall(f"CONNECT {self._vsock_port}\n".encode())
-            rfile = sock.makefile("rb")  # 读响应走它；写一律用 sock.sendall，避免读写缓冲互扰
+            rfile = sock.makefile("rb")  # reading the response goes through it; writes always use sock.sendall, to avoid read/write buffers interfering
             ack = rfile.readline()
             if not ack.startswith(b"OK"):
-                # 例如 guest 里那个 vsock 端口没人监听，Firecracker 会回非 OK。
-                raise ConnectionError(f"vsock CONNECT 被拒：{ack!r}")
-            # ② 手写最小 HTTP/1.1 请求行 + 头 + body
+                # e.g. nobody is listening on that vsock port inside the guest, so Firecracker replies non-OK.
+                raise ConnectionError(f"vsock CONNECT rejected: {ack!r}")
+            # 2. Hand-write the minimal HTTP/1.1 request line + headers + body
             head = [f"{method} {path} HTTP/1.1", "Host: sandbox", "Connection: close"]
             hdrs = dict(headers or {})
             if body is not None:
@@ -261,7 +293,7 @@ class _VsockTransport(_Transport):
             sock.sendall(("\r\n".join(head) + "\r\n\r\n").encode())
             if body:
                 sock.sendall(body)
-            # ③ 读状态行 + 跳过响应头，让 rfile 停在 body 起点交给上层（流式/单发都从这读）
+            # 3. Read the status line + skip the response headers, leaving rfile at the start of the body for the upper layer (both streaming and single-shot read from here)
             status_line = rfile.readline().decode("latin-1")
             status = int(status_line.split(" ", 2)[1])
             while True:
@@ -275,28 +307,36 @@ class _VsockTransport(_Transport):
 
 
 class Sandbox:
-    """一个沙箱会话的客户端句柄。
+    """A client handle for a sandbox session.
 
-    参数：
-        host / port：守护进程地址。
-        spawn_local：便利开关。若为 True，构造时自动在本机拉起一个守护进程
-                     子进程并连上它，退出时自动关闭 —— 让你一行代码就能跑起来，
-                     不用先手动开 server。阶段 2+ 会用真正的「创建沙箱」逻辑替换它。
-        backend：执行/部署策略，不进 wire protocol。
-                 - "local"（阶段 0）：宿主子进程，几乎无隔离。
-                 - "docker"（阶段 1）：宿主 daemon，每次执行起一个一次性容器。
-                 - "container"（阶段 2a）：daemon 搬进一个**常驻容器**里跑（envd 化），
-                   client 负责 docker run 起它、退出时 docker rm -f。容器内用无状态
-                   子进程后端。
-                 - "kernel"（阶段 2b）：同样是常驻容器，但容器内 daemon 托管一个常驻
-                   Jupyter kernel——变量跨 run_code 留存，真正的有状态 REPL（对齐 E2B）。
-                   需先构建 agent 镜像：docker build -t microsandbox-agent .
-                 - "microvm"（阶段 3）：把 daemon 跑进一台 Firecracker microVM（独立 guest
-                   内核 + KVM 边界，最强隔离），控制通道走 vsock，VM 内用 kernel 后端（有
-                   状态）。需先备好 vendor/ 素材：见 docs/STAGE3_DESIGN.md §6/§7。
-        from_snapshot：仅对 backend="microvm" 有效。True 则从预热快照毫秒级恢复（跳过内核
-                   引导 + Jupyter kernel 冷启动，~30ms 就绪 vs 冷启动 ~0.94s）。需先
-                   scripts/build-snapshot.sh；当前单实例（快照 vsock uds 路径固定，见 §9）。
+    Args:
+        host / port: daemon address.
+        spawn_local: convenience switch. If True, the constructor automatically spawns a
+                     daemon subprocess locally and connects to it, closing it
+                     automatically on exit -- so you can get running with a single line
+                     of code, without manually starting the server first. Stage 2+
+                     replaces this with real "create a sandbox" logic.
+        backend: execution/deployment strategy, not part of the wire protocol.
+                 - "local" (Stage 0): host subprocess, almost no isolation.
+                 - "docker" (Stage 1): host daemon, spawns a one-shot container per execution.
+                 - "container" (Stage 2a): the daemon moves into a **resident container**
+                   to run (envd-ified); the client is responsible for starting it via
+                   docker run and docker rm -f on exit. Inside the container it uses the
+                   stateless subprocess backend.
+                 - "kernel" (Stage 2b): also a resident container, but the in-container
+                   daemon hosts a resident Jupyter kernel -- variables persist across
+                   run_code, a real stateful REPL (aligned with E2B). Build the agent
+                   image first: docker build -t microsandbox-agent .
+                 - "microvm" (Stage 3): runs the daemon inside a Firecracker microVM
+                   (independent guest kernel + KVM boundary, the strongest isolation),
+                   with the control channel over vsock and the kernel backend (stateful)
+                   inside the VM. Prepare the vendor/ artifacts first: see
+                   docs/STAGE3_DESIGN.md §6/§7.
+        from_snapshot: only effective for backend="microvm". If True, restore from a
+                   pre-warmed snapshot in milliseconds (skipping kernel boot + Jupyter
+                   kernel cold start, ~30ms to ready vs ~0.94s cold start). Run
+                   scripts/build-snapshot.sh first; currently single-instance (the
+                   snapshot's vsock uds path is fixed, see §9).
     """
 
     def __init__(
@@ -313,28 +353,33 @@ class Sandbox:
         self.timeout_seconds = timeout_seconds
         self.backend = backend
         self._from_snapshot = from_snapshot
-        self._proc: subprocess.Popen | None = None   # 宿主 daemon 子进程（阶段 0/1）
-        self._container: str | None = None           # 常驻沙箱容器名（阶段 2）
-        # 传输层（阶段 3 抽象）：默认懒构造成 TCP；microVM 会在 _spawn_microvm 里
-        # 预装一个 vsock 传输。把「怎么连」从「连上之后说什么」里拆出来。
+        self._proc: subprocess.Popen | None = None   # host daemon subprocess (Stage 0/1)
+        self._container: str | None = None           # resident sandbox container name (Stage 2)
+        # Transport layer (Stage 3 abstraction): defaults to lazily constructing a TCP
+        # one; the microVM pre-installs a vsock transport in _spawn_microvm. Separates
+        # "how to connect" from "what to say once connected".
         self._transport: _Transport | None = None
-        self._workdir: pathlib.Path | None = None      # microVM 的 per-VM 工作目录（阶段 3）
-        self._console_log: pathlib.Path | None = None  # firecracker/guest 串口日志（诊断用）
+        self._workdir: pathlib.Path | None = None      # microVM's per-VM working directory (Stage 3)
+        self._console_log: pathlib.Path | None = None  # firecracker/guest serial log (for diagnostics)
 
-        # 阶段 2c：文件 / shell 两个命名空间，手感对齐 E2B 的 sandbox.files / sandbox.commands。
-        # 它们只在被调用时才用到 host/port，所以这里先建好即可（顺序无所谓）。
+        # Stage 2c: the file / shell namespaces, with a feel aligned to E2B's
+        # sandbox.files / sandbox.commands. They only use host/port when called, so it's
+        # enough to build them here (order doesn't matter).
         self.files = _Files(self)
         self.commands = _Commands(self)
 
         if spawn_local:
-            # 阶段 2 的「反转」就体现在这个分叉：常驻容器后端由 client 亲手
-            # docker run 起一个容器把 daemon 装进去；其余后端沿用阶段 0/1 的
-            # 宿主子进程。两条路都连同一个 daemon、说同一套协议。
+            # Stage 2's "inversion" shows up in this fork: the resident-container backend
+            # has the client hand-start a container via docker run to put the daemon
+            # inside; the other backends follow Stage 0/1's host subprocess. Both paths
+            # connect to the same daemon and speak the same protocol.
             #
-            # 兜底：_spawn_* 成功后容器/子进程就已经起来了，若紧接着的健康检查
-            # 失败（daemon 起不来/起太慢），异常会从 __init__ 穿出去——此时 with
-            # 语句还没进 __enter__，__exit__ 永远不会触发，已起的容器就成了没人收的
-            # 残留。所以这里自己 close 掉再把异常抛上去（close 幂等，安全）。
+            # Safety-net: after _spawn_* succeeds, the container/subprocess is already up;
+            # if the immediately following health check fails (the daemon won't start / is
+            # too slow), the exception propagates out of __init__ -- at which point the
+            # with statement hasn't entered __enter__, __exit__ never fires, and the
+            # already-started container becomes an orphaned leftover. So here we close it
+            # ourselves and then re-raise the exception (close is idempotent, so it's safe).
             try:
                 if backend == "microvm" and from_snapshot:
                     self._restore_microvm()
@@ -349,16 +394,17 @@ class Sandbox:
                 self.close()
                 raise
 
-    # ----- 生命周期 -----
+    # ----- lifecycle -----
 
     def _spawn_daemon(self) -> None:
-        """本机拉起守护进程子进程（阶段 0/1：daemon 留在宿主机）。
+        """Spawn the daemon subprocess locally (Stage 0/1: the daemon stays on the host machine).
 
-        阶段 1 的隔离不发生在这里，而在 daemon 内部的 DockerBackend——
-        client 只负责把 --backend 开关带给 daemon，自己完全不懂 docker。
-        阶段 2 没有改这条路，而是**新增**了一条 _spawn_resident_container（把
-        daemon 装进常驻容器，对应 E2B 的 envd）与它并存；阶段 3 会再加一条
-        「通过 orchestrator 启动 microVM」。三条路连的都是同一个 daemon。
+        Stage 1's isolation doesn't happen here, but inside the daemon's DockerBackend --
+        the client is only responsible for passing the --backend switch to the daemon, and
+        knows nothing about docker itself. Stage 2 didn't change this path, but **added** a
+        _spawn_resident_container (putting the daemon into a resident container,
+        corresponding to E2B's envd) to coexist with it; Stage 3 adds one more, "start a
+        microVM via the orchestrator". All three paths connect to the same daemon.
         """
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "microsandbox.server",
@@ -366,25 +412,29 @@ class Sandbox:
              "--backend", self.backend,
              "--log-level", "WARNING"],
             stdout=subprocess.DEVNULL,
-            # stderr 留管道：daemon 若启动即失败（如 docker 不可用），要把原因
-            # 带给用户。WARNING 级日志量极小，不会撑满 64KB 的管道缓冲。
+            # Keep stderr piped: if the daemon fails immediately at startup (e.g. docker
+            # unavailable), the reason must be brought back to the user. WARNING-level logs
+            # are tiny and won't fill up the 64KB pipe buffer.
             stderr=subprocess.PIPE,
         )
 
     def _spawn_resident_container(self) -> None:
-        """阶段 2a：docker run -d 起一个常驻容器，把 daemon 跑在里面。
+        """Stage 2a: docker run -d to start a resident container with the daemon running inside.
 
-        对比上面的 _spawn_daemon（在宿主 Popen 一个进程）：这里隔离环境（容器）
-        由 client 亲手创建并长期持有——这就是阶段 2 的「主从关系反转」。
-        注意 daemon 的代码（server.py）一行没改，只是换了运行的地方：这正是
-        三层解耦想证明的事。
+        Contrast with _spawn_daemon above (Popen a process on the host): here the
+        isolation environment (the container) is hand-created and held long-term by the
+        client -- this is Stage 2's "ownership inversion". Note the daemon's code
+        (server.py) didn't change a single line; only the place it runs changed: this is
+        exactly what the three-layer decoupling sets out to prove.
 
-        2a 刻意不建镜像：把宿主的 src/ 只读挂载进官方 python:3.12-slim 即可让
-        容器跑我们的包，改代码免重建。等阶段 2b 引入 jupyter 依赖时，才会改用
-        Dockerfile 把依赖烘进 agent 镜像。
+        2a deliberately builds no image: read-only mounting the host's src/ into the
+        official python:3.12-slim is enough to let the container run our package, and code
+        changes need no rebuild. Only when Stage 2b introduces the jupyter dependency does
+        it switch to a Dockerfile that bakes the dependencies into the agent image.
         """
-        # 按后端选镜像：container 用官方 slim（2a，零依赖）；kernel 用 agent 镜像
-        # （2b，预装了 ipykernel/jupyter_client，需先 docker build -t microsandbox-agent .）。
+        # Pick the image by backend: container uses the official slim (2a, zero deps);
+        # kernel uses the agent image (2b, with ipykernel/jupyter_client preinstalled,
+        # requires docker build -t microsandbox-agent . first).
         from .backend import DEFAULT_AGENT_IMAGE, DEFAULT_DOCKER_IMAGE, DockerBackend
 
         image = {
@@ -392,17 +442,19 @@ class Sandbox:
             "kernel": DEFAULT_AGENT_IMAGE,
         }[self.backend]
 
-        # 起容器前先把环境问题（docker 没装/没起/镜像缺失）暴露出来并给可操作指引，
-        # 而不是等 docker run 失败后从日志里猜。复用阶段 1 的同一套检查。
+        # Before starting the container, surface environment problems (docker not
+        # installed/not running/image missing) with actionable guidance, rather than
+        # guessing from logs after docker run fails. Reuse the same checks from Stage 1.
         problem = DockerBackend.check_available(image)
         if problem:
-            raise RuntimeError(f"无法创建常驻沙箱容器：{problem}")
+            raise RuntimeError(f"Failed to create resident sandbox container: {problem}")
 
-        # 容器统一前缀命名：close 时按名 docker rm -f，残留时也能按前缀一键清理
-        # （docker ps -a --filter name=microsandbox-sandbox -q | xargs -r docker rm -f）。
+        # Uniform prefix naming for the container: docker rm -f by name on close, and any
+        # leftovers can be cleaned up by prefix in one shot
+        # (docker ps -a --filter name=microsandbox-sandbox -q | xargs -r docker rm -f).
         self._container = f"microsandbox-sandbox-{uuid.uuid4().hex[:12]}"
         self.host = "127.0.0.1"
-        self.port = _find_free_port()  # 宿主侧随机空闲端口，避免多沙箱/与宿主 daemon 撞端口
+        self.port = _find_free_port()  # random free port on the host side, to avoid colliding with multiple sandboxes / the host daemon
 
         src_dir = pathlib.Path(__file__).resolve().parents[1]  # .../src
         inner_backend = _INNER_BACKEND[self.backend]
@@ -410,43 +462,51 @@ class Sandbox:
         cmd = [
             "docker", "run", "-d",
             "--name", self._container,
-            "--pull", "never",                 # 镜像缺失立刻报错，绝不在创建路径里隐式拉
-            # 只把管理端口发布到本机回环：宿主能连，外网连不到
+            "--pull", "never",                 # error immediately if the image is missing; never implicitly pull on the creation path
+            # Publish the management port only to the local loopback: the host can connect, the outside network can't
             "-p", f"127.0.0.1:{self.port}:{_CONTAINER_PORT}",
-            # 资源限制作用于整个沙箱容器（daemon + 其内所有执行共享同一 cgroup），
-            # 这正是 E2B 的 per-sandbox 限额模型——而非阶段 1 的 per-execution。
-            # pids-limit 取 128（比 DockerBackend 的 64 大）：阶段 1 的容器只跑一个
-            # python，而这里容器内还常驻着 daemon，再加上每次执行的子进程，pid 占用更高。
+            # Resource limits apply to the entire sandbox container (the daemon + all
+            # executions within it share the same cgroup); this is exactly E2B's
+            # per-sandbox quota model -- not Stage 1's per-execution one. pids-limit is set
+            # to 128 (larger than DockerBackend's 64): Stage 1's container runs only one
+            # python, whereas here the daemon also resides in the container, plus the
+            # subprocess of each execution, so pid usage is higher.
             "--memory", "256m", "--memory-swap", "256m",
             "--cpus", "1.0", "--pids-limit", "128",
             "--read-only", "--tmpfs", "/tmp:rw,size=64m",
-            "-v", f"{src_dir}:{_CONTAINER_SRC}:ro",       # 只读挂载源码
+            "-v", f"{src_dir}:{_CONTAINER_SRC}:ro",       # read-only mount the source
             "-e", f"PYTHONPATH={_CONTAINER_SRC}",
-            "-e", "PYTHONDONTWRITEBYTECODE=1",            # 只读根下别尝试写 .pyc
+            "-e", "PYTHONDONTWRITEBYTECODE=1",            # don't try to write .pyc under the read-only root
             "-e", "PYTHONUNBUFFERED=1",
-            # HOME 指到可写的 tmpfs：kernel 后端下，Jupyter 要写 kernel 连接文件、
-            # IPython 要写历史 sqlite，默认都落在 HOME 下，而根是 --read-only 的。
-            # 对 container 后端无害。
+            # Point HOME to the writable tmpfs: under the kernel backend, Jupyter needs to
+            # write the kernel connection file and IPython needs to write its history
+            # sqlite, which by default both land under HOME, while the root is
+            # --read-only. Harmless to the container backend.
             "-e", "HOME=/tmp",
             image,
-            # daemon 必须监听 0.0.0.0 才能被宿主经映射端口连到（默认 127.0.0.1 在容器内
-            # 等于谁都连不进来）。这是 server 端唯一的「配置」差异，代码本身不变。
+            # The daemon must listen on 0.0.0.0 to be reachable by the host via the mapped
+            # port (the default 127.0.0.1 inside the container means nobody can connect in).
+            # This is the only "config" difference on the server side; the code itself
+            # doesn't change.
             "python", "-m", "microsandbox.server",
             "--host", "0.0.0.0", "--port", str(_CONTAINER_PORT),
             "--backend", inner_backend, "--log-level", "WARNING",
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
-            self._container = None  # 没起成功就别在 close 里去删一个不存在的名字
-            raise RuntimeError(f"docker run 启动常驻容器失败：{proc.stderr.strip()}")
+            self._container = None  # if it didn't start, don't try to delete a nonexistent name in close
+            raise RuntimeError(f"docker run failed to start the resident container: {proc.stderr.strip()}")
 
     def _spawn_microvm(self) -> None:
-        """阶段 3：启动一台 Firecracker microVM，把 daemon 跑在里面，经 vsock 暴露。
+        """Stage 3: start a Firecracker microVM with the daemon running inside, exposed via vsock.
 
-        与上面的 _spawn_resident_container 同构（client 持有隔离环境的生命周期），区别
-        只在两点：① 隔离体从容器换成 microVM（独立 guest 内核 + KVM 边界，最强隔离）；
-        ② 控制通道从 TCP 端口映射换成 vsock。daemon（server.py）与 protocol 一行未改——
-        这正是阶段 3 最想证明的事：换隔离 = 换 client 创建逻辑 + 换传输，协议不动。
+        Isomorphic to _spawn_resident_container above (the client owns the isolation
+        environment's lifecycle), differing in only two points: (1) the isolation body
+        changes from a container to a microVM (independent guest kernel + KVM boundary, the
+        strongest isolation); (2) the control channel changes from TCP port mapping to
+        vsock. The daemon (server.py) and the protocol didn't change a single line -- this
+        is exactly what Stage 3 most wants to prove: switching isolation = switching the
+        client's creation logic + switching the transport, with the protocol untouched.
         """
         vendor = _vendor_dir()
         fc_bin, kernel, rootfs = (
@@ -454,18 +514,19 @@ class Sandbox:
 
         problem = self._check_microvm_available(fc_bin, kernel, rootfs)
         if problem:
-            raise RuntimeError(f"无法创建 microVM：{problem}")
+            raise RuntimeError(f"Failed to create microVM: {problem}")
 
-        # per-VM 工作目录：config、vsock UDS、api sock、console.log 都放这（close 时整个删）。
+        # per-VM working directory: config, vsock UDS, api sock, console.log all go here (the whole thing is deleted on close).
         self._workdir = pathlib.Path(tempfile.mkdtemp(prefix="microsandbox-vm-"))
         uds = self._workdir / "fc.vsock"
         self._console_log = self._workdir / "console.log"
 
-        # 一个 JSON 声明整台 VM（学习期用 --config-file 而非逐条 REST，便于一眼读懂）。
+        # A single JSON declares the entire VM (during the learning phase, use
+        # --config-file rather than per-item REST, for easy at-a-glance reading).
         config = {
             "boot-source": {
                 "kernel_image_path": str(kernel),
-                # root=/dev/vda 只读根；init=/init 我们的极简 init；MSBACKEND 选 VM 内执行后端。
+                # root=/dev/vda read-only root; init=/init our minimal init; MSBACKEND selects the in-VM execution backend.
                 "boot_args": (
                     "console=ttyS0 reboot=k panic=1 pci=off "
                     "root=/dev/vda ro init=/init MSBACKEND=kernel"
@@ -475,48 +536,50 @@ class Sandbox:
                 "drive_id": "rootfs",
                 "path_on_host": str(rootfs),
                 "is_root_device": True,
-                "is_read_only": True,   # 只读根，写都去 VM 内 tmpfs /tmp（对齐阶段 2）
+                "is_read_only": True,   # read-only root; all writes go to the in-VM tmpfs /tmp (aligned with Stage 2)
             }],
             "machine-config": {
                 "vcpu_count": _MICROVM_VCPUS, "mem_size_mib": _MICROVM_MEM_MIB},
-            # Firecracker 把 guest vsock 多路复用到这个 UDS；client 的 _VsockTransport 连它。
+            # Firecracker multiplexes the guest vsock onto this UDS; the client's _VsockTransport connects to it.
             "vsock": {"guest_cid": _MICROVM_GUEST_CID, "uds_path": str(uds)},
         }
         config_path = self._workdir / "config.json"
         config_path.write_text(json.dumps(config))
 
-        # firecracker 的 stdout/stderr（含 guest 串口 console）落到文件——不能用 PIPE：
-        # guest console 会持续写，PIPE 缓冲填满会卡死 VM。启动失败时读这个文件诊断。
+        # firecracker's stdout/stderr (including the guest serial console) lands in a file
+        # -- can't use PIPE: the guest console writes continuously, and a full PIPE buffer
+        # would stall the VM. Read this file to diagnose startup failures.
         with open(self._console_log, "wb") as log_fh:
             self._proc = subprocess.Popen(
                 [str(fc_bin), "--api-sock", str(self._workdir / "api.sock"),
                  "--config-file", str(config_path)],
                 stdout=log_fh, stderr=subprocess.STDOUT,
             )
-        # daemon 在 VM 内监听 vsock 1024；宿主经 uds 连进去。健康检查随后在 __init__ 触发，
-        # 走的就是这个 vsock 传输（_wait_until_healthy 已对传输无感知）。
+        # The daemon listens on vsock 1024 inside the VM; the host connects in via the uds.
+        # The health check fires next in __init__, going through exactly this vsock
+        # transport (_wait_until_healthy is already transport-agnostic).
         self._transport = _VsockTransport(str(uds), _MICROVM_VSOCK_PORT)
 
     @staticmethod
     def _check_microvm_available(
         fc_bin: pathlib.Path, kernel: pathlib.Path, rootfs: pathlib.Path
     ) -> str | None:
-        """启动前把环境问题暴露出来并给可操作指引（对照 DockerBackend.check_available）。"""
+        """Surface environment problems before startup with actionable guidance (cf. DockerBackend.check_available)."""
         if not fc_bin.exists():
-            return f"缺 firecracker 二进制（{fc_bin}），下载见 docs/STAGE3_DESIGN.md §6"
+            return f"Missing firecracker binary ({fc_bin}); see docs/STAGE3_DESIGN.md §6 for download"
         if not kernel.exists():
-            return f"缺内核 vmlinux（{kernel}），下载见 docs/STAGE3_DESIGN.md §6"
+            return f"Missing kernel vmlinux ({kernel}); see docs/STAGE3_DESIGN.md §6 for download"
         if not rootfs.exists():
-            return f"缺 rootfs（{rootfs}），请先运行 scripts/build-rootfs.sh"
+            return f"Missing rootfs ({rootfs}); please run scripts/build-rootfs.sh first"
         if not os.path.exists("/dev/kvm"):
-            return "/dev/kvm 不存在：本机未开启（嵌套）硬件虚拟化"
+            return "/dev/kvm does not exist: (nested) hardware virtualization is not enabled on this machine"
         if not os.access("/dev/kvm", os.R_OK | os.W_OK):
-            return ("无权访问 /dev/kvm：把当前用户加入 kvm 组"
-                    "（sudo usermod -aG kvm $USER）后重启 WSL")
+            return ("No permission to access /dev/kvm: add the current user to the kvm group"
+                    " (sudo usermod -aG kvm $USER) and restart WSL")
         return None
 
     def _microvm_log(self) -> str:
-        """取 microVM 的 firecracker/guest 串口日志尾巴，仅用于启动失败诊断。"""
+        """Grab the tail of the microVM's firecracker/guest serial log, only for startup-failure diagnostics."""
         if self._console_log is None:
             return ""
         try:
@@ -525,17 +588,22 @@ class Sandbox:
             return ""
 
     def _restore_microvm(self) -> None:
-        """阶段 3c：从预先生成的快照恢复一台 microVM——跳过内核引导与 Jupyter kernel
-        冷启动，做到毫秒级就绪（对照 _spawn_microvm 冷启动 ~0.94s，恢复就绪 ~30ms）。
+        """Stage 3c: restore a microVM from a pre-generated snapshot -- skipping kernel boot
+        and Jupyter kernel cold start, achieving millisecond-level readiness (cf.
+        _spawn_microvm cold start ~0.94s, restore-to-ready ~30ms).
 
-        机制：快照含两份产物——vmstate（设备/CPU 状态）+ memfile（guest 内存，已含一个热
-        kernel）。起一台空 firecracker，经 REST API `PUT /snapshot/load` + resume 把状态灌
-        回去，VM 即从冻结点继续跑，daemon 与 kernel 都已就绪。注意 rootfs.ext4 仍须在原
-        路径（快照只存内存/设备状态，磁盘内容仍由宿主那个 backing file 提供）。
+        Mechanism: a snapshot contains two artifacts -- vmstate (device/CPU state) +
+        memfile (guest memory, already containing a hot kernel). Start an empty
+        firecracker, pour the state back via the REST API `PUT /snapshot/load` + resume,
+        and the VM continues running from its frozen point, with both the daemon and kernel
+        already ready. Note rootfs.ext4 must still be at its original path (the snapshot
+        stores only memory/device state; disk contents are still provided by the host's
+        backing file).
 
-        已知限制（单实例）：快照里 vsock 的 uds 路径是固定的（vendor/snapshot/fc.vsock），
-        同一时刻只能恢复一台（多台会撞同一 socket 路径）。并发恢复 + 预热池要 per-VM 的
-        uds override，属于阶段 4。
+        Known limitation (single-instance): the vsock uds path in the snapshot is fixed
+        (vendor/snapshot/fc.vsock), so only one can be restored at a time (multiple would
+        collide on the same socket path). Concurrent restore + a pre-warm pool require a
+        per-VM uds override, which belongs to Stage 4.
         """
         vendor = _vendor_dir()
         snap = vendor / "snapshot"
@@ -544,14 +612,14 @@ class Sandbox:
         problem = self._check_microvm_available(
             vendor / "firecracker", vendor / "vmlinux", vendor / "rootfs.ext4")
         if problem:
-            raise RuntimeError(f"无法恢复 microVM：{problem}")
+            raise RuntimeError(f"Failed to restore microVM: {problem}")
         if not vmstate.exists() or not memfile.exists():
-            raise RuntimeError(f"缺快照（{snap}），请先运行 scripts/build-snapshot.sh")
+            raise RuntimeError(f"Missing snapshot ({snap}); please run scripts/build-snapshot.sh first")
 
         self._workdir = pathlib.Path(tempfile.mkdtemp(prefix="microsandbox-vm-"))
         self._console_log = self._workdir / "console.log"
         api_sock = self._workdir / "api.sock"
-        uds.unlink(missing_ok=True)  # 清掉上次留下的同名 socket，firecracker 会在该固定路径重新 listen
+        uds.unlink(missing_ok=True)  # clear out the same-named socket left from last time; firecracker will re-listen on this fixed path
 
         with open(self._console_log, "wb") as log_fh:
             self._proc = subprocess.Popen(
@@ -565,13 +633,14 @@ class Sandbox:
         })
         if status not in (200, 204):
             raise RuntimeError(
-                f"snapshot/load 失败：HTTP {status}；{self._microvm_log()[-300:]}")
+                f"snapshot/load failed: HTTP {status}; {self._microvm_log()[-300:]}")
         self._transport = _VsockTransport(str(uds), _MICROVM_VSOCK_PORT)
 
     def _ensure_transport(self) -> _Transport:
-        """懒构造传输层。默认 TCP（local/docker/container/kernel 都走它）；阶段 3b 的
-        microVM 会在 _spawn_microvm 里预装一个 _VsockTransport，这里便不再覆盖。放在
-        spawn 之后取值，才能拿到常驻容器随机映射到宿主的最终端口。"""
+        """Lazily construct the transport layer. Defaults to TCP (local/docker/container/
+        kernel all use it); Stage 3b's microVM pre-installs a _VsockTransport in
+        _spawn_microvm, so this won't override it. It's evaluated after spawn so it can
+        pick up the final port the resident container is randomly mapped to on the host."""
         if self._transport is None:
             self._transport = _TcpTransport(self.host, self.port)
         return self._transport
@@ -579,13 +648,15 @@ class Sandbox:
     def _wait_until_healthy(self, attempts: int = 50, delay: float = 0.1) -> None:
         transport = self._ensure_transport()
         for _ in range(attempts):
-            # daemon 进程已退出就别傻等满 5 秒了——立刻读出它的 stderr 作为报错。
-            # 例如 docker 后端在镜像缺失时，daemon 启动期检查会直接打印原因并退出。
+            # If the daemon process has already exited, don't dumbly wait the full 5
+            # seconds -- immediately read out its stderr as the error. For example, with the
+            # docker backend when the image is missing, the daemon's startup check directly
+            # prints the reason and exits.
             if self._proc is not None and self._proc.poll() is not None:
                 detail = ""
                 if self._proc.stderr is not None:
                     detail = self._proc.stderr.read().decode(errors="replace").strip()
-                detail = detail or self._microvm_log()  # microVM 的 firecracker 日志在文件里
+                detail = detail or self._microvm_log()  # the microVM's firecracker log is in a file
                 raise RuntimeError(
                     f"sandbox daemon exited at startup: {detail[-500:] or '(no stderr)'}"
                 )
@@ -595,8 +666,9 @@ class Sandbox:
                         return
             except Exception:
                 time.sleep(delay)
-        # 没在限定时间内就绪：常驻容器/microVM 把日志尾巴补进报错，便于排查（宿主 daemon
-        # 走上面 poll 分支提前抛出，到不了这里）。
+        # Not ready within the time limit: the resident container/microVM appends the log
+        # tail to the error for easier troubleshooting (the host daemon goes through the
+        # poll branch above and throws early, never reaching here).
         detail = self._container_logs() or self._microvm_log()
         raise RuntimeError(
             "sandbox daemon did not become healthy in time"
@@ -604,7 +676,7 @@ class Sandbox:
         )
 
     def _container_logs(self) -> str:
-        """取常驻容器的日志尾巴，仅用于启动失败时的报错。任何失败都返回空串。"""
+        """Grab the tail of the resident container's logs, only for errors on startup failure. Any failure returns an empty string."""
         if self._container is None:
             return ""
         try:
@@ -625,17 +697,20 @@ class Sandbox:
                 self._proc.kill()
             self._proc = None
         if self._container is not None:
-            # 杀死并删除整个常驻沙箱容器。对比阶段 1 的超时清理（杀的是一次性执行
-            # 容器），这里销毁的是沙箱本身。docker rm -f 一并 stop+rm；容器已不存在
-            # 等失败一律忽略（幂等兜底）。
+            # Kill and delete the entire resident sandbox container. Contrast with Stage
+            # 1's timeout cleanup (which kills the one-shot execution container); here we
+            # destroy the sandbox itself. docker rm -f does stop+rm together; failures such
+            # as the container already not existing are all ignored (idempotent
+            # safety-net).
             subprocess.run(
                 ["docker", "rm", "-f", self._container],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             self._container = None
         if self._workdir is not None:
-            # 上面 self._proc 已杀掉 firecracker 进程（= 销毁 VM）；这里清掉 per-VM 工作目录
-            # （config / vsock UDS / api sock / console.log 都在里面）。ignore_errors 幂等兜底。
+            # self._proc above has already killed the firecracker process (= destroyed the
+            # VM); here we clean up the per-VM working directory (config / vsock UDS / api
+            # sock / console.log are all inside). ignore_errors is an idempotent safety-net.
             shutil.rmtree(self._workdir, ignore_errors=True)
             self._workdir = None
 
@@ -645,7 +720,7 @@ class Sandbox:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
-    # ----- 核心 API -----
+    # ----- core API -----
 
     def run_code(
         self,
@@ -654,10 +729,11 @@ class Sandbox:
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
     ) -> Execution:
-        """执行一段代码，返回聚合后的 Execution 结果。
+        """Execute a piece of code, returning the aggregated Execution result.
 
-        可选传入 on_stdout / on_stderr 回调，实时拿到流式输出
-        （例如边跑边打印），同时最终仍返回完整 Execution。
+        Optionally pass on_stdout / on_stderr callbacks to get streaming output in real
+        time (e.g. print as it runs), while still ultimately returning the complete
+        Execution.
         """
         execution = Execution()
         for event in self._stream(code, language):
@@ -677,10 +753,12 @@ class Sandbox:
         return execution
 
     def _stream(self, code: str, language: str) -> Iterator[OutputEvent]:
-        """向守护进程发起执行请求，逐行解析 SSE 流。
+        """Issue an execution request to the daemon, parsing the SSE stream line by line.
 
-        请求怎么送到 daemon 由 transport 决定（TCP 或 vsock）；这里只负责把 /execute
-        的 SSE 响应逐行翻译回 OutputEvent——对两种传输完全一致（重构前内联在 urllib 上）。
+        How the request reaches the daemon is decided by the transport (TCP or vsock);
+        here we only translate /execute's SSE response back into OutputEvents line by line
+        -- completely identical across the two transports (before the refactor this was
+        inlined on urllib).
         """
         request = ExecuteRequest(
             code=code, language=language, timeout_seconds=self.timeout_seconds
@@ -701,13 +779,14 @@ class Sandbox:
                 yield OutputEvent.from_sse_payload(payload)
 
     def _post_json(self, path: str, payload: dict) -> dict:
-        """POST 一个 JSON 到 daemon 的非流式端点，返回解析后的 JSON dict。
+        """POST a JSON to a non-streaming endpoint of the daemon, returning the parsed JSON dict.
 
-        阶段 2c 的文件/命令端点都走它（区别于 run_code 的 SSE 流式）。
-        非 200 响应里的 {"error": ...} 会被抛成 RuntimeError。
+        Stage 2c's file/command endpoints all go through it (as opposed to run_code's SSE
+        streaming). A {"error": ...} in a non-200 response is raised as a RuntimeError.
 
-        非 2xx 在不同传输下表现不同（urllib 抛 HTTPError、vsock 是普通响应），归一化
-        交给 transport：这里只按 resp.status 判，对两种传输一致。
+        Non-2xx behaves differently across transports (urllib raises HTTPError, vsock is a
+        plain response); normalization is delegated to the transport: here we only judge
+        by resp.status, consistent across the two transports.
         """
         with self._ensure_transport().request(
             "POST",
@@ -721,19 +800,20 @@ class Sandbox:
                     message = json.loads(raw).get("error", raw)
                 except json.JSONDecodeError:
                     message = raw
-                raise RuntimeError(f"{path} 失败：{message}")
+                raise RuntimeError(f"{path} failed: {message}")
             return json.loads(raw)
 
 
-# ----- 阶段 2c：文件 / shell 命名空间（挂在 Sandbox 上，手感对齐 E2B）-----
+# ----- Stage 2c: file / shell namespaces (attached to Sandbox, with a feel aligned to E2B) -----
 
 
 class _Files:
-    """sandbox.files.*：在沙箱文件系统里读写/列目录（对齐 E2B 的 sandbox.files）。
+    """sandbox.files.*: read/write/list directories in the sandbox filesystem (aligned with E2B's sandbox.files).
 
-    由 daemon 直接在它所在的 FS 上完成：container/kernel 后端即容器内（沙箱里），
-    local 后端即宿主。注意常驻容器是 --read-only 根 + 仅 /tmp 可写——写 /tmp 之外
-    会抛 RuntimeError。
+    Done by the daemon directly on the FS it resides on: for the container/kernel backend
+    that's inside the container (in the sandbox), and for the local backend that's the
+    host. Note the resident container is a --read-only root + only /tmp writable --
+    writing outside /tmp raises a RuntimeError.
     """
 
     def __init__(self, sandbox: Sandbox) -> None:
@@ -746,21 +826,21 @@ class _Files:
         return self._sb._post_json("/files/read", {"path": path})["content"]
 
     def list(self, path: str) -> list[dict]:
-        """列目录，返回 [{"name": str, "is_dir": bool}, ...]。"""
+        """List a directory, returning [{"name": str, "is_dir": bool}, ...]."""
         return self._sb._post_json("/files/list", {"path": path})["entries"]
 
 
 class _Commands:
-    """sandbox.commands.*：在沙箱里跑 shell 命令（对齐 E2B 的 sandbox.commands）。"""
+    """sandbox.commands.*: run shell commands in the sandbox (aligned with E2B's sandbox.commands)."""
 
     def __init__(self, sandbox: Sandbox) -> None:
         self._sb = sandbox
 
     def run(self, command: str, timeout_seconds: float | None = None) -> Execution:
-        """跑一条 shell 命令，返回和 run_code 同样的 Execution（stdout/stderr/exit_code）。"""
+        """Run a shell command, returning the same Execution as run_code (stdout/stderr/exit_code)."""
         payload = {
             "command": command,
-            # 用 is None 判断而非 `or`：后者会把显式传入的 0 也当成「没传」而回退默认值。
+            # Use `is None` rather than `or`: the latter would treat an explicitly passed 0 as "not passed" and fall back to the default.
             "timeout_seconds": (
                 timeout_seconds
                 if timeout_seconds is not None
