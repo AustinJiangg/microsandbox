@@ -74,6 +74,39 @@ def _vendor_dir() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[2] / "vendor"
 
 
+def _firecracker_api(
+    sock_path: str, method: str, path: str, body: dict, timeout: float = 15.0
+) -> int:
+    """对 Firecracker 的 REST API（HTTP over AF_UNIX）发一个请求，返回状态码。
+
+    快照 load/create 这类操作 --config-file 表达不了，只能走 API。api.sock 可能还没被
+    firecracker 创建出来，所以连不上时轮询重试到 timeout。只读状态行（不关心 body）。
+    """
+    payload = json.dumps(body).encode()
+    head = (
+        f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode()
+    deadline = time.time() + timeout
+    while True:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        try:
+            sock.connect(sock_path)
+        except OSError:
+            sock.close()
+            if time.time() > deadline:
+                raise
+            time.sleep(0.005)
+            continue
+        try:
+            sock.sendall(head + payload)
+            return int(sock.makefile("rb").readline().split(b" ")[1])
+        finally:
+            sock.close()
+
+
 def _find_free_port() -> int:
     """绑到 :0 让内核分配一个空闲端口，立刻释放，把端口号交给 docker -p 用。
 
@@ -261,6 +294,9 @@ class Sandbox:
                  - "microvm"（阶段 3）：把 daemon 跑进一台 Firecracker microVM（独立 guest
                    内核 + KVM 边界，最强隔离），控制通道走 vsock，VM 内用 kernel 后端（有
                    状态）。需先备好 vendor/ 素材：见 docs/STAGE3_DESIGN.md §6/§7。
+        from_snapshot：仅对 backend="microvm" 有效。True 则从预热快照毫秒级恢复（跳过内核
+                   引导 + Jupyter kernel 冷启动，~30ms 就绪 vs 冷启动 ~0.94s）。需先
+                   scripts/build-snapshot.sh；当前单实例（快照 vsock uds 路径固定，见 §9）。
     """
 
     def __init__(
@@ -270,11 +306,13 @@ class Sandbox:
         spawn_local: bool = True,
         timeout_seconds: float = 30.0,
         backend: str = "local",
+        from_snapshot: bool = False,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout_seconds = timeout_seconds
         self.backend = backend
+        self._from_snapshot = from_snapshot
         self._proc: subprocess.Popen | None = None   # 宿主 daemon 子进程（阶段 0/1）
         self._container: str | None = None           # 常驻沙箱容器名（阶段 2）
         # 传输层（阶段 3 抽象）：默认懒构造成 TCP；microVM 会在 _spawn_microvm 里
@@ -298,7 +336,9 @@ class Sandbox:
             # 语句还没进 __enter__，__exit__ 永远不会触发，已起的容器就成了没人收的
             # 残留。所以这里自己 close 掉再把异常抛上去（close 幂等，安全）。
             try:
-                if backend == "microvm":
+                if backend == "microvm" and from_snapshot:
+                    self._restore_microvm()
+                elif backend == "microvm":
                     self._spawn_microvm()
                 elif backend in _RESIDENT_BACKENDS:
                     self._spawn_resident_container()
@@ -483,6 +523,50 @@ class Sandbox:
             return self._console_log.read_text(errors="replace")[-1500:].strip()
         except OSError:
             return ""
+
+    def _restore_microvm(self) -> None:
+        """阶段 3c：从预先生成的快照恢复一台 microVM——跳过内核引导与 Jupyter kernel
+        冷启动，做到毫秒级就绪（对照 _spawn_microvm 冷启动 ~0.94s，恢复就绪 ~30ms）。
+
+        机制：快照含两份产物——vmstate（设备/CPU 状态）+ memfile（guest 内存，已含一个热
+        kernel）。起一台空 firecracker，经 REST API `PUT /snapshot/load` + resume 把状态灌
+        回去，VM 即从冻结点继续跑，daemon 与 kernel 都已就绪。注意 rootfs.ext4 仍须在原
+        路径（快照只存内存/设备状态，磁盘内容仍由宿主那个 backing file 提供）。
+
+        已知限制（单实例）：快照里 vsock 的 uds 路径是固定的（vendor/snapshot/fc.vsock），
+        同一时刻只能恢复一台（多台会撞同一 socket 路径）。并发恢复 + 预热池要 per-VM 的
+        uds override，属于阶段 4。
+        """
+        vendor = _vendor_dir()
+        snap = vendor / "snapshot"
+        vmstate, memfile, uds = snap / "vmstate", snap / "memfile", snap / "fc.vsock"
+
+        problem = self._check_microvm_available(
+            vendor / "firecracker", vendor / "vmlinux", vendor / "rootfs.ext4")
+        if problem:
+            raise RuntimeError(f"无法恢复 microVM：{problem}")
+        if not vmstate.exists() or not memfile.exists():
+            raise RuntimeError(f"缺快照（{snap}），请先运行 scripts/build-snapshot.sh")
+
+        self._workdir = pathlib.Path(tempfile.mkdtemp(prefix="microsandbox-vm-"))
+        self._console_log = self._workdir / "console.log"
+        api_sock = self._workdir / "api.sock"
+        uds.unlink(missing_ok=True)  # 清掉上次留下的同名 socket，firecracker 会在该固定路径重新 listen
+
+        with open(self._console_log, "wb") as log_fh:
+            self._proc = subprocess.Popen(
+                [str(vendor / "firecracker"), "--api-sock", str(api_sock)],
+                stdout=log_fh, stderr=subprocess.STDOUT,
+            )
+        status = _firecracker_api(str(api_sock), "PUT", "/snapshot/load", {
+            "snapshot_path": str(vmstate),
+            "mem_backend": {"backend_type": "File", "backend_path": str(memfile)},
+            "resume_vm": True,
+        })
+        if status not in (200, 204):
+            raise RuntimeError(
+                f"snapshot/load 失败：HTTP {status}；{self._microvm_log()[-300:]}")
+        self._transport = _VsockTransport(str(uds), _MICROVM_VSOCK_PORT)
 
     def _ensure_transport(self) -> _Transport:
         """懒构造传输层。默认 TCP（local/docker/container/kernel 都走它）；阶段 3b 的

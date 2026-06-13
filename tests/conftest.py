@@ -168,3 +168,34 @@ def microvm_sandbox():
     sb = Sandbox(backend="microvm")
     yield sb
     sb.close()
+
+
+@functools.lru_cache(maxsize=1)
+def ensure_snapshot() -> None:
+    """快照不在就现 build（boot VM + 预热 kernel + snapshot，~10s，产出 512MB memfile）。
+    让快照用例在备好素材的机器上开箱即用；正常用时由开发者预先 build-snapshot.sh。"""
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    snap = repo_root / "vendor" / "snapshot"
+    if (snap / "vmstate").exists() and (snap / "memfile").exists():
+        return
+    ensure_rootfs()  # 快照基于 rootfs，先确保它在
+    subprocess.run([str(repo_root / "scripts" / "build-snapshot.sh")], check=True)
+
+
+@pytest.fixture
+def snapshot_ready():
+    """只确保快照就绪（不可用则 skip），不替你构造 Sandbox——给要自己掐表的用例。"""
+    if not firecracker_available():
+        pytest.skip("firecracker/内核/kvm 不全，跳过快照用例")
+    ensure_snapshot()
+
+
+@pytest.fixture
+def snapshot_sandbox():
+    """阶段 3c 专用：从快照毫秒级恢复的 microVM 沙箱（VM 内 kernel 已热）。"""
+    if not firecracker_available():
+        pytest.skip("firecracker/内核/kvm 不全，跳过快照用例")
+    ensure_snapshot()
+    sb = Sandbox(backend="microvm", from_snapshot=True)
+    yield sb
+    sb.close()

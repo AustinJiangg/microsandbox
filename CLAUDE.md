@@ -30,9 +30,9 @@
 - [x] **阶段 2**：容器内常驻 agent + 有状态 REPL（对齐 E2B 的 envd）
       （见 `docs/STAGE2_DESIGN.md`；2a daemon 搬进常驻容器、2b 常驻 Jupyter kernel
       有状态 REPL、2c 文件/shell API —— 全部完成）
-- [~] **阶段 3**：Firecracker microVM 后端 ← **当前在这里**（3a vsock 传输抽象 + 3b microVM
-      经 vsock 端到端跑通，冷启动 ~0.94s；3c 收尾——快照/预热池为拉伸项。见 `docs/STAGE3_DESIGN.md`）
-- [ ] **阶段 4**：产品化外围（沙箱池、模板、鉴权等）
+- [x] **阶段 3**：Firecracker microVM 后端（3a vsock 传输抽象、3b microVM 经 vsock 端到端、
+      3c 资源限制 + 快照恢复毫秒级冷启动；预热池归阶段 4。见 `docs/STAGE3_DESIGN.md`）
+- [ ] **阶段 4**：产品化外围（沙箱池、模板、鉴权等）← **当前在这里**（下一步）
 
 ## 开发约定
 
