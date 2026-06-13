@@ -24,7 +24,6 @@ import json
 import logging
 import pathlib
 import socket
-from collections.abc import AsyncIterator
 
 from .backend import (
     DockerBackend,
@@ -34,9 +33,7 @@ from .backend import (
 )
 from .protocol import (
     CommandRequest,
-    EventType,
     ExecuteRequest,
-    OutputEvent,
     PathRequest,
     WriteFileRequest,
 )

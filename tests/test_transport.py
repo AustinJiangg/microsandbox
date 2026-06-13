@@ -130,7 +130,7 @@ def test_vsock_sse_streaming(tmp_path) -> None:
             lines.append(raw.decode().rstrip("\n"))
     t.join(timeout=5)
 
-    payloads = [l[len("data: "):] for l in lines if l.startswith("data: ")]
+    payloads = [line[len("data: "):] for line in lines if line.startswith("data: ")]
     events = [json.loads(p) for p in payloads]
     assert {"type": "stdout", "data": "hello\n"} in events
     assert {"type": "end", "exit_code": 0} in events
