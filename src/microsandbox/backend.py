@@ -360,7 +360,7 @@ class JupyterKernelBackend(ExecutionBackend):
         # kernel backend. This way, when running the local/docker/container
         # backends on the host, importing backend.py doesn't require jupyter.
         try:
-            from jupyter_client.manager import AsyncKernelManager
+            from jupyter_client.manager import AsyncKernelManager  # pyright: ignore[reportMissingImports]
         except ImportError as exc:  # pragma: no cover - only triggers in environments missing the dependency
             raise RuntimeError(
                 "the kernel backend requires ipykernel + jupyter_client. Use the agent image"
