@@ -104,3 +104,66 @@ class Execution:
             f"Execution(status={status}, exit_code={self.exit_code}, "
             f"stdout={self.stdout!r}, stderr={self.stderr!r}, error={self.error!r})"
         )
+
+
+# ---- 阶段 2c：文件 / shell API（向后兼容新增；上面 /execute 的三个类型一律不动）----
+#
+# 设计要点：这些操作由 daemon **直接在自己所在的文件系统上**完成，不经过
+# ExecutionBackend——对 container/kernel 后端就是容器内（= 沙箱里），对 local 后端
+# 就是宿主。这对齐 E2B 的 envd：文件服务、进程服务与「跑代码的 kernel」是分开的
+# 三套东西，而不是都塞进代码执行通道。
+#
+# 端点与响应形状（响应沿用项目既有的「简单 JSON dict」风格，不再为每个都造 dataclass）：
+#   POST /files/read   <- {"path"}                       -> {"content": str}
+#   POST /files/write  <- {"path","content"}             -> {"ok": true}
+#   POST /files/list   <- {"path"}                       -> {"entries":[{"name":str,"is_dir":bool},...]}
+#   POST /commands     <- {"command","timeout_seconds"}  -> {"stdout":str,"stderr":str,"exit_code":int}
+# 出错统一返回 {"error": str} + 非 200 状态码，client 收到后抛 RuntimeError。
+#
+# 注意（与隔离设计一致）：常驻容器是 --read-only 根 + 仅 /tmp 可写，所以 files.write
+# 只能写到 /tmp，写别处会得到 OSError。
+
+
+@dataclass
+class WriteFileRequest:
+    path: str
+    content: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, raw: str) -> "WriteFileRequest":
+        data = json.loads(raw)
+        return cls(path=data["path"], content=data.get("content", ""))
+
+
+@dataclass
+class PathRequest:
+    """read / list 共用：只需要一个路径。"""
+
+    path: str
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, raw: str) -> "PathRequest":
+        return cls(path=json.loads(raw)["path"])
+
+
+@dataclass
+class CommandRequest:
+    command: str
+    timeout_seconds: float = 30.0
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, raw: str) -> "CommandRequest":
+        data = json.loads(raw)
+        return cls(
+            command=data["command"],
+            timeout_seconds=float(data.get("timeout_seconds", 30.0)),
+        )

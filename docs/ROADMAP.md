@@ -44,7 +44,7 @@
 
 ---
 
-## 🚧 阶段 2：容器内常驻 agent + 有状态 REPL（进行中 ← 当前在这里）
+## ✅ 阶段 2：容器内常驻 agent + 有状态 REPL（已完成）
 
 **学习目标**：对齐 E2B 核心架构 —— 沙箱内常驻一个 agent（envd），支持跨调用保留状态。
 
@@ -67,9 +67,13 @@
      backend 内懒导入）；新增 `Dockerfile` 构建 agent 镜像；`client` 新增 `backend="kernel"`。
    - 超时用 **interrupt（SIGINT）而非杀进程**：打断当前 cell 但 kernel 与命名空间存活。
    - 验收达成：变量/函数/import 跨 `run_code` 留存；超时后 kernel 不死、旧变量仍可用。
-- [ ] **2c 文件 / shell API** ← 当前在这里 —— `protocol.py` **向后兼容新增** `/files/*`、`/commands`
-   （`/execute` 与既有 dataclass 不动）；client 加 `sandbox.files.*` / `sandbox.commands.*`，
-   对齐 E2B 手感。验收：文件读写往返成功；`commands.run` 拿到 shell 输出。
+- [x] **2c 文件 / shell API** —— `protocol.py` **向后兼容新增** `/files/{read,write,list}`、
+   `/commands`（`/execute` 与既有 dataclass 不动）；client 加 `sandbox.files.*` /
+   `sandbox.commands.*`，对齐 E2B 手感。
+   - 关键设计：文件/命令由 **daemon 直接在自身 FS 上完成、不经 ExecutionBackend**——
+     对齐 E2B envd（文件/进程服务与跑代码的 kernel 是分开的）。
+   - 验收达成：写读往返、文件对 `run_code` 可见、列目录、`commands.run` 拿到 shell 输出
+     （含非零退出码）。常驻容器 `--read-only` 根，写仅限 `/tmp`，写别处如实报错。
 
 **注意（网络/安全弱化）**：阶段 2 容器要开管理端口给 client，故**不能再 `--network none`**，
 容器内代码的对外网络随之放开——这一点**隔离反而弱于阶段 1**。强隔离仍要等阶段 3。
@@ -78,7 +82,7 @@
 
 ---
 
-## ⬜ 阶段 3：Firecracker microVM 隔离
+## ⬜ 阶段 3：Firecracker microVM 隔离 ← 当前在这里（下一步）
 
 **学习目标**：理解强隔离原理、microVM、vsock 通信、快照实现毫秒级冷启动。**本阶段慢下来手动理解，别全靠 vibe。**
 

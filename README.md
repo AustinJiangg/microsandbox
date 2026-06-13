@@ -3,7 +3,8 @@
 一个**从零实现、逐步逼近 [E2B](https://github.com/e2b-dev/E2B) 的学习用代码沙箱**。
 
 目标不是做产品，而是搞懂「AI 代码沙箱到底是怎么实现的」。项目分阶段演进，
-从最简单的本机子进程，一路做到 Firecracker microVM。当前在 **阶段 2**（容器内常驻 agent）。
+从最简单的本机子进程，一路做到 Firecracker microVM。**阶段 2（容器内常驻 agent +
+有状态 REPL + 文件/shell API）已完成**，下一步阶段 3（microVM）。
 
 ## 快速开始
 
@@ -39,6 +40,12 @@ with Sandbox(backend="docker") as sandbox:
 with Sandbox(backend="kernel") as sandbox:
     sandbox.run_code("x = 41")
     print(sandbox.run_code("print(x + 1)").stdout)   # 42 —— 第二次能用第一次的变量
+
+# 阶段 2c：文件 / shell API（手感对齐 E2B 的 sandbox.files / sandbox.commands）
+with Sandbox(backend="container") as sandbox:
+    sandbox.files.write("/tmp/data.txt", "42")        # 常驻容器仅 /tmp 可写
+    print(sandbox.files.read("/tmp/data.txt"))        # 42
+    print(sandbox.commands.run("ls /tmp").stdout)     # data.txt
 ```
 
 ## 项目结构
@@ -66,8 +73,8 @@ microsandbox/
 |------|----------|------|
 | 0 | 本机子进程 | ✅ |
 | 1 | Docker 容器 | ✅ |
-| 2 | 容器内常驻 agent + 有状态 REPL | 🚧 当前（2a/2b 完成，2c 进行中） |
-| 3 | Firecracker microVM | ⬜ |
+| 2 | 容器内常驻 agent + 有状态 REPL + 文件/shell API | ✅ |
+| 3 | Firecracker microVM | ⬜ 下一步 |
 | 4 | 产品化外围（池化/模板/鉴权） | ⬜ |
 
 详见 `docs/ROADMAP.md`。

@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Iterator
@@ -99,6 +100,11 @@ class Sandbox:
         self.backend = backend
         self._proc: subprocess.Popen | None = None   # 宿主 daemon 子进程（阶段 0/1）
         self._container: str | None = None           # 常驻沙箱容器名（阶段 2）
+
+        # 阶段 2c：文件 / shell 两个命名空间，手感对齐 E2B 的 sandbox.files / sandbox.commands。
+        # 它们只在被调用时才用到 host/port，所以这里先建好即可（顺序无所谓）。
+        self.files = _Files(self)
+        self.commands = _Commands(self)
 
         if spawn_local:
             # 阶段 2 的「反转」就体现在这个分叉：常驻容器后端由 client 亲手
@@ -324,3 +330,76 @@ class Sandbox:
                 if not payload:
                     continue
                 yield OutputEvent.from_sse_payload(payload)
+
+    def _post_json(self, path: str, payload: dict) -> dict:
+        """POST 一个 JSON 到 daemon 的非流式端点，返回解析后的 JSON dict。
+
+        阶段 2c 的文件/命令端点都走它（区别于 run_code 的 SSE 流式）。
+        非 200 响应里的 {"error": ...} 会被抛成 RuntimeError。
+        """
+        req = urllib.request.Request(
+            f"http://{self.host}:{self.port}{path}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with _DIRECT_OPENER.open(req) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            try:
+                message = json.loads(detail).get("error", detail)
+            except json.JSONDecodeError:
+                message = detail
+            raise RuntimeError(f"{path} 失败：{message}") from exc
+
+
+# ----- 阶段 2c：文件 / shell 命名空间（挂在 Sandbox 上，手感对齐 E2B）-----
+
+
+class _Files:
+    """sandbox.files.*：在沙箱文件系统里读写/列目录（对齐 E2B 的 sandbox.files）。
+
+    由 daemon 直接在它所在的 FS 上完成：container/kernel 后端即容器内（沙箱里），
+    local 后端即宿主。注意常驻容器是 --read-only 根 + 仅 /tmp 可写——写 /tmp 之外
+    会抛 RuntimeError。
+    """
+
+    def __init__(self, sandbox: Sandbox) -> None:
+        self._sb = sandbox
+
+    def write(self, path: str, content: str) -> None:
+        self._sb._post_json("/files/write", {"path": path, "content": content})
+
+    def read(self, path: str) -> str:
+        return self._sb._post_json("/files/read", {"path": path})["content"]
+
+    def list(self, path: str) -> list[dict]:
+        """列目录，返回 [{"name": str, "is_dir": bool}, ...]。"""
+        return self._sb._post_json("/files/list", {"path": path})["entries"]
+
+
+class _Commands:
+    """sandbox.commands.*：在沙箱里跑 shell 命令（对齐 E2B 的 sandbox.commands）。"""
+
+    def __init__(self, sandbox: Sandbox) -> None:
+        self._sb = sandbox
+
+    def run(self, command: str, timeout_seconds: float | None = None) -> Execution:
+        """跑一条 shell 命令，返回和 run_code 同样的 Execution（stdout/stderr/exit_code）。"""
+        payload = {
+            "command": command,
+            # 用 is None 判断而非 `or`：后者会把显式传入的 0 也当成「没传」而回退默认值。
+            "timeout_seconds": (
+                timeout_seconds
+                if timeout_seconds is not None
+                else self._sb.timeout_seconds
+            ),
+        }
+        data = self._sb._post_json("/commands", payload)
+        return Execution(
+            stdout=data["stdout"],
+            stderr=data["stderr"],
+            exit_code=data["exit_code"],
+        )

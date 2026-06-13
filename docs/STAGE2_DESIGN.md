@@ -193,5 +193,8 @@
 
 - [x] 2a：`backend="container"` 跑通；端到端用例三拓扑参数化全绿（7×3）。
 - [x] 2b：连续两次 `run_code`，第二次能用第一次定义的变量（超时 interrupt 后 kernel 存活、旧变量仍可用）。
-- [ ] 2c：文件读写往返成功；`commands.run` 拿到 shell 输出。
-- [x] 全程 `pytest` 全绿；文档如实写明阶段 2 的网络/安全弱化点（2a/2b 阶段）。
+- [x] 2c：文件读写往返成功、文件对 `run_code` 可见、列目录、`commands.run` 拿到 shell 输出（含非零退出码）。
+- [x] 全程 `pytest` 全绿（41 项）；文档如实写明阶段 2 的网络/安全弱化点与「仅 /tmp 可写」约束。
+
+**阶段 2 已整体完成。** 文件/命令采用 daemon 级实现（不经 ExecutionBackend），对齐 E2B
+envd 把文件/进程服务与代码 kernel 分开的设计；下一步进入阶段 3（Firecracker microVM）。

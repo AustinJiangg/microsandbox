@@ -27,10 +27,10 @@
 
 - [x] **阶段 0**：本机子进程后端，跑通 client/protocol/daemon 骨架
 - [x] **阶段 1**：Docker 容器后端（真正的隔离起点）
-- [ ] **阶段 2**：容器内常驻 agent + 有状态 REPL（对齐 E2B 的 envd）← **当前在这里**
-      （见 `docs/STAGE2_DESIGN.md`；2a daemon 搬进常驻容器 ✅、2b 常驻 Jupyter kernel
-      有状态 REPL ✅ 已完成；**当前在 2c：文件 / shell API**）
-- [ ] **阶段 3**：Firecracker microVM 后端
+- [x] **阶段 2**：容器内常驻 agent + 有状态 REPL（对齐 E2B 的 envd）
+      （见 `docs/STAGE2_DESIGN.md`；2a daemon 搬进常驻容器、2b 常驻 Jupyter kernel
+      有状态 REPL、2c 文件/shell API —— 全部完成）
+- [ ] **阶段 3**：Firecracker microVM 后端 ← **当前在这里**（下一步）
 - [ ] **阶段 4**：产品化外围（沙箱池、模板、鉴权等）
 
 ## 开发约定

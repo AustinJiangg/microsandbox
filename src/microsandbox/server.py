@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import json
 import logging
+import pathlib
 from collections.abc import AsyncIterator
 
 from .backend import (
@@ -26,16 +27,30 @@ from .backend import (
     JupyterKernelBackend,
     LocalSubprocessBackend,
 )
-from .protocol import EventType, ExecuteRequest, OutputEvent
+from .protocol import (
+    CommandRequest,
+    EventType,
+    ExecuteRequest,
+    OutputEvent,
+    PathRequest,
+    WriteFileRequest,
+)
 
 logger = logging.getLogger("microsandbox.server")
 
 
 class SandboxServer:
-    """最小 HTTP 守护进程，基于 asyncio，只暴露两个端点：
+    """最小 HTTP 守护进程，基于 asyncio。端点：
 
         GET  /health        健康检查（阶段 2+ 用来探测沙箱是否就绪）
         POST /execute       执行代码，SSE 流式返回 OutputEvent
+        POST /files/read    读文件        （阶段 2c）
+        POST /files/write   写文件        （阶段 2c）
+        POST /files/list    列目录        （阶段 2c）
+        POST /commands      跑 shell 命令  （阶段 2c）
+
+    阶段 2c 的文件/命令端点由 daemon 直接在自身文件系统上完成（不经 backend）——
+    对齐 E2B envd：文件/进程服务与跑代码的 kernel 是分开的。
     """
 
     def __init__(self, backend: ExecutionBackend | None = None) -> None:
@@ -64,11 +79,25 @@ class SandboxServer:
                 await self._write_json(writer, 200, {"status": "ok"})
                 return
 
-            if method == "POST" and path == "/execute":
+            if method == "POST":
+                # 所有 POST 端点都带 JSON body，统一读一次再按 path 分发。
                 length = int(headers.get("content-length", "0"))
-                body = await reader.readexactly(length) if length else b"{}"
-                await self._handle_execute(writer, body.decode())
-                return
+                body = (await reader.readexactly(length) if length else b"{}").decode()
+                if path == "/execute":
+                    await self._handle_execute(writer, body)
+                    return
+                if path == "/files/read":
+                    await self._handle_file_read(writer, body)
+                    return
+                if path == "/files/write":
+                    await self._handle_file_write(writer, body)
+                    return
+                if path == "/files/list":
+                    await self._handle_file_list(writer, body)
+                    return
+                if path == "/commands":
+                    await self._handle_command(writer, body)
+                    return
 
             await self._write_json(writer, 404, {"error": "not found"})
         except Exception as exc:  # noqa: BLE001 - 守护进程不应因单个请求崩溃
@@ -103,6 +132,101 @@ class SandboxServer:
         async for event in self.backend.execute(request):
             writer.write(event.to_sse().encode())
             await writer.drain()
+
+    # ----- 阶段 2c：文件 / shell 端点 -----
+    # 都由 daemon 直接在自身所在的文件系统/环境里完成（不经 ExecutionBackend）——
+    # 对 container/kernel 后端就是容器内（沙箱里），对 local 后端就是宿主。
+    #
+    # 路径限制：这里**有意不做**任何路径白名单/校验。container/kernel 后端下 daemon
+    # 只能看到容器自己的文件，「容器边界」就是天然的 confinement，再加人为限制反而会
+    # 挡掉合法读取（如 /etc/os-release）。唯一不安全的是 local 后端（能碰宿主任意文件）
+    # ——这与 local 一贯「无隔离、严禁对外」的定位一致，不是这里的新问题。
+
+    async def _handle_file_read(
+        self, writer: asyncio.StreamWriter, raw_body: str
+    ) -> None:
+        try:
+            req = PathRequest.from_json(raw_body)
+        except (json.JSONDecodeError, KeyError) as exc:
+            await self._write_json(writer, 400, {"error": f"bad request: {exc}"})
+            return
+        try:
+            # 小文件直接读，阻塞极短。大文件/高并发再考虑 run_in_executor（阶段 4）。
+            content = pathlib.Path(req.path).read_text()
+        except OSError as exc:
+            await self._write_json(writer, 404, {"error": str(exc)})
+            return
+        await self._write_json(writer, 200, {"content": content})
+
+    async def _handle_file_write(
+        self, writer: asyncio.StreamWriter, raw_body: str
+    ) -> None:
+        try:
+            req = WriteFileRequest.from_json(raw_body)
+        except (json.JSONDecodeError, KeyError) as exc:
+            await self._write_json(writer, 400, {"error": f"bad request: {exc}"})
+            return
+        try:
+            p = pathlib.Path(req.path)
+            p.parent.mkdir(parents=True, exist_ok=True)  # 顺手建中间目录（如写 /tmp/a/b.txt）
+            p.write_text(req.content)
+        except OSError as exc:
+            # 常见：常驻容器 --read-only 根，写 /tmp 之外会到这里。如实回吐原因。
+            await self._write_json(writer, 400, {"error": str(exc)})
+            return
+        await self._write_json(writer, 200, {"ok": True})
+
+    async def _handle_file_list(
+        self, writer: asyncio.StreamWriter, raw_body: str
+    ) -> None:
+        try:
+            req = PathRequest.from_json(raw_body)
+        except (json.JSONDecodeError, KeyError) as exc:
+            await self._write_json(writer, 400, {"error": f"bad request: {exc}"})
+            return
+        try:
+            entries = [
+                {"name": e.name, "is_dir": e.is_dir()}
+                for e in sorted(pathlib.Path(req.path).iterdir())
+            ]
+        except OSError as exc:
+            await self._write_json(writer, 404, {"error": str(exc)})
+            return
+        await self._write_json(writer, 200, {"entries": entries})
+
+    async def _handle_command(
+        self, writer: asyncio.StreamWriter, raw_body: str
+    ) -> None:
+        try:
+            req = CommandRequest.from_json(raw_body)
+        except (json.JSONDecodeError, KeyError) as exc:
+            await self._write_json(writer, 400, {"error": f"bad request: {exc}"})
+            return
+        # 在 daemon 所在环境跑 shell（container/kernel 后端 = 容器内 = 沙箱里）。
+        # 非流式：跑完一次性把 stdout/stderr/exit_code 收回去（流式可作为后续扩展）。
+        proc = await asyncio.create_subprocess_shell(
+            req.command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(), timeout=req.timeout_seconds
+            )
+            payload = {
+                "stdout": out.decode(errors="replace"),
+                "stderr": err.decode(errors="replace"),
+                "exit_code": proc.returncode,
+            }
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            payload = {
+                "stdout": "",
+                "stderr": f"command timed out after {req.timeout_seconds}s",
+                "exit_code": -1,
+            }
+        await self._write_json(writer, 200, payload)
 
     async def _write_json(
         self, writer: asyncio.StreamWriter, status: int, payload: dict
