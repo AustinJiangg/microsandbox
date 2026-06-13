@@ -19,10 +19,13 @@ SDK 会很有亲切感。典型用法：
 from __future__ import annotations
 
 import json
+import pathlib
+import socket
 import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -36,6 +39,30 @@ from .protocol import EventType, Execution, ExecuteRequest, OutputEvent
 # 这里显式构造「无代理」opener，client 的所有请求都走它。
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+# ---- 阶段 2：常驻容器拓扑 ----
+# 这些 backend 取值代表「主从关系反转」：daemon 不再跑在宿主，而是被 client
+# docker run -d 进一个长期存活的容器里常驻（对应 E2B 的 envd）。
+_RESIDENT_BACKENDS = {"container"}          # 2b 会加入 "kernel"（有状态 REPL）
+# client 的 backend 取值 → 容器内 daemon 实际用哪个 --backend 启动。
+# 2a 容器内仍是无状态子进程后端；2b 时 "kernel" -> "kernel"。
+_INNER_BACKEND = {"container": "local"}
+# 容器内 daemon 固定监听这个端口；宿主侧映射到一个随机空闲端口（见 _find_free_port），
+# 这样多个沙箱、以及宿主上可能已存在的 daemon 都不会撞端口。
+_CONTAINER_PORT = 49152
+# 容器内挂载源码的位置（2a 不建镜像，把宿主 src/ 只读挂进来即可跑我们的包）。
+_CONTAINER_SRC = "/opt/microsandbox/src"
+
+
+def _find_free_port() -> int:
+    """绑到 :0 让内核分配一个空闲端口，立刻释放，把端口号交给 docker -p 用。
+
+    释放到 docker 真正绑定之间有极小的竞态窗口；阶段 2a 够用，
+    更稳的端口/沙箱池管理是阶段 4 的事。
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
 
 class Sandbox:
     """一个沙箱会话的客户端句柄。
@@ -45,8 +72,12 @@ class Sandbox:
         spawn_local：便利开关。若为 True，构造时自动在本机拉起一个守护进程
                      子进程并连上它，退出时自动关闭 —— 让你一行代码就能跑起来，
                      不用先手动开 server。阶段 2+ 会用真正的「创建沙箱」逻辑替换它。
-        backend：执行后端。"local"=本机子进程（无隔离），"docker"=一次性容器
-                 （阶段 1 的隔离）。它只是起 daemon 时带的开关，不进 wire protocol。
+        backend：执行/部署策略，不进 wire protocol。
+                 - "local"（阶段 0）：宿主子进程，几乎无隔离。
+                 - "docker"（阶段 1）：宿主 daemon，每次执行起一个一次性容器。
+                 - "container"（阶段 2a）：daemon 搬进一个**常驻容器**里跑（envd 化），
+                   client 负责 docker run 起它、退出时 docker rm -f。容器内暂用无状态
+                   子进程后端；有状态 REPL（"kernel"）是阶段 2b。
     """
 
     def __init__(
@@ -61,11 +92,27 @@ class Sandbox:
         self.port = port
         self.timeout_seconds = timeout_seconds
         self.backend = backend
-        self._proc: subprocess.Popen | None = None
+        self._proc: subprocess.Popen | None = None   # 宿主 daemon 子进程（阶段 0/1）
+        self._container: str | None = None           # 常驻沙箱容器名（阶段 2）
 
         if spawn_local:
-            self._spawn_daemon()
-            self._wait_until_healthy()
+            # 阶段 2 的「反转」就体现在这个分叉：常驻容器后端由 client 亲手
+            # docker run 起一个容器把 daemon 装进去；其余后端沿用阶段 0/1 的
+            # 宿主子进程。两条路都连同一个 daemon、说同一套协议。
+            #
+            # 兜底：_spawn_* 成功后容器/子进程就已经起来了，若紧接着的健康检查
+            # 失败（daemon 起不来/起太慢），异常会从 __init__ 穿出去——此时 with
+            # 语句还没进 __enter__，__exit__ 永远不会触发，已起的容器就成了没人收的
+            # 残留。所以这里自己 close 掉再把异常抛上去（close 幂等，安全）。
+            try:
+                if backend in _RESIDENT_BACKENDS:
+                    self._spawn_resident_container()
+                else:
+                    self._spawn_daemon()
+                self._wait_until_healthy()
+            except Exception:
+                self.close()
+                raise
 
     # ----- 生命周期 -----
 
@@ -74,8 +121,9 @@ class Sandbox:
 
         阶段 1 的隔离不发生在这里，而在 daemon 内部的 DockerBackend——
         client 只负责把 --backend 开关带给 daemon，自己完全不懂 docker。
-        阶段 2 这里才会变成「创建容器并连进去」（对应 E2B 的 envd）；
-        阶段 3 改成「通过 orchestrator 启动 microVM」。
+        阶段 2 没有改这条路，而是**新增**了一条 _spawn_resident_container（把
+        daemon 装进常驻容器，对应 E2B 的 envd）与它并存；阶段 3 会再加一条
+        「通过 orchestrator 启动 microVM」。三条路连的都是同一个 daemon。
         """
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "microsandbox.server",
@@ -87,6 +135,64 @@ class Sandbox:
             # 带给用户。WARNING 级日志量极小，不会撑满 64KB 的管道缓冲。
             stderr=subprocess.PIPE,
         )
+
+    def _spawn_resident_container(self) -> None:
+        """阶段 2a：docker run -d 起一个常驻容器，把 daemon 跑在里面。
+
+        对比上面的 _spawn_daemon（在宿主 Popen 一个进程）：这里隔离环境（容器）
+        由 client 亲手创建并长期持有——这就是阶段 2 的「主从关系反转」。
+        注意 daemon 的代码（server.py）一行没改，只是换了运行的地方：这正是
+        三层解耦想证明的事。
+
+        2a 刻意不建镜像：把宿主的 src/ 只读挂载进官方 python:3.12-slim 即可让
+        容器跑我们的包，改代码免重建。等阶段 2b 引入 jupyter 依赖时，才会改用
+        Dockerfile 把依赖烘进 agent 镜像。
+        """
+        # 起容器前先把环境问题（docker 没装/没起/镜像缺失）暴露出来并给可操作指引，
+        # 而不是等 docker run 失败后从日志里猜。复用阶段 1 的同一套检查。
+        from .backend import DEFAULT_DOCKER_IMAGE, DockerBackend
+
+        problem = DockerBackend.check_available(DEFAULT_DOCKER_IMAGE)
+        if problem:
+            raise RuntimeError(f"无法创建常驻沙箱容器：{problem}")
+
+        # 容器统一前缀命名：close 时按名 docker rm -f，残留时也能按前缀一键清理
+        # （docker ps -a --filter name=microsandbox-sandbox -q | xargs -r docker rm -f）。
+        self._container = f"microsandbox-sandbox-{uuid.uuid4().hex[:12]}"
+        self.host = "127.0.0.1"
+        self.port = _find_free_port()  # 宿主侧随机空闲端口，避免多沙箱/与宿主 daemon 撞端口
+
+        src_dir = pathlib.Path(__file__).resolve().parents[1]  # .../src
+        inner_backend = _INNER_BACKEND[self.backend]
+
+        cmd = [
+            "docker", "run", "-d",
+            "--name", self._container,
+            "--pull", "never",                 # 镜像缺失立刻报错，绝不在创建路径里隐式拉
+            # 只把管理端口发布到本机回环：宿主能连，外网连不到
+            "-p", f"127.0.0.1:{self.port}:{_CONTAINER_PORT}",
+            # 资源限制作用于整个沙箱容器（daemon + 其内所有执行共享同一 cgroup），
+            # 这正是 E2B 的 per-sandbox 限额模型——而非阶段 1 的 per-execution。
+            # pids-limit 取 128（比 DockerBackend 的 64 大）：阶段 1 的容器只跑一个
+            # python，而这里容器内还常驻着 daemon，再加上每次执行的子进程，pid 占用更高。
+            "--memory", "256m", "--memory-swap", "256m",
+            "--cpus", "1.0", "--pids-limit", "128",
+            "--read-only", "--tmpfs", "/tmp:rw,size=64m",
+            "-v", f"{src_dir}:{_CONTAINER_SRC}:ro",       # 只读挂载源码
+            "-e", f"PYTHONPATH={_CONTAINER_SRC}",
+            "-e", "PYTHONDONTWRITEBYTECODE=1",            # 只读根下别尝试写 .pyc
+            "-e", "PYTHONUNBUFFERED=1",
+            DEFAULT_DOCKER_IMAGE,
+            # daemon 必须监听 0.0.0.0 才能被宿主经映射端口连到（默认 127.0.0.1 在容器内
+            # 等于谁都连不进来）。这是 server 端唯一的「配置」差异，代码本身不变。
+            "python", "-m", "microsandbox.server",
+            "--host", "0.0.0.0", "--port", str(_CONTAINER_PORT),
+            "--backend", inner_backend, "--log-level", "WARNING",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            self._container = None  # 没起成功就别在 close 里去删一个不存在的名字
+            raise RuntimeError(f"docker run 启动常驻容器失败：{proc.stderr.strip()}")
 
     def _wait_until_healthy(self, attempts: int = 50, delay: float = 0.1) -> None:
         url = f"http://{self.host}:{self.port}/health"
@@ -106,7 +212,26 @@ class Sandbox:
                         return
             except Exception:
                 time.sleep(delay)
-        raise RuntimeError("sandbox daemon did not become healthy in time")
+        # 没在限定时间内就绪：常驻容器把日志尾巴补进报错，便于排查（宿主 daemon
+        # 走上面 poll 分支提前抛出，到不了这里）。
+        detail = self._container_logs()
+        raise RuntimeError(
+            "sandbox daemon did not become healthy in time"
+            + (f": {detail[-500:]}" if detail else "")
+        )
+
+    def _container_logs(self) -> str:
+        """取常驻容器的日志尾巴，仅用于启动失败时的报错。任何失败都返回空串。"""
+        if self._container is None:
+            return ""
+        try:
+            out = subprocess.run(
+                ["docker", "logs", "--tail", "20", self._container],
+                capture_output=True, text=True, timeout=5,
+            )
+            return (out.stdout + out.stderr).strip()
+        except Exception:
+            return ""
 
     def close(self) -> None:
         if self._proc is not None:
@@ -116,6 +241,15 @@ class Sandbox:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
             self._proc = None
+        if self._container is not None:
+            # 杀死并删除整个常驻沙箱容器。对比阶段 1 的超时清理（杀的是一次性执行
+            # 容器），这里销毁的是沙箱本身。docker rm -f 一并 stop+rm；容器已不存在
+            # 等失败一律忽略（幂等兜底）。
+            subprocess.run(
+                ["docker", "rm", "-f", self._container],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self._container = None
 
     def __enter__(self) -> "Sandbox":
         return self

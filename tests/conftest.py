@@ -50,10 +50,18 @@ requires_docker = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(params=["local", pytest.param("docker", marks=requires_docker)])
+@pytest.fixture(
+    params=[
+        "local",
+        pytest.param("docker", marks=requires_docker),
+        # 阶段 2a：daemon 搬进常驻容器后，同一套端到端用例在这个新拓扑下再跑一遍——
+        # 把「协议不变、隔离/部署可换」的承诺从「换 backend」扩展到「换整个部署形态」。
+        pytest.param("container", marks=requires_docker),
+    ]
+)
 def sandbox(request: pytest.FixtureRequest):
-    """参数化的沙箱 fixture：每个用它的测试自动变成 [local] / [docker] 两个用例。"""
-    if request.param == "docker":
+    """参数化的沙箱 fixture：每个用它的测试自动变成 [local]/[docker]/[container] 三个用例。"""
+    if request.param in ("docker", "container"):
         ensure_image()
     sb = Sandbox(backend=request.param)
     yield sb
@@ -69,3 +77,26 @@ def docker_sandbox():
     sb = Sandbox(backend="docker")
     yield sb
     sb.close()
+
+
+@pytest.fixture
+def resident_sandbox():
+    """阶段 2a 专用：daemon 跑在常驻容器里的沙箱（backend="container"）。"""
+    if not docker_available():
+        pytest.skip("docker 不可用，跳过常驻容器测试")
+    ensure_image()
+    sb = Sandbox(backend="container")
+    yield sb
+    sb.close()  # 若测试已显式 close 过，这里是幂等空操作
+
+
+@pytest.fixture
+def docker_env():
+    """只确保 docker 环境就绪（不可用则 skip、并预拉镜像），不替你创建 Sandbox。
+
+    给需要自己掌控 Sandbox 构造过程的测试用——例如要故意让构造失败、
+    验证错误路径行为的回归测试。
+    """
+    if not docker_available():
+        pytest.skip("docker 不可用，跳过")
+    ensure_image()
