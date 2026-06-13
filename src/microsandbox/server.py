@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import socket
 from collections.abc import AsyncIterator
 
 from .backend import (
@@ -242,9 +243,26 @@ class SandboxServer:
         )
         await writer.drain()
 
-    async def serve(self, host: str = "127.0.0.1", port: int = 49152) -> None:
-        server = await asyncio.start_server(self.handle, host, port)
-        addr = ", ".join(str(s.getsockname()) for s in server.sockets)
+    async def serve(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 49152,
+        *,
+        transport: str = "tcp",
+        vsock_port: int = 1024,
+    ) -> None:
+        # 阶段 3：daemon 跑在 microVM 里时，控制通道走 vsock 而非 TCP（宿主经 Firecracker
+        # 的 UDS 连进来，见 docs/STAGE3_DESIGN.md §4.1）。除了「监听哪种 socket」不同，
+        # handle / 分发 / backend 全不变——这正是「协议稳定、传输可换」的体现。
+        if transport == "vsock":
+            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            # VMADDR_CID_ANY：监听本 VM 自己的 vsock；端口固定，client 侧 CONNECT 它。
+            sock.bind((socket.VMADDR_CID_ANY, vsock_port))
+            server = await asyncio.start_server(self.handle, sock=sock)
+            addr = f"vsock:cid=ANY,port={vsock_port}"
+        else:
+            server = await asyncio.start_server(self.handle, host, port)
+            addr = ", ".join(str(s.getsockname()) for s in server.sockets)
         logger.info("sandbox daemon listening on %s", addr)
         async with server:
             await server.serve_forever()
@@ -263,6 +281,20 @@ def main() -> None:
             "执行后端：local=本机子进程（无隔离）；docker=一次性容器（阶段 1）；"
             "kernel=常驻 Jupyter kernel，有状态 REPL（阶段 2b，需在 agent 镜像内运行）"
         ),
+    )
+    # 阶段 3：传输方式与执行后端正交——backend 决定「怎么跑代码」，transport 决定
+    # 「client 怎么连进来」。microVM 内用 vsock，容器/宿主仍用 tcp。
+    parser.add_argument(
+        "--transport",
+        choices=["tcp", "vsock"],
+        default="tcp",
+        help="控制通道：tcp=HTTP over TCP（阶段 0~2）；vsock=HTTP over vsock（阶段 3 microVM 内）",
+    )
+    parser.add_argument(
+        "--vsock-port",
+        type=int,
+        default=1024,
+        help="vsock 传输时 daemon 监听的 vsock 端口（client 侧 CONNECT 它）",
     )
     args = parser.parse_args()
 
@@ -290,7 +322,14 @@ def main() -> None:
 
     server = SandboxServer(backend)
     try:
-        asyncio.run(server.serve(args.host, args.port))
+        asyncio.run(
+            server.serve(
+                args.host,
+                args.port,
+                transport=args.transport,
+                vsock_port=args.vsock_port,
+            )
+        )
     except KeyboardInterrupt:
         logger.info("shutting down")
 

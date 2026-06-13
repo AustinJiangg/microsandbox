@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -67,6 +68,162 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+# ---- 阶段 3：传输层抽象（Transport）----
+#
+# 阶段 0~2 里 client 与 daemon 之间一直是「HTTP/SSE over TCP」，写死在 urllib 调用里。
+# 阶段 3 的 microVM 把控制通道换成 vsock（宿主经 Firecracker 的 UDS 连进 VM，见
+# docs/STAGE3_DESIGN.md §4.1）——传输方式第一次真的变了。为了让「协议字节不变、只换
+# 底层管道」这条主线继续成立，这里把「怎么把一次 HTTP 往返送到 daemon」抽成 Transport：
+#   - _TcpTransport ：原样包住既有的 urllib over TCP，行为字节级不变（local/docker/
+#     container/kernel 四个拓扑、既有 42 个测试因此一字不改地全绿）。
+#   - _VsockTransport：连 Firecracker 的 vsock UDS、做 CONNECT 握手、在裸 socket 上手写
+#     最小 HTTP/1.1（阶段 3b 接 microVM 时用；本步先写好并单测，暂不接真 VM）。
+# Sandbox 的 _stream / _post_json / _wait_until_healthy 都改为经 transport 收发，
+# 自己不再直接碰 urllib——传输细节被这层挡住，上层逻辑对 TCP/vsock 完全一致。
+
+
+class _Response:
+    """一次 HTTP 往返被传输层归一化后的响应：状态码 + 一个 file-like。
+
+    两种用法共用它，区别只在调用方怎么读 fp：
+      - 流式(SSE)：`for line in resp:` 逐行消费，直到连接关闭（EOF）；
+      - 单发(JSON)：`resp.read()` 一次读完 body。
+    fp 对 _TcpTransport 是 urllib 的响应对象，对 _VsockTransport 是 socket 的读文件——
+    两者都支持「按行迭代」和 read()，所以上层逻辑对两种传输无差别。
+    """
+
+    def __init__(
+        self, status: int, fp: Any, on_close: Callable[[], None] | None = None
+    ) -> None:
+        self.status = status
+        self.fp = fp
+        self._on_close = on_close
+
+    def __iter__(self) -> Iterator[bytes]:
+        return iter(self.fp)
+
+    def read(self) -> bytes:
+        return self.fp.read()
+
+    def close(self) -> None:
+        try:
+            self.fp.close()
+        finally:
+            if self._on_close is not None:
+                self._on_close()
+
+    def __enter__(self) -> "_Response":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+class _Transport(ABC):
+    """「怎么把一次 HTTP 请求送到 daemon、取回响应」的抽象。换隔离/换部署形态时，
+    需要换的只是这层（TCP→vsock），protocol 与上层 API 都不动。"""
+
+    @abstractmethod
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> _Response:
+        """发一次 HTTP 请求，返回 _Response。timeout=None 表示不设超时（阻塞）。"""
+        raise NotImplementedError
+
+
+class _TcpTransport(_Transport):
+    """HTTP over TCP（阶段 0~2 的老路）。内部仍用 urllib + 无代理 opener，行为与重构前
+    字节级一致——这正是既有测试不改即全绿的依据。"""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._base = f"http://{host}:{port}"
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> _Response:
+        req = urllib.request.Request(
+            self._base + path, data=body, headers=headers or {}, method=method
+        )
+        try:
+            # timeout=None 时不传该参数，完全复刻重构前 _DIRECT_OPENER.open(req) 的行为
+            # （urllib 里「不传」走全局默认，与显式 None 有微妙差别，这里保持原样最稳）。
+            resp = (
+                _DIRECT_OPENER.open(req)
+                if timeout is None
+                else _DIRECT_OPENER.open(req, timeout=timeout)
+            )
+        except urllib.error.HTTPError as exc:
+            # 非 2xx 在 urllib 里是异常；归一化成 _Response，让上层（_post_json）统一按
+            # status 处理，与 vsock 路径行为一致。HTTPError 本身就是个 file-like，能 read()。
+            return _Response(exc.code, exc)
+        return _Response(resp.status, resp)
+
+
+class _VsockTransport(_Transport):
+    """HTTP over vsock（阶段 3 的 microVM 控制通道）。
+
+    Firecracker 把 guest 的 vsock 多路复用到宿主的一个 Unix domain socket（UDS）上，
+    握手是文本协议：连上 UDS 后发 `CONNECT <port>\\n`，Firecracker 回 `OK <hostport>\\n`，
+    之后这条字节流就接到了 guest 里监听该 vsock 端口的 daemon。握手完，双方说的还是原来
+    那套 HTTP/SSE——所以这里只需在裸 socket 上手写一个最小 HTTP/1.1 客户端。
+    （urllib 不会说这套 CONNECT 握手，故不能复用 _TcpTransport。）
+    """
+
+    def __init__(self, uds_path: str, vsock_port: int) -> None:
+        self._uds = uds_path
+        self._vsock_port = vsock_port
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> _Response:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)  # None=阻塞（流式 /execute 用）；健康检查传 1s
+        try:
+            sock.connect(self._uds)
+            # ① Firecracker vsock 握手：CONNECT <port> -> OK <hostport>
+            sock.sendall(f"CONNECT {self._vsock_port}\n".encode())
+            rfile = sock.makefile("rb")  # 读响应走它；写一律用 sock.sendall，避免读写缓冲互扰
+            ack = rfile.readline()
+            if not ack.startswith(b"OK"):
+                # 例如 guest 里那个 vsock 端口没人监听，Firecracker 会回非 OK。
+                raise ConnectionError(f"vsock CONNECT 被拒：{ack!r}")
+            # ② 手写最小 HTTP/1.1 请求行 + 头 + body
+            head = [f"{method} {path} HTTP/1.1", "Host: sandbox", "Connection: close"]
+            hdrs = dict(headers or {})
+            if body is not None:
+                hdrs.setdefault("Content-Length", str(len(body)))
+            head += [f"{k}: {v}" for k, v in hdrs.items()]
+            sock.sendall(("\r\n".join(head) + "\r\n\r\n").encode())
+            if body:
+                sock.sendall(body)
+            # ③ 读状态行 + 跳过响应头，让 rfile 停在 body 起点交给上层（流式/单发都从这读）
+            status_line = rfile.readline().decode("latin-1")
+            status = int(status_line.split(" ", 2)[1])
+            while True:
+                line = rfile.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+            return _Response(status, rfile, on_close=sock.close)
+        except Exception:
+            sock.close()
+            raise
+
+
 class Sandbox:
     """一个沙箱会话的客户端句柄。
 
@@ -100,6 +257,9 @@ class Sandbox:
         self.backend = backend
         self._proc: subprocess.Popen | None = None   # 宿主 daemon 子进程（阶段 0/1）
         self._container: str | None = None           # 常驻沙箱容器名（阶段 2）
+        # 传输层（阶段 3 抽象）：默认懒构造成 TCP；microVM 会在 _spawn_microvm 里
+        # 预装一个 vsock 传输。把「怎么连」从「连上之后说什么」里拆出来。
+        self._transport: _Transport | None = None
 
         # 阶段 2c：文件 / shell 两个命名空间，手感对齐 E2B 的 sandbox.files / sandbox.commands。
         # 它们只在被调用时才用到 host/port，所以这里先建好即可（顺序无所谓）。
@@ -216,8 +376,16 @@ class Sandbox:
             self._container = None  # 没起成功就别在 close 里去删一个不存在的名字
             raise RuntimeError(f"docker run 启动常驻容器失败：{proc.stderr.strip()}")
 
+    def _ensure_transport(self) -> _Transport:
+        """懒构造传输层。默认 TCP（local/docker/container/kernel 都走它）；阶段 3b 的
+        microVM 会在 _spawn_microvm 里预装一个 _VsockTransport，这里便不再覆盖。放在
+        spawn 之后取值，才能拿到常驻容器随机映射到宿主的最终端口。"""
+        if self._transport is None:
+            self._transport = _TcpTransport(self.host, self.port)
+        return self._transport
+
     def _wait_until_healthy(self, attempts: int = 50, delay: float = 0.1) -> None:
-        url = f"http://{self.host}:{self.port}/health"
+        transport = self._ensure_transport()
         for _ in range(attempts):
             # daemon 进程已退出就别傻等满 5 秒了——立刻读出它的 stderr 作为报错。
             # 例如 docker 后端在镜像缺失时，daemon 启动期检查会直接打印原因并退出。
@@ -229,7 +397,7 @@ class Sandbox:
                     f"sandbox daemon exited at startup: {detail[-500:] or '(no stderr)'}"
                 )
             try:
-                with _DIRECT_OPENER.open(url, timeout=1) as resp:
+                with transport.request("GET", "/health", timeout=1) as resp:
                     if resp.status == 200:
                         return
             except Exception:
@@ -311,17 +479,20 @@ class Sandbox:
         return execution
 
     def _stream(self, code: str, language: str) -> Iterator[OutputEvent]:
-        """向守护进程发起执行请求，逐行解析 SSE 流。"""
+        """向守护进程发起执行请求，逐行解析 SSE 流。
+
+        请求怎么送到 daemon 由 transport 决定（TCP 或 vsock）；这里只负责把 /execute
+        的 SSE 响应逐行翻译回 OutputEvent——对两种传输完全一致（重构前内联在 urllib 上）。
+        """
         request = ExecuteRequest(
             code=code, language=language, timeout_seconds=self.timeout_seconds
         )
-        req = urllib.request.Request(
-            f"http://{self.host}:{self.port}/execute",
-            data=request.to_json().encode(),
+        with self._ensure_transport().request(
+            "POST",
+            "/execute",
+            body=request.to_json().encode(),
             headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with _DIRECT_OPENER.open(req) as resp:
+        ) as resp:
             for raw in resp:
                 line = raw.decode(errors="replace").rstrip("\n")
                 if not line.startswith("data: "):
@@ -336,23 +507,24 @@ class Sandbox:
 
         阶段 2c 的文件/命令端点都走它（区别于 run_code 的 SSE 流式）。
         非 200 响应里的 {"error": ...} 会被抛成 RuntimeError。
+
+        非 2xx 在不同传输下表现不同（urllib 抛 HTTPError、vsock 是普通响应），归一化
+        交给 transport：这里只按 resp.status 判，对两种传输一致。
         """
-        req = urllib.request.Request(
-            f"http://{self.host}:{self.port}{path}",
-            data=json.dumps(payload).encode(),
+        with self._ensure_transport().request(
+            "POST",
+            path,
+            body=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with _DIRECT_OPENER.open(req) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            try:
-                message = json.loads(detail).get("error", detail)
-            except json.JSONDecodeError:
-                message = detail
-            raise RuntimeError(f"{path} 失败：{message}") from exc
+        ) as resp:
+            raw = resp.read().decode(errors="replace")
+            if resp.status != 200:
+                try:
+                    message = json.loads(raw).get("error", raw)
+                except json.JSONDecodeError:
+                    message = raw
+                raise RuntimeError(f"{path} 失败：{message}")
+            return json.loads(raw)
 
 
 # ----- 阶段 2c：文件 / shell 命名空间（挂在 Sandbox 上，手感对齐 E2B）-----
