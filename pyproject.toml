@@ -8,9 +8,9 @@ version = "0.1.0"
 description = "A learning code sandbox, implemented from scratch and progressively approaching E2B"
 readme = "README.md"
 requires-python = ">=3.11"
-# Stages 0/1 both keep zero runtime dependencies: Stage 1 drives Docker via docker
-# CLI subprocesses rather than docker-py (a sync library inside an asyncio daemon
-# only makes things more convoluted). Later stages add dependencies as needed, with a stated reason.
+# The host side has zero runtime dependencies: the client drives Firecracker (and
+# docker, for the one-time rootfs build) via CLI subprocesses rather than a Python
+# library. The in-VM kernel's deps live in the [kernel] extra below.
 dependencies = []
 
 [project.optional-dependencies]
@@ -18,12 +18,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
-# Stage 2b introduces runtime dependencies for the first time: a resident Jupyter
-# kernel (stateful REPL, aligned with E2B). Note these are only needed by the
-# "in-container daemon" -- the agent image (see Dockerfile) already pre-installs them;
-# running the client / local / docker / container backends on the host doesn't need
-# them, so they're made an optional extra, and backend.py also lazily imports
-# jupyter_client to keep the non-kernel path dependency-free.
+# The in-VM execution backend is a resident Jupyter kernel (stateful REPL, aligned
+# with E2B). These deps are only needed by the daemon *inside the VM* -- the agent
+# image (see Dockerfile), from which the rootfs is exported, already pre-installs
+# them. The host client doesn't need them, so they're an optional extra, and
+# backend.py imports jupyter_client lazily.
 kernel = [
     "ipykernel>=6",
     "jupyter_client>=8",

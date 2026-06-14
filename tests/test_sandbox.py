@@ -1,9 +1,9 @@
-"""End-to-end tests (written in Stage 0, reused across both backends from Stage 1).
+"""End-to-end tests: basic execution, stdout/stderr separation, error capture, timeout.
 
-Covers: basic execution, stdout/stderr separation, error capture, timeout.
-The sandbox fixture in conftest.py is already parametrized over the local /
-docker backends -- the same test bodies run once each, verifying that "the
-protocol contract stays fixed while the isolation scheme can be swapped."
+The `sandbox` fixture in conftest.py provides a Firecracker microVM. These same
+generic test bodies have ridden along through every isolation scheme the project
+passed through -- the running proof that the wire protocol stays fixed while the
+isolation underneath is swapped.
 """
 
 from microsandbox import Sandbox

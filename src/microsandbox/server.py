@@ -1,19 +1,18 @@
 """Sandbox daemon (daemon / server).
 
-It runs *inside* the sandbox, listens for HTTP requests, hands code off to an
-execution backend to run, then streams the output back to the client over SSE.
+It runs *inside the Firecracker microVM* as a resident agent -- the counterpart
+of E2B's `envd`. It listens on vsock for HTTP requests, hands code off to the
+execution backend (a stateful Jupyter kernel) to run, then streams the output
+back to the client over SSE.
 
-Stage 0/1: this process runs on your local machine (in Stage 1 the isolation
-happens inside the container the backend spins up).
-Stage 2+: this process gets baked into the container/VM image and runs as a
-        resident agent -- the counterpart of E2B's `envd`. At that point the
-        URL the client connects to changes from localhost to the container/VM
-        address, while the server code itself barely needs to change.
+The client starts the VM and connects in over vsock; the daemon code itself is
+transport-agnostic (it just listens on a different kind of socket). This is the
+embodiment of the project's main thread: keep the wire protocol (protocol.py)
+fixed, swap only the isolation/transport underneath.
 
-Implemented with the standard library only, to avoid pulling in a pile of
-dependencies as early as Stage 0. From Stage 1 onward, if hand-rolling HTTP
-feels too tedious, you can switch to FastAPI/uvicorn -- just keep the interface
-contract (the wire protocol) unchanged.
+Implemented with the standard library only. If hand-rolling HTTP feels too
+tedious you can switch to FastAPI/uvicorn -- just keep the interface contract
+(the wire protocol) unchanged.
 """
 
 from __future__ import annotations
@@ -25,12 +24,7 @@ import logging
 import pathlib
 import socket
 
-from .backend import (
-    DockerBackend,
-    ExecutionBackend,
-    JupyterKernelBackend,
-    LocalSubprocessBackend,
-)
+from .backend import ExecutionBackend, JupyterKernelBackend
 from .protocol import (
     CommandRequest,
     ExecuteRequest,
@@ -89,9 +83,9 @@ class SandboxServer:
     """
 
     def __init__(self, backend: ExecutionBackend | None = None) -> None:
-        # Depend on the abstract interface rather than a concrete implementation:
-        # switching isolation schemes only changes this line's default value.
-        self.backend = backend or LocalSubprocessBackend()
+        # Depend on the abstract interface rather than a concrete implementation.
+        # Inside the microVM the only backend is the stateful Jupyter kernel.
+        self.backend = backend or JupyterKernelBackend()
 
     async def handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -284,66 +278,48 @@ class SandboxServer:
         )
         await writer.drain()
 
-    async def serve(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 49152,
-        *,
-        transport: str = "tcp",
-        vsock_port: int = 1024,
-    ) -> None:
-        # Stage 3: when the daemon runs inside a microVM, the control channel goes
-        # over vsock rather than TCP (the host connects in via Firecracker's UDS,
-        # see docs/STAGE3_DESIGN.md §4.1). Apart from "which kind of socket to
-        # listen on", handle / dispatch / backend are all unchanged -- this is
-        # exactly the embodiment of "stable protocol, swappable transport".
-        if transport == "vsock":
-            # Inside a microVM lo defaults to down, and the kernel backend relies on it for ZMQ; bring it up best-effort, warn only on failure.
-            try:
-                _ensure_loopback_up()
-            except OSError as exc:
-                logger.warning("could not bring up loopback (kernel backend may be unavailable): %s", exc)
-            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-            # VMADDR_CID_ANY: listen on this VM's own vsock; the port is fixed, the client side CONNECTs to it.
-            sock.bind((socket.VMADDR_CID_ANY, vsock_port))
-            server = await asyncio.start_server(self.handle, sock=sock)
-            addr = f"vsock:cid=ANY,port={vsock_port}"
-        else:
-            server = await asyncio.start_server(self.handle, host, port)
-            addr = ", ".join(str(s.getsockname()) for s in server.sockets)
-        logger.info("sandbox daemon listening on %s", addr)
+    async def serve(self, *, vsock_port: int = 1024) -> None:
+        # The daemon runs inside a Firecracker microVM, so the control channel is
+        # vsock (the host connects in via Firecracker's UDS, see
+        # docs/STAGE3_DESIGN.md §4.1). Apart from "which kind of socket to listen
+        # on", handle / dispatch / backend are all unchanged -- exactly the
+        # embodiment of "stable protocol, swappable transport".
+        #
+        # Inside a microVM lo defaults to down, and the kernel backend relies on it
+        # for ZMQ; bring it up best-effort, warn only on failure.
+        try:
+            _ensure_loopback_up()
+        except OSError as exc:
+            logger.warning("could not bring up loopback (kernel backend may be unavailable): %s", exc)
+        # VMADDR_CID_ANY: listen on this VM's own vsock; the port is fixed, the client side CONNECTs to it.
+        sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        sock.bind((socket.VMADDR_CID_ANY, vsock_port))
+        server = await asyncio.start_server(self.handle, sock=sock)
+        logger.info("sandbox daemon listening on vsock:cid=ANY,port=%d", vsock_port)
         async with server:
             await server.serve_forever()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="microsandbox daemon")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=49152)
+    parser = argparse.ArgumentParser(
+        description="microsandbox daemon (runs inside the Firecracker microVM)"
+    )
     parser.add_argument("--log-level", default="INFO")
+    # The daemon now only ever runs inside the microVM: the control channel is
+    # vsock and the execution backend is the stateful Jupyter kernel. These flags
+    # are kept single-valued (rather than dropped) so the rootfs /init invocation
+    # stays stable and self-documenting -- see scripts/build-rootfs.sh.
     parser.add_argument(
-        "--backend",
-        choices=["local", "docker", "kernel"],
-        default="local",
-        help=(
-            "execution backend: local=local subprocess (no isolation); docker=one-shot container (Stage 1); "
-            "kernel=resident Jupyter kernel, stateful REPL (Stage 2b, must run inside the agent image)"
-        ),
-    )
-    # Stage 3: transport is orthogonal to the execution backend -- the backend
-    # decides "how to run code", the transport decides "how the client connects
-    # in". Inside a microVM use vsock; for container/host still use tcp.
-    parser.add_argument(
-        "--transport",
-        choices=["tcp", "vsock"],
-        default="tcp",
-        help="control channel: tcp=HTTP over TCP (Stage 0~2); vsock=HTTP over vsock (Stage 3, inside the microVM)",
+        "--transport", choices=["vsock"], default="vsock",
+        help="control channel (fixed: HTTP over vsock)",
     )
     parser.add_argument(
-        "--vsock-port",
-        type=int,
-        default=1024,
-        help="the vsock port the daemon listens on under vsock transport (the client side CONNECTs to it)",
+        "--backend", choices=["kernel"], default="kernel",
+        help="execution backend (fixed: resident Jupyter kernel, stateful REPL)",
+    )
+    parser.add_argument(
+        "--vsock-port", type=int, default=1024,
+        help="the vsock port the daemon listens on (the client side CONNECTs to it)",
     )
     args = parser.parse_args()
 
@@ -352,35 +328,17 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    if args.backend == "docker":
-        # Surface environment problems (docker not installed / not running / image missing) to
-        # whoever starts the daemon right at startup, with actionable guidance -- rather than
-        # burying them in the SSE stream only on the first execution.
-        problem = DockerBackend.check_available()
-        if problem:
-            parser.error(problem)
-        backend: ExecutionBackend = DockerBackend()
-    elif args.backend == "kernel":
-        # Likewise, when ipykernel/jupyter_client is missing, report it clearly at startup
-        # (this generally only triggers when --backend kernel is misused outside the agent
-        # image). Instantiation only validates dependencies; the kernel is started lazily.
-        try:
-            backend = JupyterKernelBackend()
-        except RuntimeError as exc:
-            parser.error(str(exc))
-    else:
-        backend = LocalSubprocessBackend()
+    # Instantiation only validates dependencies (ipykernel/jupyter_client, which the
+    # agent image preinstalls); the kernel itself is started lazily on first execute.
+    try:
+        backend: ExecutionBackend = JupyterKernelBackend()
+    except RuntimeError as exc:
+        parser.error(str(exc))
+        return  # unreachable (parser.error raises SystemExit), but reassures type checkers
 
     server = SandboxServer(backend)
     try:
-        asyncio.run(
-            server.serve(
-                args.host,
-                args.port,
-                transport=args.transport,
-                vsock_port=args.vsock_port,
-            )
-        )
+        asyncio.run(server.serve(vsock_port=args.vsock_port))
     except KeyboardInterrupt:
         logger.info("shutting down")
 

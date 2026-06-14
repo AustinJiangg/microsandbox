@@ -1,15 +1,14 @@
-# Stage 2b: agent image (microsandbox-agent).
+# Agent image (microsandbox-agent): the base the microVM rootfs is exported from.
 #
 # On top of the official python:3.12-slim, install the Jupyter kernel runtime
-# (ipykernel + jupyter_client) so the in-container daemon can host a resident
-# Python kernel, giving a stateful REPL across run_code calls (the equivalent of
-# E2B's code interpreter).
+# (ipykernel + jupyter_client) so the in-VM daemon can host a resident Python
+# kernel, giving a stateful REPL across run_code calls (the equivalent of E2B's
+# code interpreter).
 #
-# Note: the source code is not COPYied into the image; instead the host's src/ is
-# bind-mounted read-only at docker run time (see client._spawn_resident_container)
-# -- so you can edit code during development without rebuilding the image. The
-# image only holds the "rarely-changing, slow-to-install" dependencies. The source
-# will only be baked into the image once Stage 4 productionizes things.
+# This image is never `docker run`; instead scripts/build-rootfs.sh does
+# `docker export` on it, injects src/microsandbox + a minimal /init, and packs the
+# result into an ext4 rootfs for Firecracker. So docker is only a one-time build
+# tool here, not a runtime.
 #
 # Build: docker build -t microsandbox-agent .
 FROM python:3.12-slim
@@ -23,6 +22,6 @@ RUN pip install --no-cache-dir ipykernel jupyter_client \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# No ENTRYPOINT/CMD: the actual startup command is supplied by the client at
-# docker run time (python -m microsandbox.server --host 0.0.0.0 --port ... --backend kernel),
-# sharing the same docker run invocation style as the container backend.
+# No ENTRYPOINT/CMD: this image is exported into a rootfs, where the microVM's
+# /init (written by scripts/build-rootfs.sh) starts the daemon
+# (python -m microsandbox.server --transport vsock --backend kernel).

@@ -1,9 +1,18 @@
-# Stage 3 Design: Firecracker microVM isolation
+# Firecracker microVM design (formerly "Stage 3")
 
-> This document is the design and implementation plan for Stage 3. Stage 3 is the stage where the project's **isolation strength changes qualitatively for the first time**—
-> upgrading from "a container that shares the host kernel" to "a microVM with its own guest kernel", with the escape surface dropping sharply.
-> We recommend reading it alongside `docs/ARCHITECTURE.md` and `docs/STAGE2_DESIGN.md`: architecturally, Stage 3 is
-> highly isomorphic to Stage 2 (another "ownership inversion"); the only truly new boundary is **the transport changing from TCP to vsock**.
+> **Note.** This is the design journal for the microVM — the project's only
+> isolation form today. It was originally "Stage 3", built on top of earlier stages
+> (host subprocess → Docker container → resident container → stateful kernel) that
+> have since been removed as scaffolding; the journal still references them because
+> that's the context it was designed in. Those stages live on in the git history.
+>
+> This is the stage where the project's **isolation strength changed qualitatively
+> for the first time** — upgrading from "a container that shares the host kernel" to
+> "a microVM with its own guest kernel", with the escape surface dropping sharply.
+> Read it alongside `docs/ARCHITECTURE.md`. Architecturally the microVM is highly
+> isomorphic to the earlier resident-container stage (another "ownership
+> inversion"); the only truly new boundary is **the transport changing from TCP to
+> vsock**.
 
 The ROADMAP gives Stage 3 one line: **"Slow down and understand this stage by hand—don't run on vibes alone."** This document exists precisely to
 make every step understandable rather than copy-pasted.
@@ -64,7 +73,7 @@ host                                sandbox microVM (long-lived, one per Sandbox
    ▲ the guest's own kernel + the KVM boundary sit right on this vertical line
 ```
 
-Against Stage 2's responsibility migration table (`STAGE2_DESIGN.md` §2), Stage 3 still changes the same three places,
+Against the earlier resident-container stage's responsibility migration, Stage 3 still changes the same three places,
 and **`server.py`'s business logic and `protocol.py`'s wire bytes still don't change one line**:
 
 | Code location | What Stage 2 does now | What Stage 3 changes it to |
@@ -251,7 +260,7 @@ and `server.py`'s request handling logic and `backend.py`'s execution logic all 
 
 **Security: Stage 3 is the first time "isolation actually gets stronger" appears, rather than "weakened for the sake of a management channel".**
 In Stage 2, to let the client connect to the in-container daemon, it **must open a TCP management port**, which incidentally also opens up the guest's outbound
-network (`STAGE2_DESIGN.md` §6 honestly records this regression). Stage 3 uses vsock as the control channel, so it **fundamentally
+network (the earlier resident-container stage honestly recorded this regression). Stage 3 uses vsock as the control channel, so it **fundamentally
 doesn't need to give the VM a NIC**—the management channel goes over virtio-vsock, orthogonal to "whether there's a network". So we can:
 
 - The guest has **no virtio-net at all** → the sandbox code is completely network-less (back to Stage 1's cut-off strength),

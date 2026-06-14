@@ -37,7 +37,7 @@ def test_restore_is_fast(snapshot_ready) -> None:
     from "skipping kernel boot."
     """
     t0 = time.time()
-    sb = Sandbox(backend="microvm", from_snapshot=True)
+    sb = Sandbox(from_snapshot=True)
     ready = time.time() - t0
     try:
         assert sb.run_code("print(1)").stdout.strip() == "1"

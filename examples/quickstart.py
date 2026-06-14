@@ -1,17 +1,19 @@
-"""Stage 0 quickstart example.
+"""Quickstart example.
 
 Run it directly:
     python examples/quickstart.py
 
-It automatically spins up a sandbox daemon locally, runs a few snippets of code,
-and then cleans up.
+It boots a Firecracker microVM, runs a few snippets of code inside it, and cleans
+up on exit. Requires the one-time microVM setup (firecracker + kernel under
+vendor/, /dev/kvm access, and scripts/build-rootfs.sh) -- see README / docs.
 """
 
 from microsandbox import Sandbox
 
 
 def main() -> None:
-    # spawn_local=True (the default) automatically starts a local daemon and shuts it down on exit.
+    # Constructing the Sandbox cold-starts a microVM and connects in over vsock;
+    # leaving the `with` block kills the VM and cleans up.
     with Sandbox() as sandbox:
         print("=== 1. Basic output ===")
         ex = sandbox.run_code("print('hello from the sandbox')")
