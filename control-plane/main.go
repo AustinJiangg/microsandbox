@@ -23,9 +23,11 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "host:port to listen on")
 	vendorDir := flag.String("vendor-dir", "vendor",
 		"directory holding firecracker / vmlinux / rootfs.ext4 / snapshot")
+	poolSize := flag.Int("pool-size", 0,
+		"keep this many snapshot-restored microVMs warm for instant from_snapshot creates (0 = disabled)")
 	flag.Parse()
 
-	srv := newServer(*vendorDir)
+	srv := newServer(*vendorDir, *poolSize)
 
 	// Go 1.22+ ServeMux: method + path-wildcard patterns. The trailing-slash
 	// pattern is the catch-all transparent proxy (Stage 4b); the two exact
@@ -53,7 +55,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("control-plane listening on %s (vendor=%s)", *addr, *vendorDir)
+	log.Printf("control-plane listening on %s (vendor=%s, pool-size=%d)", *addr, *vendorDir, *poolSize)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
