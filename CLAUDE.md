@@ -21,11 +21,12 @@ Firecracker path. **The staged journey is preserved in the git history** — see
 
 ## Core architecture (keep it stable)
 
-Three decoupled layers — see `docs/ARCHITECTURE.md` for the full design:
+The core layers — see `docs/ARCHITECTURE.md` for the full design:
 
 1. **client (SDK)** — `src/microsandbox/client.py`. What the user faces:
-   `Sandbox().run_code(...)`. Also owns the microVM lifecycle (`_spawn_microvm` /
-   `_restore_microvm`) and the vsock transport (`_VsockTransport`).
+   `Sandbox().run_code(...)`. As of Stage 4 it no longer creates the VM itself: it
+   asks the control plane over HTTP (`POST`/`DELETE /sandboxes`), then (in Stage 4a)
+   still connects to that VM over the vsock transport (`_VsockTransport`).
 2. **protocol (wire protocol)** — `src/microsandbox/protocol.py`. The contract
    between client and daemon. **This is the most important boundary; it stayed
    byte-stable as the isolation evolved from subprocess to microVM — keep it that
@@ -33,6 +34,10 @@ Three decoupled layers — see `docs/ARCHITECTURE.md` for the full design:
 3. **daemon + backend** — `server.py` / `backend.py`. The daemon runs **inside the
    VM**, listening on vsock; `JupyterKernelBackend` is the stateful kernel that
    actually runs the code.
+4. **control plane** — `control-plane/` (Go), built to `vendor/control-plane`. Owns
+   the microVM fleet: spawn / restore / destroy (ported from the SDK's old
+   `_spawn_microvm` / `_restore_microvm` / `close`). New in Stage 4; the wire
+   protocol stayed untouched. See `docs/STAGE4_DESIGN.md`.
 
 **Key principle**: isolation strength comes from *where the daemon runs* and *how
 the client connects* (client/transport concerns), not from the backend. The
@@ -45,9 +50,14 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   control channel, machine-config resource limits, no guest NIC (the sandbox code
   is fully offline while still manageable), and snapshot restore (~30ms to ready).
   See `docs/MICROVM_DESIGN.md` for the design + measured records.
+- **In progress (Stage 4 — Go control plane)**: 4a is done — VM lifecycle moved out
+  of the SDK into a standalone Go service (`control-plane/`); the SDK now drives it
+  over HTTP and still reaches the VM over vsock itself. Next is 4b: move the vsock
+  proxy + health probe into the control plane so the SDK becomes pure HTTP. See
+  `docs/STAGE4_DESIGN.md`.
 - **Possible next**: a warm pool (one base snapshot forked into N second-scale
-  sandboxes — needs a per-VM vsock uds override), plus productization (templates,
-  auth, a control plane). None started.
+  sandboxes — needs a per-VM vsock uds override), plus further productization
+  (templates, auth, multi-host scheduling, a TypeScript SDK).
 
 ## Development conventions
 
@@ -70,8 +80,8 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 
 ```bash
 pip install -e ".[dev]"                          # install (dev mode)
-pytest                                           # run tests (VM cases auto-skip without firecracker/kvm)
-pytest tests/test_transport.py -q                # the vsock unit tests (no VM/KVM needed)
+pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs the control plane)
+pytest tests/test_transport.py -q                # the vsock unit tests (no VM/KVM/go needed)
 pytest tests/test_microvm.py::test_runs_in_microvm -v   # one real-VM end-to-end case
 
 # One-time microVM setup (see docs/MICROVM_DESIGN.md §7):
@@ -79,9 +89,12 @@ sudo usermod -aG kvm "$USER"                     # then `wsl --shutdown` and reo
 docker build -t microsandbox-agent .             # the agent image the rootfs is exported from
 scripts/build-rootfs.sh                          # export the ext4 rootfs from the agent image (no root)
 scripts/build-snapshot.sh                        # build the warm snapshot for millisecond restore
+scripts/build-control-plane.sh                   # build the Go control plane to vendor/control-plane (Stage 4)
 
-# Minimal end-to-end smoke (needs the vendor artifacts):
+# Minimal end-to-end smoke (Stage 4: start the control plane first; needs the vendor artifacts):
+./vendor/control-plane &                         # owns the microVM fleet; the SDK talks to it over HTTP
 python -c 'from microsandbox import Sandbox; s=Sandbox(); s.run_code("x=41"); print(s.run_code("print(x+1)").stdout); s.close()'
+kill %1                                           # stop the control plane
 
 # After editing in-VM code (server.py / backend.py), rebuild the rootfs (+ snapshot)
 # so the VM picks up the change -- the rootfs bakes in a copy of src/ at build time:

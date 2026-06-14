@@ -1,19 +1,20 @@
 """Quickstart example.
 
-Run it directly:
+Start the control plane first (Stage 4 -- it owns the microVM fleet), then run this:
+    scripts/build-control-plane.sh && ./vendor/control-plane &
     python examples/quickstart.py
 
-It boots a Firecracker microVM, runs a few snippets of code inside it, and cleans
-up on exit. Requires the one-time microVM setup (firecracker + kernel under
-vendor/, /dev/kvm access, and scripts/build-rootfs.sh) -- see README / docs.
+It asks the control plane to boot a Firecracker microVM, runs a few snippets of code
+inside it, and cleans up on exit. Requires the one-time microVM setup (firecracker +
+kernel under vendor/, /dev/kvm access, scripts/build-rootfs.sh) -- see README / docs.
 """
 
 from microsandbox import Sandbox
 
 
 def main() -> None:
-    # Constructing the Sandbox cold-starts a microVM and connects in over vsock;
-    # leaving the `with` block kills the VM and cleans up.
+    # Constructing the Sandbox asks the control plane to cold-start a microVM, then
+    # connects in over vsock; leaving the `with` block destroys the VM and cleans up.
     with Sandbox() as sandbox:
         print("=== 1. Basic output ===")
         ex = sandbox.run_code("print('hello from the sandbox')")

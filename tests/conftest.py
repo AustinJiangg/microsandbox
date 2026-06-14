@@ -10,7 +10,10 @@ and always run).
 import functools
 import os
 import pathlib
+import shutil
 import subprocess
+import time
+import urllib.request
 
 import pytest
 
@@ -30,6 +33,12 @@ def firecracker_available() -> bool:
     if not (vendor / "firecracker").exists() or not (vendor / "vmlinux").exists():
         return False
     return os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
+@functools.lru_cache(maxsize=1)
+def go_available() -> bool:
+    """The Stage 4 control plane is a Go binary built on demand; skip its cases when go is absent."""
+    return shutil.which("go") is not None
 
 
 @functools.lru_cache(maxsize=1)
@@ -73,31 +82,76 @@ def ensure_snapshot() -> None:
     subprocess.run([str(repo_root / "scripts" / "build-snapshot.sh")], check=True)
 
 
-@pytest.fixture
-def sandbox():
-    """A cold-started microVM sandbox -- the common fixture for end-to-end / stateful / files tests."""
+@pytest.fixture(scope="session")
+def control_plane(tmp_path_factory):
+    """Build and run the Go control plane once for the whole test session.
+
+    As of Stage 4 every Sandbox is created by asking this service (rather than the SDK
+    forking firecracker itself), so the microVM tests need it running. Skips the whole
+    microVM group when go / firecracker / kvm are unavailable, keeping pytest green on
+    machines / CI without them. Yields the control plane's base URL.
+    """
     if not firecracker_available():
         pytest.skip("firecracker/kernel/kvm incomplete, skipping microVM cases")
-    ensure_rootfs()
-    sb = Sandbox()
+    if not go_available():
+        pytest.skip("go toolchain not found, skipping control-plane cases")
+
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    ensure_rootfs()  # the control plane needs the rootfs for any cold start
+    subprocess.run([str(repo_root / "scripts" / "build-control-plane.sh")], check=True)
+
+    addr = "127.0.0.1:8099"
+    base_url = f"http://{addr}"
+    log_path = tmp_path_factory.mktemp("control-plane") / "cp.log"
+    log_fh = open(log_path, "wb")
+    proc = subprocess.Popen(
+        [str(repo_root / "vendor" / "control-plane"),
+         "--addr", addr, "--vendor-dir", str(repo_root / "vendor")],
+        stdout=log_fh, stderr=subprocess.STDOUT,
+    )
+    try:
+        # Wait for the control plane's own /health (a connection refused before it binds
+        # raises URLError, which is an OSError subclass).
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(base_url + "/health", timeout=1) as r:
+                    if r.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise RuntimeError(f"control plane did not become healthy; see {log_path}")
+        yield base_url
+    finally:
+        proc.terminate()  # SIGTERM -> the control plane destroys any VMs still running
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        log_fh.close()
+
+
+@pytest.fixture
+def sandbox(control_plane):
+    """A cold-started microVM sandbox -- the common fixture for end-to-end / stateful / files tests."""
+    sb = Sandbox(base_url=control_plane)
     yield sb
     sb.close()
 
 
 @pytest.fixture
-def snapshot_ready():
-    """Only ensures the snapshot is ready (skip if unavailable); does not construct a Sandbox -- for cases that time things themselves."""
-    if not firecracker_available():
-        pytest.skip("firecracker/kernel/kvm incomplete, skipping snapshot cases")
+def snapshot_ready(control_plane):
+    """Ensure the snapshot is ready and yield the control-plane URL, for cases that
+    construct (and time) their own Sandbox(from_snapshot=True)."""
     ensure_snapshot()
+    return control_plane
 
 
 @pytest.fixture
-def snapshot_sandbox():
+def snapshot_sandbox(control_plane):
     """A microVM sandbox restored from a snapshot in milliseconds (the kernel inside the VM is already warm)."""
-    if not firecracker_available():
-        pytest.skip("firecracker/kernel/kvm incomplete, skipping snapshot cases")
     ensure_snapshot()
-    sb = Sandbox(from_snapshot=True)
+    sb = Sandbox(from_snapshot=True, base_url=control_plane)
     yield sb
     sb.close()

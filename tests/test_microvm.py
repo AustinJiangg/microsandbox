@@ -60,12 +60,16 @@ def test_machine_config_resource_limits(sandbox: Sandbox) -> None:
 
 
 def test_vm_lifecycle_cleanup(sandbox: Sandbox) -> None:
-    """The VM lives and dies with the Sandbox: firecracker runs while open, and after close the process exits and the working directory is cleaned up."""
-    proc = sandbox._proc
-    workdir = sandbox._workdir
-    assert proc is not None and proc.poll() is None       # the VM is running
-    assert workdir is not None and workdir.exists()
+    """The VM lives and dies with the Sandbox: the control plane runs firecracker while
+    the sandbox is open and tears it down (process + per-VM working directory) on close.
+
+    Stage 4a is co-located (the SDK and the control plane share a host), so we can
+    observe the per-VM vsock UDS appear and then vanish with its working directory.
+    """
+    uds = pathlib.Path(sandbox._transport._uds)
+    assert uds.exists()                                   # firecracker created the vsock UDS -> the VM is up
+    with sandbox._transport.request("GET", "/health", timeout=2) as resp:
+        assert resp.status == 200                         # the in-VM daemon is alive
 
     sandbox.close()
-    assert proc.poll() is not None                        # firecracker has exited (VM destroyed)
-    assert not workdir.exists()                            # the per-VM working directory is cleaned up
+    assert not uds.parent.exists()                        # the control plane removed the per-VM working directory

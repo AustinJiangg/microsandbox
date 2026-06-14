@@ -33,6 +33,11 @@ docker build -t microsandbox-agent .   # the agent image the rootfs is exported 
 scripts/build-rootfs.sh                # export an ext4 rootfs from that image (no root needed)
 scripts/build-snapshot.sh              # optional: a warm snapshot for millisecond restore
 
+# 4) Build and start the Go control plane (Stage 4): it owns the microVM fleet, and
+#    the SDK talks to it over HTTP. Leave it running (e.g. in another terminal).
+scripts/build-control-plane.sh
+./vendor/control-plane &
+
 python examples/quickstart.py
 ```
 
@@ -41,6 +46,7 @@ Usage feels like E2B:
 ```python
 from microsandbox import Sandbox
 
+# (Start the control plane first: ./vendor/control-plane -- it owns the VM lifecycle.)
 # Cold start a microVM (~0.94s: firecracker + guest kernel boot + daemon on vsock).
 with Sandbox() as sandbox:
     ex = sandbox.run_code("print('hello from the microVM')")
@@ -77,30 +83,34 @@ microsandbox/
 ├── Dockerfile                 # the agent image (Jupyter kernel runtime) the rootfs is exported from
 ├── docs/
 │   ├── ARCHITECTURE.md        # the three-layer design (client / protocol / daemon+backend)
-│   └── MICROVM_DESIGN.md      # the microVM design (Firecracker, vsock, snapshots)
+│   ├── MICROVM_DESIGN.md      # the microVM design (Firecracker, vsock, snapshots)
+│   └── STAGE4_DESIGN.md       # Stage 4: extracting the Go control plane
 ├── src/microsandbox/
 │   ├── protocol.py            # client↔daemon wire protocol (the stable boundary)
-│   ├── client.py              # SDK: Sandbox / run_code + the vsock transport + VM lifecycle
+│   ├── client.py              # SDK: Sandbox / run_code + the vsock transport; drives the control plane over HTTP
 │   ├── server.py              # the in-VM daemon: HTTP + SSE over vsock (corresponds to E2B's envd)
 │   └── backend.py             # JupyterKernelBackend: the stateful kernel that runs inside the VM
+├── control-plane/             # the Go control plane (Stage 4): owns the microVM fleet (E2B's "infra")
 ├── scripts/
 │   ├── build-rootfs.sh        # export an ext4 rootfs from the agent image (no root needed)
-│   └── build-snapshot.sh      # build a warm Firecracker snapshot for millisecond restore
+│   ├── build-snapshot.sh      # build a warm Firecracker snapshot for millisecond restore
+│   └── build-control-plane.sh # build the Go control plane to vendor/control-plane
 ├── examples/quickstart.py
 └── tests/                     # vsock-transport unit tests + end-to-end / stateful / snapshot tests on real VMs
 ```
 
 ## How it works (one paragraph)
 
-The client (`client.py`) writes a declarative Firecracker config and starts the
-`firecracker` process — a microVM with its own guest kernel and an ext4 rootfs.
-Inside the VM, PID 1 (`/init`) execs the daemon (`server.py`), which listens on
-**vsock**. The client connects in over Firecracker's vsock Unix-domain socket
+The SDK (`client.py`) asks the **control plane** (`control-plane/`, Go) for a
+sandbox over HTTP; the control plane writes a declarative Firecracker config and
+starts the `firecracker` process — a microVM with its own guest kernel and an ext4
+rootfs. Inside the VM, PID 1 (`/init`) execs the daemon (`server.py`), which listens
+on **vsock**. The client connects in over Firecracker's vsock Unix-domain socket
 (a `CONNECT <port>` handshake, then plain HTTP/SSE), sends `/execute`, and the
-daemon hands the code to a long-lived **Jupyter kernel** (`backend.py`) and
-streams output back. The wire protocol (`protocol.py`) is the stable boundary —
-it never changed as the isolation evolved from subprocess to microVM. See
-`docs/ARCHITECTURE.md` and `docs/MICROVM_DESIGN.md`.
+daemon hands the code to a long-lived **Jupyter kernel** (`backend.py`) and streams
+output back. The wire protocol (`protocol.py`) is the stable boundary — it never
+changed as the isolation evolved from subprocess to microVM to a control-plane
+split. See `docs/ARCHITECTURE.md`, `docs/MICROVM_DESIGN.md` and `docs/STAGE4_DESIGN.md`.
 
 ## ⚠️ Safety note
 
