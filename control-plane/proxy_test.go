@@ -96,7 +96,14 @@ func TestVsockProxyStreamsSSE(t *testing.T) {
 		br := bufio.NewReader(conn)
 		br.ReadString('\n') // consume CONNECT
 		io.WriteString(conn, "OK 1024\n")
-		http.ReadRequest(br) // consume the request
+		req, _ := http.ReadRequest(br)
+		if req != nil {
+			// Drain the POST body before responding: closing the socket with unread
+			// inbound data sends an RST, which races the client's read of the SSE
+			// stream (-> "connection reset"/truncated response). Mirrors the body read
+			// the non-streaming round-trip test already does.
+			io.Copy(io.Discard, req.Body)
+		}
 		io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
 		io.WriteString(conn, "data: {\"type\":\"stdout\",\"data\":\"hello\\n\"}\n\n")
 		io.WriteString(conn, "data: {\"type\":\"end\",\"exit_code\":0}\n\n")
@@ -123,7 +130,7 @@ func TestVsockProxyStreamsSSE(t *testing.T) {
 func TestVsockRoundTripConnectRejected(t *testing.T) {
 	uds := fakeVsock(t, func(conn net.Conn) {
 		bufio.NewReader(conn).ReadString('\n') // consume CONNECT
-		io.WriteString(conn, "FAILED\n")        // simulate nothing listening on the guest port
+		io.WriteString(conn, "FAILED\n")       // simulate nothing listening on the guest port
 	})
 	rt := &vsockRoundTripper{udsPath: uds, vsockPort: 1024}
 	req, _ := http.NewRequest("GET", "http://sandbox/health", nil)
