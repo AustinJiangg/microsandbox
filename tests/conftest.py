@@ -1,10 +1,11 @@
 """Shared test infrastructure for the Firecracker microVM sandbox.
 
-Every Sandbox is a microVM, so the tests need firecracker + a guest kernel +
-rootfs under vendor/ and an accessible /dev/kvm. When any of those is missing the
-microVM fixtures skip as a group, so `pytest` still completes on machines without
-KVM (the vsock-transport unit tests in test_transport.py have no such dependency
-and always run).
+Every Sandbox is created via the Go control plane, so the tests need the go
+toolchain plus firecracker + a guest kernel + rootfs under vendor/ and an
+accessible /dev/kvm. When any of those is missing the microVM fixtures skip as a
+group, so `pytest` still completes on machines without them. The vsock bridge's
+own unit tests now live in Go (control-plane/proxy_test.go, run with
+`go test ./control-plane`) and need none of this.
 """
 
 import functools

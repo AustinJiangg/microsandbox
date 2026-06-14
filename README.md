@@ -87,7 +87,7 @@ microsandbox/
 │   └── STAGE4_DESIGN.md       # Stage 4: extracting the Go control plane
 ├── src/microsandbox/
 │   ├── protocol.py            # client↔daemon wire protocol (the stable boundary)
-│   ├── client.py              # SDK: Sandbox / run_code + the vsock transport; drives the control plane over HTTP
+│   ├── client.py              # SDK: Sandbox / run_code -- a thin pure-HTTP client to the control plane
 │   ├── server.py              # the in-VM daemon: HTTP + SSE over vsock (corresponds to E2B's envd)
 │   └── backend.py             # JupyterKernelBackend: the stateful kernel that runs inside the VM
 ├── control-plane/             # the Go control plane (Stage 4): owns the microVM fleet (E2B's "infra")
@@ -96,7 +96,7 @@ microsandbox/
 │   ├── build-snapshot.sh      # build a warm Firecracker snapshot for millisecond restore
 │   └── build-control-plane.sh # build the Go control plane to vendor/control-plane
 ├── examples/quickstart.py
-└── tests/                     # vsock-transport unit tests + end-to-end / stateful / snapshot tests on real VMs
+└── tests/                     # end-to-end / stateful / snapshot tests on real VMs (vsock-bridge unit tests are in control-plane/)
 ```
 
 ## How it works (one paragraph)
@@ -105,12 +105,14 @@ The SDK (`client.py`) asks the **control plane** (`control-plane/`, Go) for a
 sandbox over HTTP; the control plane writes a declarative Firecracker config and
 starts the `firecracker` process — a microVM with its own guest kernel and an ext4
 rootfs. Inside the VM, PID 1 (`/init`) execs the daemon (`server.py`), which listens
-on **vsock**. The client connects in over Firecracker's vsock Unix-domain socket
-(a `CONNECT <port>` handshake, then plain HTTP/SSE), sends `/execute`, and the
-daemon hands the code to a long-lived **Jupyter kernel** (`backend.py`) and streams
-output back. The wire protocol (`protocol.py`) is the stable boundary — it never
-changed as the isolation evolved from subprocess to microVM to a control-plane
-split. See `docs/ARCHITECTURE.md`, `docs/MICROVM_DESIGN.md` and `docs/STAGE4_DESIGN.md`.
+on **vsock**. The SDK then POSTs `/sandboxes/{id}/execute` to the control plane,
+which bridges it to the VM over Firecracker's vsock Unix-domain socket (a
+`CONNECT <port>` handshake, then plain HTTP/SSE) and streams the response straight
+back; the daemon hands the code to a long-lived **Jupyter kernel** (`backend.py`).
+The SDK itself is pure HTTP — the vsock handshake lives in the control plane. The
+wire protocol (`protocol.py`) is the stable boundary — it never changed as the
+isolation evolved from subprocess to microVM to a control-plane split. See
+`docs/ARCHITECTURE.md`, `docs/MICROVM_DESIGN.md` and `docs/STAGE4_DESIGN.md`.
 
 ## ⚠️ Safety note
 

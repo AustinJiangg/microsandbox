@@ -24,9 +24,9 @@ Firecracker path. **The staged journey is preserved in the git history** — see
 The core layers — see `docs/ARCHITECTURE.md` for the full design:
 
 1. **client (SDK)** — `src/microsandbox/client.py`. What the user faces:
-   `Sandbox().run_code(...)`. As of Stage 4 it no longer creates the VM itself: it
-   asks the control plane over HTTP (`POST`/`DELETE /sandboxes`), then (in Stage 4a)
-   still connects to that VM over the vsock transport (`_VsockTransport`).
+   `Sandbox().run_code(...)`. As of Stage 4 it is a thin **pure-HTTP** client: it
+   drives the control plane (`POST`/`DELETE /sandboxes`) and runs code through it
+   (`/sandboxes/{id}/...`); it holds no vsock code anymore.
 2. **protocol (wire protocol)** — `src/microsandbox/protocol.py`. The contract
    between client and daemon. **This is the most important boundary; it stayed
    byte-stable as the isolation evolved from subprocess to microVM — keep it that
@@ -50,10 +50,11 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   control channel, machine-config resource limits, no guest NIC (the sandbox code
   is fully offline while still manageable), and snapshot restore (~30ms to ready).
   See `docs/MICROVM_DESIGN.md` for the design + measured records.
-- **In progress (Stage 4 — Go control plane)**: 4a is done — VM lifecycle moved out
-  of the SDK into a standalone Go service (`control-plane/`); the SDK now drives it
-  over HTTP and still reaches the VM over vsock itself. Next is 4b: move the vsock
-  proxy + health probe into the control plane so the SDK becomes pure HTTP. See
+- **Done (Stage 4 — Go control plane)**: the VM lifecycle lives in a standalone Go
+  service (`control-plane/`). 4a moved spawn/restore/destroy there; 4b moved the
+  vsock proxy + health probe there too, so the SDK is now a thin **pure-HTTP**
+  client (no vsock left in Python) and the control plane delivers a sandbox only
+  once it is healthy. The vsock-bridge unit tests are in Go now. See
   `docs/STAGE4_DESIGN.md`.
 - **Possible next**: a warm pool (one base snapshot forked into N second-scale
   sandboxes — needs a per-VM vsock uds override), plus further productization
@@ -68,9 +69,10 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   shells out to `docker` to build the rootfs) — no Python VM library.
 - **Language: English only.** All docs, code comments, docstrings, and commit
   messages are in English. Comments explain **why**, not what.
-- Keep `tests/` all green. The vsock-transport unit tests run anywhere; the
-  end-to-end / stateful / snapshot tests run on real VMs and auto-skip when
-  firecracker / `/dev/kvm` / the vendor artifacts are missing.
+- Keep `tests/` all green. The vsock-bridge unit tests now live in Go
+  (`go test ./control-plane`, no VM/KVM needed); the Python end-to-end / stateful
+  / snapshot tests run on real VMs (driven through the control plane) and auto-skip
+  when go / firecracker / `/dev/kvm` / the vendor artifacts are missing.
 - **Safety rule**: the microVM is the first isolation strong enough to *discuss*
   untrusted code, but it is a learning implementation, **not security-audited** —
   never imply in docs or code that it is safe to expose as a service or feed
@@ -81,7 +83,7 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 ```bash
 pip install -e ".[dev]"                          # install (dev mode)
 pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs the control plane)
-pytest tests/test_transport.py -q                # the vsock unit tests (no VM/KVM/go needed)
+go test ./control-plane                          # the vsock-bridge unit tests (no VM/KVM needed)
 pytest tests/test_microvm.py::test_runs_in_microvm -v   # one real-VM end-to-end case
 
 # One-time microVM setup (see docs/MICROVM_DESIGN.md §7):

@@ -30,9 +30,9 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreate: POST /sandboxes -- spawn (or restore from snapshot) a microVM.
-// Body: {"from_snapshot": bool}. On success returns 201 {"id", "uds_path"}; in
-// Stage 4a the SDK uses uds_path to connect over vsock and waits for health
-// itself (Stage 4b moves both the proxy and the health probe in here).
+// Body: {"from_snapshot": bool}. Blocks until the VM is healthy, then returns
+// 201 {"id"}. The SDK reaches the VM only through the proxy (handleProxy), so it
+// never needs the uds path.
 func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		FromSnapshot bool `json:"from_snapshot"`
@@ -70,7 +70,7 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.sandboxes[id] = vm
 	s.mu.Unlock()
-	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "uds_path": vm.udsPath})
+	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
 // handleDestroy: DELETE /sandboxes/{id} -- kill the VM and clean up. Ported from

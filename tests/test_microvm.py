@@ -9,6 +9,8 @@ staying green as usual on other machines / CI.
 
 import pathlib
 
+import pytest
+
 from microsandbox import Sandbox
 
 
@@ -60,16 +62,17 @@ def test_machine_config_resource_limits(sandbox: Sandbox) -> None:
 
 
 def test_vm_lifecycle_cleanup(sandbox: Sandbox) -> None:
-    """The VM lives and dies with the Sandbox: the control plane runs firecracker while
-    the sandbox is open and tears it down (process + per-VM working directory) on close.
+    """The VM lives and dies with the Sandbox: it runs code while open, and after close
+    the control plane has destroyed it -- deleting it again then 404s.
 
-    Stage 4a is co-located (the SDK and the control plane share a host), so we can
-    observe the per-VM vsock UDS appear and then vanish with its working directory.
+    As of Stage 4b the SDK is pure HTTP and holds no VM-internal handles, so we assert
+    the lifecycle through the control plane's behaviour rather than poking at
+    processes / files.
     """
-    uds = pathlib.Path(sandbox._transport._uds)
-    assert uds.exists()                                   # firecracker created the vsock UDS -> the VM is up
-    with sandbox._transport.request("GET", "/health", timeout=2) as resp:
-        assert resp.status == 200                         # the in-VM daemon is alive
+    assert sandbox.run_code("print(1)").stdout.strip() == "1"   # the VM is up and running code
 
+    sandbox_id = sandbox._sandbox_id
     sandbox.close()
-    assert not uds.parent.exists()                        # the control plane removed the per-VM working directory
+    # The control plane destroyed the VM, so it no longer knows this id.
+    with pytest.raises(RuntimeError):
+        sandbox._control_plane("DELETE", f"/sandboxes/{sandbox_id}")
