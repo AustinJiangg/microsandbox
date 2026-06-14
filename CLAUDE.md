@@ -56,9 +56,15 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   client (no vsock left in Python) and the control plane delivers a sandbox only
   once it is healthy. The vsock-bridge unit tests are in Go now. See
   `docs/STAGE4_DESIGN.md`.
-- **Possible next**: a warm pool (one base snapshot forked into N second-scale
-  sandboxes — needs a per-VM vsock uds override), plus further productization
-  (templates, auth, multi-host scheduling, a TypeScript SDK).
+- **Done (Stage 5 — warm pool)**: one base snapshot now forks into N second-scale
+  sandboxes. 5a gives each restored VM its own vsock uds via Firecracker v1.16.0's
+  `vsock_override` (no snapshot rebuild), lifting the single-instance limit; 5b adds
+  a background pool (`--pool-size K`) that pre-warms K VMs and hands one out per
+  `from_snapshot` create in **~1ms** (vs ~30ms restore, ~0.94s cold). The pool is
+  control-plane-internal — the protocol and SDK are unchanged; its semantics are
+  unit-tested without KVM (`control-plane/pool_test.go`). See `docs/STAGE5_DESIGN.md`.
+- **Possible next**: further productization — templates, auth, multi-host
+  scheduling, a TypeScript SDK.
 
 ## Development conventions
 
@@ -94,7 +100,7 @@ scripts/build-snapshot.sh                        # build the warm snapshot for m
 scripts/build-control-plane.sh                   # build the Go control plane to vendor/control-plane (Stage 4)
 
 # Minimal end-to-end smoke (Stage 4: start the control plane first; needs the vendor artifacts):
-./vendor/control-plane &                         # owns the microVM fleet; the SDK talks to it over HTTP
+./vendor/control-plane &                         # owns the microVM fleet over HTTP (add --pool-size K to keep K VMs warm -> ~1ms from_snapshot creates, Stage 5)
 python -c 'from microsandbox import Sandbox; s=Sandbox(); s.run_code("x=41"); print(s.run_code("print(x+1)").stdout); s.close()'
 kill %1                                           # stop the control plane
 
