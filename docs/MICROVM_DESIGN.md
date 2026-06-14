@@ -46,35 +46,37 @@ hardware-virtualization boundary:
 
 ---
 
-## 2. How it fits together: the client owns the VM, the daemon lives inside it
+## 2. How it fits together: the control plane owns the VM, the daemon lives inside it
 
 ```
-host                                sandbox microVM (one per Sandbox)
-┌───────────────────┐              ┌──────────────────────────────────┐
-│ client (client.py)│  HTTP/SSE     │  daemon (server.py) ← E2B's envd   │
-│  start firecracker│  over vsock   │     │  listens on AF_VSOCK :1024   │
-│  connect vsock UDS│ ────────────► │     ▼                              │
-│  health probe     │ ◄──────────── │  JupyterKernelBackend (stateful)   │
-│  kill firecracker │               │     └ variables persist across run_code │
-└───────────────────┘              └──────────────────────────────────┘
-   ▲ the guest's own kernel + the KVM boundary sit on this vertical line
+host                                                  sandbox microVM (one per Sandbox)
+┌──────────────┐      ┌────────────────────────┐      ┌──────────────────────────────────┐
+│ SDK          │ HTTP │ control plane (Go)      │ vsock│  daemon (server.py) ← E2B's envd   │
+│ client.py    │ ────►│  start/kill firecracker │ ────►│     │  listens on AF_VSOCK :1024   │
+│ (pure HTTP)  │ ◄──── │  (microvm.go)           │ ◄────│     ▼                              │
+└──────────────┘      │  vsock bridge + health  │      │  JupyterKernelBackend (stateful)   │
+                      │  (proxy.go)             │      │     └ variables persist across run_code │
+                      └────────────────────────┘      └──────────────────────────────────┘
+                                                         ▲ the guest's own kernel + the KVM boundary
 ```
 
-The client (`client.py`) owns the VM lifecycle: `_spawn_microvm` writes a
-declarative config and starts `firecracker`; `_VsockTransport` connects in;
-`_wait_until_healthy` polls `/health`; `close()` kills the process and removes the
-per-VM working directory. The daemon (`server.py`) and the wire protocol
-(`protocol.py`) don't know they're inside a VM — `server.py`'s request handling
-and `backend.py`'s execution are exactly what they'd be anywhere; only the *kind
-of socket* the daemon listens on differs (`AF_VSOCK` instead of TCP). That is the
-project's core invariant: **keep the protocol bytes fixed, swap only the isolation
-and the transport underneath.**
+As of Stage 4 the **control plane** (`control-plane/`, Go) owns the VM lifecycle:
+`spawnMicroVM` writes a declarative config and starts `firecracker`; the vsock
+bridge (`proxy.go`) connects in; `waitHealthy` polls `/health` before handing the
+sandbox back; `destroy` kills the process and removes the per-VM working directory.
+The SDK (`client.py`) is now a thin pure-HTTP client that drives it. The daemon
+(`server.py`) and the wire protocol (`protocol.py`) don't know they're inside a VM —
+`server.py`'s request handling and `backend.py`'s execution are exactly what they'd
+be anywhere; only the *kind of socket* the daemon listens on differs (`AF_VSOCK`
+instead of TCP). That is the project's core invariant: **keep the protocol bytes
+fixed, swap only the isolation and the transport underneath.** (See
+`docs/STAGE4_DESIGN.md` for how the control plane was split out.)
 
 Two orthogonal concerns, worth keeping separate (see `ARCHITECTURE.md`):
-*isolation/transport* (a microVM reached over vsock — a client concern) and the
-*execution model* (a stateful Jupyter kernel — the backend concern). The microVM
-is therefore not a "backend"; it's the isolation the client creates, inside which
-the daemon runs the kernel backend.
+*isolation/transport* (a microVM reached over vsock — owned by the control plane)
+and the *execution model* (a stateful Jupyter kernel — the backend concern). The
+microVM is therefore not a "backend"; it's the isolation the control plane creates,
+inside which the daemon runs the kernel backend.
 
 ---
 
@@ -85,7 +87,7 @@ port)` rather than `(IP, port)`: the guest's CID is 3, the host is fixed at 2.
 Firecracker **multiplexes the guest's vsock onto a single Unix domain socket (UDS)
 on the host**, with a text handshake:
 
-- **host → guest (the direction the client wants)**: the client connects to the
+- **host → guest (the direction we need)**: the control plane connects to the
   host UDS (e.g. `/tmp/microsandbox-vm-xxxx/fc.vsock`), sends a line `CONNECT
   <port>\n` (e.g. `CONNECT 1024`), Firecracker replies `OK <hostport>\n`, and from
   then on this byte stream is wired through to the process **listening on
@@ -103,17 +105,20 @@ s.bind((socket.VMADDR_CID_ANY, 1024))   # listen on this VM's port 1024
 server = await asyncio.start_server(self.handle, sock=s)   # handle is transport-agnostic
 ```
 
-On the host side (`client.py`'s `_VsockTransport`), `urllib` can't do this
-handshake, so we hand-write a minimal HTTP/1.1 client over the raw socket:
+On the host side (`control-plane/proxy.go`), Go's `net/http` can't dial this
+handshake, so the control plane hand-rolls it in a `RoundTripper`:
 
-```python
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect(uds_path)
-sock.sendall(b"CONNECT 1024\n")
-# read "OK <port>\n", confirm the handshake succeeded
-# then write "POST /execute HTTP/1.1\r\n...\r\n\r\n<body>",
-# and stream the response back per Content-Length / text/event-stream, yielding line by line.
+```go
+conn, _ := net.Dial("unix", udsPath)
+fmt.Fprintf(conn, "CONNECT 1024\n")                       // then read back "OK <port>\n" to confirm
+req.Write(conn)                                            // "POST /execute HTTP/1.1\r\n...\r\n\r\n<body>"
+resp, _ := http.ReadResponse(bufio.NewReader(conn), req)  // stream SSE / read JSON back
 ```
+
+A reverse proxy wraps that transport, so `POST /sandboxes/{id}/execute` from the SDK
+is bridged to `/execute` inside the guest, with the daemon's SSE streamed straight
+back. (Before Stage 4 this lived in the SDK as `_VsockTransport`; the protocol bytes
+are unchanged — only the language and the location moved.)
 
 ---
 
@@ -180,15 +185,16 @@ one by one) and `--config-file` (a single JSON declaring everything). We use
 }
 ```
 
-`client._spawn_microvm` creates a per-VM working directory → writes the above config
-(uds/paths all inside that directory) → `subprocess.Popen(["firecracker",
-"--config-file", cfg, "--api-sock", api])` → `_wait_until_healthy` (over vsock) →
-on `close`, `proc.terminate()`/`kill()` + delete the working directory. Killing the
-firecracker process destroys the entire VM, so cleanup is trivially that simple.
+The control plane's `spawnMicroVM` (`microvm.go`) creates a per-VM working directory
+→ writes the above config (uds/paths all inside that directory) →
+`exec.Command("firecracker", "--config-file", cfg, "--api-sock", api)` → `waitHealthy`
+(over vsock) → on `destroy`, terminate/kill the process + delete the working
+directory. Killing the firecracker process destroys the entire VM, so cleanup is
+trivially that simple.
 
 Snapshot load/create can't be expressed via `--config-file` and must go through the
-REST API; `client._restore_microvm` drives it with `_firecracker_api` (HTTP over
-`AF_UNIX`) — see §8.
+REST API; `restoreMicroVM` drives it with `firecrackerAPI` (HTTP over `AF_UNIX`) —
+see §8.
 
 ---
 
@@ -232,10 +238,12 @@ scripts/build-rootfs.sh                # export the ext4 rootfs (no root needed)
 scripts/build-snapshot.sh              # optional: a warm snapshot for millisecond restore
 ```
 
-`tests/conftest.py` guards the VM cases on "firecracker binary + vmlinux present
-and `/dev/kvm` readable/writable"; if any is missing, the VM cases skip as a group
-(the vsock-transport unit tests in `tests/test_transport.py` need none of this and
-always run). On machines without KVM, `pytest` therefore still completes.
+`tests/conftest.py` builds + runs the control plane for the VM cases and guards them
+on "go toolchain + firecracker binary + vmlinux present and `/dev/kvm`
+readable/writable"; if any is missing, the VM cases skip as a group. The vsock-bridge
+unit tests now live in Go (`control-plane/proxy_test.go`, run with
+`go test ./control-plane`) and need none of this. On machines without KVM, `pytest`
+therefore still completes.
 
 ---
 
@@ -270,20 +278,20 @@ and on restore skip the kernel boot for millisecond-scale readiness.
   kernel (run a `pass` to force it up) → `PATCH /vm {Paused}` → `PUT
   /snapshot/create {Full}`. Two artifacts: `vendor/snapshot/vmstate` (~13KB
   device/CPU state) + `memfile` (512MB guest memory, **including the hot kernel**).
-- **Restore** (`Sandbox(from_snapshot=True)` → `_restore_microvm`): start an empty
-  firecracker → drive the state back in via `PUT /snapshot/load` + `resume_vm` (over
-  the REST API, since `--config-file` can't express it).
+- **Restore** (`Sandbox(from_snapshot=True)` → the control plane's `restoreMicroVM`):
+  start an empty firecracker → drive the state back in via `PUT /snapshot/load` +
+  `resume_vm` (over the REST API, since `--config-file` can't express it).
 - **Measured comparison**:
 
   | Path | Ready | First run_code | To first result |
   |------|-------|----------------|-----------------|
-  | Cold start (`_spawn_microvm`) | ~0.94s | ~0.8s (incl. kernel cold start) | ~1.77s |
-  | Snapshot restore (`_restore_microvm`) | **~0.03–0.04s** | ~0.13s (kernel already hot) | **~0.17s** |
+  | Cold start (`spawnMicroVM`) | ~0.94s | ~0.8s (incl. kernel cold start) | ~1.77s |
+  | Snapshot restore (`restoreMicroVM`) | **~0.03–0.04s** | ~0.13s (kernel already hot) | **~0.17s** |
 
   To first result, about **10× faster**; readiness itself about 30×.
 - **Disk**: a snapshot stores only memory + device state — the disk contents are
   still provided by the host's `rootfs.ext4`, so on restore it must still be at the
-  original path (which is why `_restore_microvm` still validates the rootfs).
+  original path (which is why `restoreMicroVM` still validates the rootfs).
 - **Known limitation (single instance)**: the vsock uds path in the snapshot is
   fixed, so only one VM can be restored at a time. Concurrent restore + a warm pool
   (one base snapshot forked into N second-scale sandboxes) needs a per-VM uds
