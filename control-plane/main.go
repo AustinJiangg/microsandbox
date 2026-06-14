@@ -34,7 +34,7 @@ func main() {
 	mux.HandleFunc("GET /health", srv.handleHealth)
 	mux.HandleFunc("POST /sandboxes", srv.handleCreate)
 	mux.HandleFunc("DELETE /sandboxes/{id}", srv.handleDestroy)
-	mux.HandleFunc("/sandboxes/{id}/", srv.handleProxy)
+	mux.HandleFunc("/sandboxes/{id}/{rest...}", srv.handleProxy)
 
 	httpServer := &http.Server{Addr: *addr, Handler: mux}
 

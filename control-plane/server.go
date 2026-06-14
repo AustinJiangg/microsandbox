@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // server owns the microVM fleet. Stage 4a fills in create/destroy; Stage 4b
@@ -54,6 +56,17 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ready on delivery: block until the in-VM daemon answers /health, so the SDK
+	// gets back an id only once the sandbox can actually run code. On failure the VM
+	// would otherwise leak, so destroy it and report the guest serial tail.
+	if err := waitHealthy(vm.udsPath, vsockPort, 10*time.Second); err != nil {
+		tail := vm.consoleTail()
+		vm.destroy()
+		writeJSON(w, http.StatusInternalServerError,
+			map[string]string{"error": fmt.Sprintf("sandbox %v; %s", err, tail)})
+		return
+	}
+
 	s.mu.Lock()
 	s.sandboxes[id] = vm
 	s.mu.Unlock()
@@ -78,10 +91,20 @@ func (s *server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleProxy: ANY /sandboxes/{id}/... -- transparent vsock bridge to the in-VM
-// daemon. (Stage 4b.)
+// handleProxy: ANY /sandboxes/{id}/<rest> -- transparently bridge the request to
+// the in-VM daemon at /<rest> over vsock (the data path: /execute, /files/*,
+// /commands). The control plane stays protocol-agnostic here -- it pipes bytes, so
+// protocol.py remains the single source of truth.
 func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "proxy not implemented yet"})
+	id := r.PathValue("id")
+	s.mu.Lock()
+	vm, ok := s.sandboxes[id]
+	s.mu.Unlock()
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such sandbox: " + id})
+		return
+	}
+	vsockProxy(vm.udsPath, vsockPort, r.PathValue("rest")).ServeHTTP(w, r)
 }
 
 // destroyAll terminates every running VM. Called on shutdown so nothing leaks.
