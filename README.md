@@ -13,11 +13,11 @@ inside the VM (variables persist across `run_code`, like E2B).
 > container → resident in-container agent → microVM — as a way to understand each
 > isolation technique. Those earlier backends were learning scaffolding; now that
 > the microVM works they have been removed, leaving only the Firecracker path. The
-> full staged journey is preserved in the git history.
+> full staged journey is preserved in the git history (tag `archive/stages-0-3`).
 
 ## Quick start
 
-One-time setup (see `docs/STAGE3_DESIGN.md` §6/§7 for details):
+One-time setup (see `docs/MICROVM_DESIGN.md` §7 for details):
 
 ```bash
 pip install -e ".[dev]"
@@ -77,7 +77,7 @@ microsandbox/
 ├── Dockerfile                 # the agent image (Jupyter kernel runtime) the rootfs is exported from
 ├── docs/
 │   ├── ARCHITECTURE.md        # the three-layer design (client / protocol / daemon+backend)
-│   └── STAGE3_DESIGN.md       # the microVM design journal (Firecracker, vsock, snapshots)
+│   └── MICROVM_DESIGN.md      # the microVM design (Firecracker, vsock, snapshots)
 ├── src/microsandbox/
 │   ├── protocol.py            # client↔daemon wire protocol (the stable boundary)
 │   ├── client.py              # SDK: Sandbox / run_code + the vsock transport + VM lifecycle
@@ -100,7 +100,7 @@ Inside the VM, PID 1 (`/init`) execs the daemon (`server.py`), which listens on
 daemon hands the code to a long-lived **Jupyter kernel** (`backend.py`) and
 streams output back. The wire protocol (`protocol.py`) is the stable boundary —
 it never changed as the isolation evolved from subprocess to microVM. See
-`docs/ARCHITECTURE.md` and `docs/STAGE3_DESIGN.md`.
+`docs/ARCHITECTURE.md` and `docs/MICROVM_DESIGN.md`.
 
 ## ⚠️ Safety note
 

@@ -3,8 +3,8 @@ a request.
 
 There is exactly one implementation now -- `JupyterKernelBackend`, a long-lived
 Jupyter (IPython) kernel hosted inside the daemon. It runs *inside the Firecracker
-microVM*: the client starts the VM, the in-VM daemon (server.py) starts with
-`--backend kernel`, and this class is what gets instantiated.
+microVM*: the client starts the VM, and the in-VM daemon (server.py) instantiates
+this class as its sole execution backend.
 
 We keep the abstract base class `ExecutionBackend` so the daemon depends only on
 the interface, not the concrete kernel implementation. Historically there were
@@ -63,7 +63,7 @@ class JupyterKernelBackend(ExecutionBackend):
 
     Coordination: the client starts a Firecracker microVM (its rootfs is exported
     from the agent image, which pre-installs ipykernel/jupyter_client); the in-VM
-    daemon starts with --backend kernel, and what gets instantiated is this class.
+    daemon instantiates this class as its execution backend.
 
     Communication mechanism: via jupyter_client, speak the Jupyter message
     protocol to the kernel subprocess over ZMQ --

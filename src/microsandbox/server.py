@@ -281,7 +281,7 @@ class SandboxServer:
     async def serve(self, *, vsock_port: int = 1024) -> None:
         # The daemon runs inside a Firecracker microVM, so the control channel is
         # vsock (the host connects in via Firecracker's UDS, see
-        # docs/STAGE3_DESIGN.md §4.1). Apart from "which kind of socket to listen
+        # docs/MICROVM_DESIGN.md §3). Apart from "which kind of socket to listen
         # on", handle / dispatch / backend are all unchanged -- exactly the
         # embodiment of "stable protocol, swappable transport".
         #
@@ -305,18 +305,10 @@ def main() -> None:
         description="microsandbox daemon (runs inside the Firecracker microVM)"
     )
     parser.add_argument("--log-level", default="INFO")
-    # The daemon now only ever runs inside the microVM: the control channel is
-    # vsock and the execution backend is the stateful Jupyter kernel. These flags
-    # are kept single-valued (rather than dropped) so the rootfs /init invocation
-    # stays stable and self-documenting -- see scripts/build-rootfs.sh.
-    parser.add_argument(
-        "--transport", choices=["vsock"], default="vsock",
-        help="control channel (fixed: HTTP over vsock)",
-    )
-    parser.add_argument(
-        "--backend", choices=["kernel"], default="kernel",
-        help="execution backend (fixed: resident Jupyter kernel, stateful REPL)",
-    )
+    # The daemon only ever runs inside the microVM: the control channel is always
+    # vsock and the execution backend is always the stateful Jupyter kernel, so
+    # neither is a flag. --vsock-port is the one genuine knob (client and daemon
+    # must agree on it).
     parser.add_argument(
         "--vsock-port", type=int, default=1024,
         help="the vsock port the daemon listens on (the client side CONNECTs to it)",

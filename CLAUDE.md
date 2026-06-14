@@ -16,8 +16,8 @@ boundary, control channel over **vsock**, and a stateful Jupyter kernel inside t
 VM. The project was originally built up in stages (host subprocess → Docker
 container → resident container → microVM) to learn each isolation technique; those
 earlier backends were scaffolding and have since been removed, leaving only the
-Firecracker path. **The staged journey is preserved in the git history** — look
-there (not in the current tree) for how the earlier stages worked.
+Firecracker path. **The staged journey is preserved in the git history** — see the
+`archive/stages-0-3` tag (not the current tree) for how the earlier stages worked.
 
 ## Core architecture (keep it stable)
 
@@ -44,7 +44,7 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 - **Done**: the Firecracker microVM works end to end — cold start ~0.94s, vsock
   control channel, machine-config resource limits, no guest NIC (the sandbox code
   is fully offline while still manageable), and snapshot restore (~30ms to ready).
-  See `docs/STAGE3_DESIGN.md` for the design + measured records.
+  See `docs/MICROVM_DESIGN.md` for the design + measured records.
 - **Possible next**: a warm pool (one base snapshot forked into N second-scale
   sandboxes — needs a per-VM vsock uds override), plus productization (templates,
   auth, a control plane). None started.
@@ -74,7 +74,7 @@ pytest                                           # run tests (VM cases auto-skip
 pytest tests/test_transport.py -q                # the vsock unit tests (no VM/KVM needed)
 pytest tests/test_microvm.py::test_runs_in_microvm -v   # one real-VM end-to-end case
 
-# One-time microVM setup (see docs/STAGE3_DESIGN.md §6/§7):
+# One-time microVM setup (see docs/MICROVM_DESIGN.md §7):
 sudo usermod -aG kvm "$USER"                     # then `wsl --shutdown` and reopen, to open /dev/kvm without sudo
 docker build -t microsandbox-agent .             # the agent image the rootfs is exported from
 scripts/build-rootfs.sh                          # export the ext4 rootfs from the agent image (no root)

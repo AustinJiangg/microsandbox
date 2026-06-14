@@ -2,7 +2,7 @@
 # Stage 3c: produce a "warm snapshot" -- boot a microVM, warm up the Jupyter kernel, pause, then take a Full snapshot.
 #
 # The outputs vendor/snapshot/{vmstate,memfile} let Sandbox(backend="microvm", from_snapshot=True)
-# restore in milliseconds: skipping the kernel boot + the Jupyter kernel cold start (see docs/STAGE3_DESIGN.md §9).
+# restore in milliseconds: skipping the kernel boot + the Jupyter kernel cold start (see docs/MICROVM_DESIGN.md §8).
 #
 # The snapshot stores only "memory + device/CPU state"; the disk contents are still provided by the host's rootfs.ext4 -- so on restore
 # rootfs.ext4 must still be at its original path. The vsock uds is fixed at vendor/snapshot/fc.vsock (recreated on restore).
@@ -16,7 +16,7 @@ UDS="$SNAP/fc.vsock"
 
 command -v curl >/dev/null || { echo "curl is required to drive the Firecracker API" >&2; exit 1; }
 for f in "$FC" "$KERNEL" "$ROOTFS"; do
-  [ -e "$f" ] || { echo "missing artifact $f (see docs/STAGE3_DESIGN.md §6; for rootfs run build-rootfs.sh first)" >&2; exit 1; }
+  [ -e "$f" ] || { echo "missing artifact $f (see docs/MICROVM_DESIGN.md §7; for rootfs run build-rootfs.sh first)" >&2; exit 1; }
 done
 { [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || { echo "no access to /dev/kvm (join the kvm group, then restart WSL)" >&2; exit 1; }
 
@@ -25,7 +25,7 @@ BASE="$(mktemp -d)"
 
 cat > "$BASE/config.json" <<EOF
 { "boot-source": { "kernel_image_path": "$KERNEL",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init MSBACKEND=kernel" },
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init" },
   "drives": [ { "drive_id": "rootfs", "path_on_host": "$ROOTFS", "is_root_device": true, "is_read_only": true } ],
   "machine-config": { "vcpu_count": 1, "mem_size_mib": 512 },
   "vsock": { "guest_cid": 3, "uds_path": "$UDS" } }

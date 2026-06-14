@@ -24,4 +24,4 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # No ENTRYPOINT/CMD: this image is exported into a rootfs, where the microVM's
 # /init (written by scripts/build-rootfs.sh) starts the daemon
-# (python -m microsandbox.server --transport vsock --backend kernel).
+# (python -m microsandbox.server --vsock-port 1024).

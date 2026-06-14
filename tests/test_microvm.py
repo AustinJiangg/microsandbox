@@ -2,8 +2,8 @@
 
 Runs inside a real microVM: a separate guest kernel + KVM boundary, control
 channel over vsock, with not a single line changed in the daemon or protocol.
-Requires firecracker + vmlinux + rootfs.ext4 under vendor/ (see docs/STAGE3_DESIGN.md
-§6/§7) and an accessible /dev/kvm; if any is missing the whole group is skipped,
+Requires firecracker + vmlinux + rootfs.ext4 under vendor/ (see docs/MICROVM_DESIGN.md
+§7) and an accessible /dev/kvm; if any is missing the whole group is skipped,
 staying green as usual on other machines / CI.
 """
 

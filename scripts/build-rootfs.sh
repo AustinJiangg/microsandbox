@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Stage 3b: export the agent image into an ext4 rootfs for the Firecracker microVM (entirely without root).
 #
-# Approach (see docs/STAGE3_DESIGN.md §4.2/4.3):
+# Approach (see docs/MICROVM_DESIGN.md §4):
 #   1. docker export reuses the entire filesystem of the microsandbox-agent image built in Stage 2
 #      (which already contains Python + ipykernel + jupyter_client);
 #   2. inject our src/ (Stage 2 mounts it at runtime, but there is no such mount inside the VM, so it must live in the rootfs);
-#   3. write a minimal /init as PID 1: after mounting the pseudo-filesystems, exec our daemon (--transport vsock);
+#   3. write a minimal /init as PID 1: after mounting the pseudo-filesystems, exec our daemon (listening on vsock);
 #   4. use `mkfs.ext4 -d <dir>` to pack the directory straight into an ext4 image -- no mount needed, hence without root.
 #
 # Why being without root matters: the current user on this host can run docker / mkfs.ext4, but sudo prompts for a password. `mkfs.ext4 -d`
@@ -50,23 +50,17 @@ cat > "$STAGING/init" <<'INIT'
 mount -t proc     proc /proc 2>/dev/null
 mount -t sysfs    sys  /sys  2>/dev/null
 mount -t devtmpfs dev  /dev  2>/dev/null   # the kernel most likely already mounted it (DEVTMPFS_MOUNT=y); failure is harmless
-mount -t tmpfs    tmp  /tmp  2>/dev/null    # the only writable area (the root is a read-only rootfs), matching Stage 2's /tmp
-
-# The execution backend is read from the kernel cmdline (the client passes MSBACKEND=... via boot_args); default is kernel (stateful).
-backend=kernel
-for tok in $(cat /proc/cmdline 2>/dev/null); do
-  case "$tok" in MSBACKEND=*) backend="${tok#MSBACKEND=}" ;; esac
-done
+mount -t tmpfs    tmp  /tmp  2>/dev/null    # the only writable area (the root is a read-only rootfs)
 
 # PATH must be set explicitly: under a minimal init PATH may be empty, so sh cannot find commands, and python cannot compute
-# sys.executable (the local backend needs it to spawn subprocesses; the shell in commands.run also needs PATH).
+# sys.executable (commands.run's shell and the Jupyter kernel both need a real PATH).
 export PATH=/usr/local/bin:/usr/bin:/bin
 export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/opt/microsandbox/src
-echo "[init] microsandbox daemon: transport=vsock port=1024 backend=$backend"
-# exec with an absolute path: ensures python's sys.executable is a real path rather than an empty string (otherwise the local backend's
-# create_subprocess_exec("") raises PermissionError).
+echo "[init] microsandbox daemon: vsock port 1024, kernel backend"
+# exec with an absolute path: ensures python's sys.executable is a real path rather than an empty string
+# (otherwise subprocess spawning from the daemon raises PermissionError).
 PY="$(command -v python3)"
-exec "$PY" -m microsandbox.server --transport vsock --vsock-port 1024 --backend "$backend"
+exec "$PY" -m microsandbox.server --vsock-port 1024
 INIT
 chmod +x "$STAGING/init"
 
