@@ -1,4 +1,4 @@
-"""Stage 3c tests: Firecracker snapshot restore (millisecond cold start).
+"""Snapshot restore tests: Firecracker snapshot restore (millisecond cold start).
 
 Restore a microVM from a pre-warmed snapshot (containing an already-ready Jupyter
 kernel) -- skipping kernel boot and kernel cold start. Requires
@@ -6,12 +6,14 @@ vendor/snapshot/{vmstate,memfile} (produced by scripts/build-snapshot.sh, built 
 demand if absent) + an accessible /dev/kvm; if firecracker/kernel are missing the
 whole group is skipped.
 
-Note: the snapshot's vsock uds path is fixed, so only one can be restored at a time
-(pytest runs in order by default, so this is fine). Concurrent restore + a warm pool
-belong to Stage 4.
+As of Stage 5a several sandboxes can be restored from the one snapshot at once: the
+control plane overrides the snapshot's baked-in vsock uds per VM (vsock_override), so
+each gets its own socket. test_concurrent_restores_are_isolated exercises that -- the
+prerequisite for the warm pool (Stage 5b). See docs/STAGE5_DESIGN.md.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from microsandbox import Sandbox
 
@@ -44,3 +46,35 @@ def test_restore_is_fast(snapshot_ready) -> None:
     finally:
         sb.close()
     assert ready < 0.6, f"restore-to-ready took {ready * 1000:.0f}ms, exceeding expectation (cold start is only ~940ms)"
+
+
+def test_concurrent_restores_are_isolated(snapshot_ready) -> None:
+    """Restore several sandboxes from the one snapshot *concurrently*, give each a
+    distinct variable, then read them all back -- proving the restores coexist as
+    independent VMs (own kernel, own vsock socket) with no cross-talk. Before Stage 5a
+    the snapshot's baked-in socket path was shared, so this raced and could not be done.
+    """
+    n = 3
+    base_url = snapshot_ready
+
+    def restore(_: int) -> Sandbox:
+        return Sandbox(from_snapshot=True, base_url=base_url)
+
+    # Restore concurrently -- the path that collided on the shared baked socket pre-5a.
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        boxes = list(pool.map(restore, range(n)))
+    try:
+        # Distinct control-plane ids => genuinely distinct VMs.
+        assert len({sb._sandbox_id for sb in boxes}) == n
+
+        # Set a unique value in each, then read them all back in a second pass: a shared
+        # kernel would surface as one VM's write leaking into the others.
+        for i, sb in enumerate(boxes):
+            assert sb.run_code(f"x = {i * 100 + 7}").success
+        for i, sb in enumerate(boxes):
+            ex = sb.run_code("print(x)")
+            assert ex.success
+            assert ex.stdout.strip() == str(i * 100 + 7), f"box {i} saw {ex.stdout!r} -- cross-talk?"
+    finally:
+        for sb in boxes:
+            sb.close()

@@ -116,9 +116,11 @@ func spawnMicroVM(id, vendorDir string) (*microVM, error) {
 // restoreMicroVM restores a microVM from a pre-generated snapshot (~30ms to
 // ready vs ~0.94s cold start). Ported from client.py's _restore_microvm.
 //
-// Known limitation (single-instance): the vsock uds path is baked into the
-// snapshot (vendor/snapshot/fc.vsock), so only one can be restored at a time.
-// A per-VM uds override is future work (the warm pool, Stage 5).
+// The snapshot bakes in a fixed vsock uds path (vendor/snapshot/fc.vsock), which
+// alone would limit us to one restore at a time. We override it per-VM at load
+// time via Firecracker v1.16.0's vsock_override, so N VMs can be restored from the
+// one snapshot -- each listening on its own workdir/fc.vsock. This is the basis for
+// the warm pool (Stage 5). See docs/STAGE5_DESIGN.md.
 func restoreMicroVM(id, vendorDir string) (*microVM, error) {
 	if err := checkAvailable(vendorDir); err != nil {
 		return nil, err
@@ -126,7 +128,6 @@ func restoreMicroVM(id, vendorDir string) (*microVM, error) {
 	snap := filepath.Join(vendorDir, "snapshot")
 	vmstate := filepath.Join(snap, "vmstate")
 	memfile := filepath.Join(snap, "memfile")
-	uds := filepath.Join(snap, "fc.vsock") // fixed path baked into the snapshot
 	if _, err := os.Stat(vmstate); err != nil {
 		return nil, fmt.Errorf("missing snapshot (%s); run scripts/build-snapshot.sh first", snap)
 	}
@@ -139,7 +140,10 @@ func restoreMicroVM(id, vendorDir string) (*microVM, error) {
 		return nil, err
 	}
 	apiSock := filepath.Join(workdir, "api.sock")
-	os.Remove(uds) // clear a stale socket from a previous restore; firecracker re-listens on this fixed path
+	// This VM's own vsock socket, inside its private workdir. We override the path
+	// baked into the snapshot at load time (below), so concurrent restores never
+	// collide on a shared socket.
+	uds := filepath.Join(workdir, "fc.vsock")
 
 	vm, err := startFirecracker(id, vendorDir, workdir, uds, "--api-sock", apiSock)
 	if err != nil {
@@ -149,9 +153,10 @@ func restoreMicroVM(id, vendorDir string) (*microVM, error) {
 
 	// Snapshot load + resume can't go through --config-file, so use the REST API.
 	status, err := firecrackerAPI(apiSock, "PUT", "/snapshot/load", map[string]any{
-		"snapshot_path": vmstate,
-		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": memfile},
-		"resume_vm":     true,
+		"snapshot_path":  vmstate,
+		"mem_backend":    map[string]any{"backend_type": "File", "backend_path": memfile},
+		"vsock_override": map[string]any{"uds_path": uds}, // v1.16.0: per-VM uds, overriding the snapshot's baked path
+		"resume_vm":      true,
 	}, 15*time.Second)
 	if err != nil || (status != 200 && status != 204) {
 		tail := vm.consoleTail()

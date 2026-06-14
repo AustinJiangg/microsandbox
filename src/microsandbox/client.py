@@ -47,8 +47,9 @@ class Sandbox:
         timeout_seconds: per-execution timeout passed to the daemon.
         from_snapshot: if True, ask the control plane to restore from a pre-warmed
             snapshot in milliseconds (skipping kernel boot + Jupyter kernel cold start,
-            ~30ms to ready vs ~0.94s cold start). Run scripts/build-snapshot.sh first;
-            currently single-instance (the snapshot's vsock uds path is fixed).
+            ~30ms to ready vs ~0.94s cold start). Run scripts/build-snapshot.sh first.
+            Several sandboxes can be restored from the one snapshot concurrently -- the
+            control plane gives each VM its own vsock socket (Stage 5a).
         base_url: where the Go control plane is reachable. Defaults to the
             MICROSANDBOX_URL env var, then http://127.0.0.1:8080.
 
