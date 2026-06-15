@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,26 +16,77 @@ import (
 // split) and docs/STAGE5_DESIGN.md (the warm pool).
 type server struct {
 	vendorDir string
-	pool      *pool // warm pool for from_snapshot creates; nil when --pool-size 0
+	pools     map[string]*pool // template name -> its warm pool; empty when no --pool/--pool-size
 
 	mu        sync.Mutex          // guards sandboxes
 	sandboxes map[string]*microVM // sandbox id -> running VM
 }
 
-// newServer builds the server and, when poolSize > 0, a warm pool that pre-restores
-// that many snapshot VMs in the background (each already health-probed). poolSize 0
-// keeps the original behavior of restoring on the request path. The pool's "make one
-// VM" step is restoreHealthy -- the very same one the unpooled from_snapshot path uses.
-func newServer(vendorDir string, poolSize int) *server {
-	s := &server{vendorDir: vendorDir, sandboxes: map[string]*microVM{}}
-	if poolSize > 0 {
-		// 6a: the pool pre-warms the default template; 6c makes this a per-template
-		// map. resolveTemplate(default) never errors.
-		def, _ := resolveTemplate(vendorDir, defaultTemplate)
-		s.pool = newPool(poolSize, func() (*microVM, error) { return restoreHealthy(vendorDir, def) })
-		s.pool.start()
+// newServer builds the server and one warm pool per entry in poolSpecs (template name
+// -> K): each pre-restores K snapshot VMs in the background, already health-probed, so
+// a from_snapshot create for that template is served in ~ms. An empty poolSpecs keeps
+// the original behavior of restoring on the request path. The pool's "make one VM"
+// step is restoreHealthy -- the same one the unpooled from_snapshot path uses.
+func newServer(vendorDir string, poolSpecs map[string]int) *server {
+	s := &server{vendorDir: vendorDir, sandboxes: map[string]*microVM{}, pools: map[string]*pool{}}
+	for name, k := range poolSpecs {
+		// name was validated by parsePoolSpecs, so resolve cannot fail. tmpl is a
+		// fresh per-iteration variable, so each closure captures its own template.
+		tmpl, _ := resolveTemplate(vendorDir, name)
+		p := newPool(k, func() (*microVM, error) { return restoreHealthy(vendorDir, tmpl) })
+		s.pools[name] = p
+		p.start()
 	}
 	return s
+}
+
+// poolFor returns the warm pool for a template, or nil if that template isn't pooled.
+func (s *server) poolFor(tmpl template) *pool { return s.pools[tmpl.name] }
+
+// repeatedFlag collects a flag passed more than once (--pool a=1 --pool b=2).
+type repeatedFlag []string
+
+func (r *repeatedFlag) String() string     { return strings.Join(*r, ",") }
+func (r *repeatedFlag) Set(v string) error { *r = append(*r, v); return nil }
+
+// parsePoolSpecs turns the CLI pool flags into a {template name -> warm count} map.
+// --pool-size K is shorthand for the default template; --pool name=K (repeatable) sets
+// a named one. A bad format, a non-positive K, an invalid template name, or the same
+// template named twice (including default given via both flags) is a startup error.
+func parsePoolSpecs(poolFlags []string, poolSize int) (map[string]int, error) {
+	out := map[string]int{}
+	add := func(name string, k int) error {
+		if _, dup := out[name]; dup {
+			return fmt.Errorf("template %q given more than one pool size", name)
+		}
+		if k <= 0 {
+			return fmt.Errorf("pool size for %q must be > 0, got %d", name, k)
+		}
+		if _, err := resolveTemplate("", name); err != nil { // validate the name (path-independent)
+			return err
+		}
+		out[name] = k
+		return nil
+	}
+	if poolSize > 0 {
+		if err := add(defaultTemplate, poolSize); err != nil {
+			return nil, err
+		}
+	}
+	for _, spec := range poolFlags {
+		name, val, ok := strings.Cut(spec, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid --pool %q: want name=K", spec)
+		}
+		k, err := strconv.Atoi(val)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --pool %q: K must be an integer", spec)
+		}
+		if err := add(name, k); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // handleHealth is the control plane's *own* liveness, not a VM's. The SDK uses
@@ -98,13 +151,14 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serve from a warm pool only if this template has one; otherwise restore/spawn
+	// its own image inline. A pooled VM is always the right image -- each pool restores
+	// from its template's own snapshot (newServer).
+	p := s.poolFor(tmpl)
 	var vm *microVM
 	switch {
-	// The warm pool currently holds only default-template VMs (6c makes it per
-	// template), so serve from it only for a default from_snapshot create -- a
-	// non-default template must restore its own image, never a pooled default one.
-	case req.FromSnapshot && s.pool != nil && tmpl.name == defaultTemplate:
-		vm, err = s.pool.get()
+	case req.FromSnapshot && p != nil:
+		vm, err = p.get()
 	case req.FromSnapshot:
 		vm, err = restoreHealthy(s.vendorDir, tmpl)
 	default:
@@ -155,11 +209,11 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	vsockProxy(vm.udsPath, vsockPort, r.PathValue("rest")).ServeHTTP(w, r)
 }
 
-// destroyAll terminates every running VM -- the warm pool's idle VMs first, then the
+// destroyAll terminates every running VM -- the warm pools' idle VMs first, then the
 // active ones in the registry. Called on shutdown so nothing leaks.
 func (s *server) destroyAll() {
-	if s.pool != nil {
-		s.pool.drain()
+	for _, p := range s.pools {
+		p.drain()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
