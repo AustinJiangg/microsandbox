@@ -46,13 +46,16 @@ func newID() string {
 	return "sb_" + hex.EncodeToString(b)
 }
 
-// checkAvailable surfaces environment problems before startup with actionable
-// guidance. Ported from client.py's _check_microvm_available.
-func checkAvailable(vendorDir string) error {
+// checkHostArtifacts surfaces template-independent environment problems before
+// startup with actionable guidance: the firecracker binary, the guest kernel, and
+// an accessible /dev/kvm. The per-template rootfs / snapshot are checked separately
+// by spawnMicroVM / restoreMicroVM against the resolved template (Stage 6) -- they
+// now live under vendor/templates/<name>/ rather than at one fixed path. Ported from
+// client.py's _check_microvm_available.
+func checkHostArtifacts(vendorDir string) error {
 	for _, f := range []struct{ path, hint string }{
 		{filepath.Join(vendorDir, "firecracker"), "see docs/MICROVM_DESIGN.md §7 for setup"},
 		{filepath.Join(vendorDir, "vmlinux"), "see docs/MICROVM_DESIGN.md §7 for setup"},
-		{filepath.Join(vendorDir, "rootfs.ext4"), "run scripts/build-rootfs.sh first"},
 	} {
 		if _, err := os.Stat(f.path); err != nil {
 			return fmt.Errorf("missing %s; %s", f.path, f.hint)
@@ -68,11 +71,15 @@ func checkAvailable(vendorDir string) error {
 	return nil
 }
 
-// spawnMicroVM cold-starts a Firecracker microVM with the daemon running inside,
-// exposed via vsock. Ported from client.py's _spawn_microvm.
-func spawnMicroVM(id, vendorDir string) (*microVM, error) {
-	if err := checkAvailable(vendorDir); err != nil {
+// spawnMicroVM cold-starts a Firecracker microVM (from the template's rootfs) with
+// the daemon running inside, exposed via vsock. Ported from client.py's _spawn_microvm.
+func spawnMicroVM(id, vendorDir string, tmpl template) (*microVM, error) {
+	if err := checkHostArtifacts(vendorDir); err != nil {
 		return nil, err
+	}
+	if _, err := os.Stat(tmpl.rootfs); err != nil {
+		return nil, fmt.Errorf("missing rootfs %s for template %q; run scripts/build-rootfs.sh"+
+			" (or scripts/build-template.sh %s) first", tmpl.rootfs, tmpl.name, tmpl.name)
 	}
 	workdir, err := os.MkdirTemp("", "microsandbox-vm-")
 	if err != nil {
@@ -90,7 +97,7 @@ func spawnMicroVM(id, vendorDir string) (*microVM, error) {
 		},
 		"drives": []any{map[string]any{
 			"drive_id":       "rootfs",
-			"path_on_host":   filepath.Join(vendorDir, "rootfs.ext4"),
+			"path_on_host":   tmpl.rootfs,
 			"is_root_device": true,
 			"is_read_only":   true, // all writes go to the in-VM tmpfs /tmp
 		}},
@@ -121,18 +128,27 @@ func spawnMicroVM(id, vendorDir string) (*microVM, error) {
 // time via Firecracker v1.16.0's vsock_override, so N VMs can be restored from the
 // one snapshot -- each listening on its own workdir/fc.vsock. This is the basis for
 // the warm pool (Stage 5). See docs/STAGE5_DESIGN.md.
-func restoreMicroVM(id, vendorDir string) (*microVM, error) {
-	if err := checkAvailable(vendorDir); err != nil {
+func restoreMicroVM(id, vendorDir string, tmpl template) (*microVM, error) {
+	if err := checkHostArtifacts(vendorDir); err != nil {
 		return nil, err
 	}
-	snap := filepath.Join(vendorDir, "snapshot")
+	snap := tmpl.snapshotDir
 	vmstate := filepath.Join(snap, "vmstate")
 	memfile := filepath.Join(snap, "memfile")
 	if _, err := os.Stat(vmstate); err != nil {
-		return nil, fmt.Errorf("missing snapshot (%s); run scripts/build-snapshot.sh first", snap)
+		return nil, fmt.Errorf("missing snapshot (%s) for template %q; run scripts/build-snapshot.sh"+
+			" (or scripts/build-template.sh %s) first", snap, tmpl.name, tmpl.name)
 	}
 	if _, err := os.Stat(memfile); err != nil {
-		return nil, fmt.Errorf("missing snapshot (%s); run scripts/build-snapshot.sh first", snap)
+		return nil, fmt.Errorf("missing snapshot (%s) for template %q; run scripts/build-snapshot.sh"+
+			" (or scripts/build-template.sh %s) first", snap, tmpl.name, tmpl.name)
+	}
+	// The snapshot references its rootfs by the absolute path baked in at build time,
+	// so that rootfs must still be present for the load to succeed (Stage 6: it lives
+	// under the template's own dir).
+	if _, err := os.Stat(tmpl.rootfs); err != nil {
+		return nil, fmt.Errorf("missing rootfs %s for template %q (the snapshot references it);"+
+			" rebuild with scripts/build-template.sh %s", tmpl.rootfs, tmpl.name, tmpl.name)
 	}
 
 	workdir, err := os.MkdirTemp("", "microsandbox-vm-")

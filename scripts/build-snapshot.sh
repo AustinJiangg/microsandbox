@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 # Stage 3c: produce a "warm snapshot" -- boot a microVM, warm up the Jupyter kernel, pause, then take a Full snapshot.
 #
-# The outputs vendor/snapshot/{vmstate,memfile} let Sandbox(backend="microvm", from_snapshot=True)
-# restore in milliseconds: skipping the kernel boot + the Jupyter kernel cold start (see docs/MICROVM_DESIGN.md §8).
+# The outputs {snapshot_dir}/{vmstate,memfile} let Sandbox(from_snapshot=True) restore in
+# milliseconds: skipping the kernel boot + the Jupyter kernel cold start (see docs/MICROVM_DESIGN.md §8).
 #
-# The snapshot stores only "memory + device/CPU state"; the disk contents are still provided by the host's rootfs.ext4 -- so on restore
-# rootfs.ext4 must still be at its original path. The vsock uds is fixed at vendor/snapshot/fc.vsock (recreated on restore).
+# The snapshot stores only "memory + device/CPU state"; the disk is still provided by the rootfs -- so on restore
+# that rootfs must still be at its original path. The vsock uds is fixed at {snapshot_dir}/fc.vsock (recreated on restore).
+#
+# Stage 6: parameterized per template. With no args it builds the default snapshot
+# (vendor/rootfs.ext4 -> vendor/snapshot); build-template.sh passes a template's own paths.
+# Usage: scripts/build-snapshot.sh [rootfs] [out_snapshot_dir]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR="$REPO_ROOT/vendor"
-SNAP="$VENDOR/snapshot"
-FC="$VENDOR/firecracker"; KERNEL="$VENDOR/vmlinux"; ROOTFS="$VENDOR/rootfs.ext4"
+# Stage 6: a snapshot is built per template. Default to the stock top-level paths (so
+# the default template is unchanged); build-template.sh passes a template's own rootfs
+# + snapshot dir. firecracker/vmlinux are host artifacts, always under vendor/.
+ROOTFS="${1:-$VENDOR/rootfs.ext4}"
+SNAP="${2:-$VENDOR/snapshot}"
+FC="$VENDOR/firecracker"; KERNEL="$VENDOR/vmlinux"
 UDS="$SNAP/fc.vsock"
 
 command -v curl >/dev/null || { echo "curl is required to drive the Firecracker API" >&2; exit 1; }
@@ -37,24 +45,57 @@ FCPID=$!
 trap 'kill $FCPID 2>/dev/null || true; rm -rf "$BASE"' EXIT
 
 echo "[build-snapshot] warming up the Jupyter kernel (health + running a 'pass' to force the kernel to start) ..."
-PYTHONPATH="$REPO_ROOT/src" python3 - "$UDS" <<'PY'
-import sys, time, json
-from microsandbox.client import _VsockTransport
-t = _VsockTransport(sys.argv[1], 1024)
+# A self-contained vsock client: connect to Firecracker's UDS, do the CONNECT
+# handshake, speak one HTTP/1.1 request, read to EOF. The SDK used to expose
+# _VsockTransport for this, but Stage 4b moved all vsock into the Go control plane, so
+# the warm-up carries its own ~20-line client (stdlib only) rather than importing the
+# SDK. The daemon answers with `Connection: close`, so reading to EOF is safe.
+python3 - "$UDS" <<'PY'
+import socket, sys, time, json
+
+uds, port = sys.argv[1], 1024
+
+def vsock_request(method, path, body=b"", headers=None):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(65)  # the first /execute pays the Jupyter kernel cold start
+    s.connect(uds)
+    s.sendall(b"CONNECT %d\n" % port)            # Firecracker host->guest vsock handshake
+    ack = b""
+    while not ack.endswith(b"\n"):
+        ch = s.recv(1)
+        if not ch:
+            raise OSError("vsock CONNECT closed before OK")
+        ack += ch
+    if not ack.startswith(b"OK"):
+        raise OSError("vsock CONNECT rejected: %r" % ack)
+    req = "%s %s HTTP/1.1\r\nHost: sandbox\r\nConnection: close\r\n" % (method, path)
+    for k, v in (headers or {}).items():
+        req += "%s: %s\r\n" % (k, v)
+    if body:
+        req += "Content-Length: %d\r\n" % len(body)
+    req += "\r\n"
+    s.sendall(req.encode() + body)
+    data = b""                                   # Connection: close -> read to EOF
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    return data
+
 for _ in range(300):
     try:
-        with t.request("GET", "/health", timeout=2) as r:
-            if r.status == 200:
-                break
-    except Exception:
+        if vsock_request("GET", "/health").startswith(b"HTTP/1.1 200"):
+            break
+    except OSError:
         pass
     time.sleep(0.1)
 else:
     sys.exit("health failed: daemon not ready")
+
 body = json.dumps({"code": "pass", "language": "python", "timeout_seconds": 60}).encode()
-with t.request("POST", "/execute", body=body, headers={"Content-Type": "application/json"}) as r:
-    for _ in r:
-        pass
+vsock_request("POST", "/execute", body=body, headers={"Content-Type": "application/json"})
 print("[build-snapshot] kernel is ready")
 PY
 

@@ -27,7 +27,10 @@ type server struct {
 func newServer(vendorDir string, poolSize int) *server {
 	s := &server{vendorDir: vendorDir, sandboxes: map[string]*microVM{}}
 	if poolSize > 0 {
-		s.pool = newPool(poolSize, func() (*microVM, error) { return restoreHealthy(vendorDir) })
+		// 6a: the pool pre-warms the default template; 6c makes this a per-template
+		// map. resolveTemplate(default) never errors.
+		def, _ := resolveTemplate(vendorDir, defaultTemplate)
+		s.pool = newPool(poolSize, func() (*microVM, error) { return restoreHealthy(vendorDir, def) })
 		s.pool.start()
 	}
 	return s
@@ -59,12 +62,12 @@ func healthyOrDestroy(vm *microVM, err error) (*microVM, error) {
 
 // restoreHealthy / spawnHealthy mint an id, create a VM (restored from the snapshot /
 // cold-started), and block until it is healthy.
-func restoreHealthy(vendorDir string) (*microVM, error) {
-	return healthyOrDestroy(restoreMicroVM(newID(), vendorDir))
+func restoreHealthy(vendorDir string, tmpl template) (*microVM, error) {
+	return healthyOrDestroy(restoreMicroVM(newID(), vendorDir, tmpl))
 }
 
-func spawnHealthy(vendorDir string) (*microVM, error) {
-	return healthyOrDestroy(spawnMicroVM(newID(), vendorDir))
+func spawnHealthy(vendorDir string, tmpl template) (*microVM, error) {
+	return healthyOrDestroy(spawnMicroVM(newID(), vendorDir, tmpl))
 }
 
 // handleCreate: POST /sandboxes -- spawn (or restore from snapshot) a microVM.
@@ -84,17 +87,24 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// is the only caller, so we stay lenient rather than 400 on decode errors.
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	var (
-		vm  *microVM
-		err error
-	)
+	// 6a: every sandbox uses the default template. 6b lets POST /sandboxes pick one
+	// via a "template" field -- this resolve call is where that name will flow in --
+	// and 6c serves it from a per-template warm pool. For the default constant resolve
+	// never fails, but the error path is wired now so 6b only swaps the name in.
+	tmpl, err := resolveTemplate(s.vendorDir, defaultTemplate)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	var vm *microVM
 	switch {
 	case req.FromSnapshot && s.pool != nil:
 		vm, err = s.pool.get()
 	case req.FromSnapshot:
-		vm, err = restoreHealthy(s.vendorDir)
+		vm, err = restoreHealthy(s.vendorDir, tmpl)
 	default:
-		vm, err = spawnHealthy(s.vendorDir)
+		vm, err = spawnHealthy(s.vendorDir, tmpl)
 	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
