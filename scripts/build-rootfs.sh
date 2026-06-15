@@ -4,7 +4,7 @@
 # Approach (see docs/MICROVM_DESIGN.md §4):
 #   1. docker export reuses the entire filesystem of the microsandbox-agent image built in Stage 2
 #      (which already contains Python + ipykernel + jupyter_client);
-#   2. inject our src/ (Stage 2 mounts it at runtime, but there is no such mount inside the VM, so it must live in the rootfs);
+#   2. build the Go daemon (Stage 7, E2B's envd) as a static binary and inject it (the Python daemon is retired);
 #   3. write a minimal /init as PID 1: after mounting the pseudo-filesystems, exec our daemon (listening on vsock);
 #   4. use `mkfs.ext4 -d <dir>` to pack the directory straight into an ext4 image -- no mount needed, hence without root.
 #
@@ -37,30 +37,31 @@ docker rm "$cid" >/dev/null
 # At a minimum python3 must be present; otherwise the export clearly went wrong, so fail early to ease debugging.
 test -x "$STAGING/usr/local/bin/python3" || { echo "exported rootfs has no python3, aborting" >&2; exit 1; }
 
-echo "[build-rootfs] injecting microsandbox source into /opt/microsandbox/src ..."
-mkdir -p "$STAGING/opt/microsandbox"
-cp -r "$REPO_ROOT/src" "$STAGING/opt/microsandbox/src"
+echo "[build-rootfs] building the Go daemon (static, linux/amd64) and injecting it ..."
+# Stage 7: the in-VM daemon is now a static Go binary (E2B's envd), not the Python
+# package. CGO-free so it runs in the minimal guest with no libc deps; the Jupyter
+# kernel it drives is still Python, launched at runtime via the kernel gateway.
+mkdir -p "$STAGING/usr/local/bin"
+( cd "$REPO_ROOT/daemon" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$STAGING/usr/local/bin/microsandbox-daemon" . )
+chmod +x "$STAGING/usr/local/bin/microsandbox-daemon"
 
 echo "[build-rootfs] writing /init (PID 1) ..."
 cat > "$STAGING/init" <<'INIT'
 #!/bin/sh
-# The microVM's PID 1: after mounting the pseudo-filesystems, exec the daemon (exec lets the daemon take over PID 1 directly).
-# On failure (e.g. a python import error) PID 1 exits -> kernel panic=1 -> the Firecracker process exits too,
-# so the host-side health check notices immediately, and the traceback is left in console.log -- this is a deliberate diagnostic path.
+# The microVM's PID 1: after mounting the pseudo-filesystems, exec the Go daemon (exec lets it take over PID 1 directly).
+# On failure PID 1 exits -> kernel panic=1 -> the Firecracker process exits too, so the host-side health check notices
+# immediately, and any error is left in console.log -- a deliberate diagnostic path.
 mount -t proc     proc /proc 2>/dev/null
 mount -t sysfs    sys  /sys  2>/dev/null
 mount -t devtmpfs dev  /dev  2>/dev/null   # the kernel most likely already mounted it (DEVTMPFS_MOUNT=y); failure is harmless
 mount -t tmpfs    tmp  /tmp  2>/dev/null    # the only writable area (the root is a read-only rootfs)
 
-# PATH must be set explicitly: under a minimal init PATH may be empty, so sh cannot find commands, and python cannot compute
-# sys.executable (commands.run's shell and the Jupyter kernel both need a real PATH).
+# PATH must be explicit under a minimal init: the daemon execs `jupyter` (the kernel gateway), and the gateway + kernel
+# need a real PATH; HOME=/tmp is the only writable home (the root is read-only).
 export PATH=/usr/local/bin:/usr/bin:/bin
-export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/opt/microsandbox/src
-echo "[init] microsandbox daemon: vsock port 1024, kernel backend"
-# exec with an absolute path: ensures python's sys.executable is a real path rather than an empty string
-# (otherwise subprocess spawning from the daemon raises PermissionError).
-PY="$(command -v python3)"
-exec "$PY" -m microsandbox.server --vsock-port 1024
+export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+echo "[init] microsandbox daemon (Go): vsock port 1024, kernel via jupyter gateway"
+exec /usr/local/bin/microsandbox-daemon
 INIT
 chmod +x "$STAGING/init"
 
