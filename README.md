@@ -71,6 +71,12 @@ with Sandbox() as sandbox:
 # Restore from a warm snapshot instead: ready in ~30ms (skips kernel boot + kernel cold start).
 with Sandbox(from_snapshot=True) as sandbox:
     print(sandbox.run_code("print(6 * 7)").stdout)    # 42
+
+# Boot a custom image (Stage 6 templates): build a template once, then select it by name.
+#   scripts/build-template.sh example   # templates/example/Dockerfile -> vendor/templates/example/
+# (swap the marker line in that Dockerfile for `RUN pip install ...` to make a real env.)
+with Sandbox(template="example") as sandbox:
+    print(sandbox.files.read("/etc/microsandbox-template"))   # hello from the example template
 ```
 
 ## Project structure
@@ -84,7 +90,9 @@ microsandbox/
 ├── docs/
 │   ├── ARCHITECTURE.md        # the three-layer design (client / protocol / daemon+backend)
 │   ├── MICROVM_DESIGN.md      # the microVM design (Firecracker, vsock, snapshots)
-│   └── STAGE4_DESIGN.md       # Stage 4: extracting the Go control plane
+│   ├── STAGE4_DESIGN.md       # Stage 4: extracting the Go control plane
+│   ├── STAGE5_DESIGN.md       # Stage 5: the warm pool
+│   └── STAGE6_DESIGN.md       # Stage 6: named templates (custom images)
 ├── src/microsandbox/
 │   ├── protocol.py            # client↔daemon wire protocol (the stable boundary)
 │   ├── client.py              # SDK: Sandbox / run_code -- a thin pure-HTTP client to the control plane
@@ -94,7 +102,9 @@ microsandbox/
 ├── scripts/
 │   ├── build-rootfs.sh        # export an ext4 rootfs from the agent image (no root needed)
 │   ├── build-snapshot.sh      # build a warm Firecracker snapshot for millisecond restore
+│   ├── build-template.sh      # build a named custom image (Stage 6): Dockerfile -> rootfs (+ snapshot)
 │   └── build-control-plane.sh # build the Go control plane to vendor/control-plane
+├── templates/                 # template recipes (Stage 6): templates/<name>/Dockerfile (built artifacts -> vendor/templates/)
 ├── examples/quickstart.py
 └── tests/                     # end-to-end / stateful / snapshot tests on real VMs (vsock-bridge unit tests are in control-plane/)
 ```

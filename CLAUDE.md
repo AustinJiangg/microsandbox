@@ -63,8 +63,19 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   `from_snapshot` create in **~1ms** (vs ~30ms restore, ~0.94s cold). The pool is
   control-plane-internal — the protocol and SDK are unchanged; its semantics are
   unit-tested without KVM (`control-plane/pool_test.go`). See `docs/STAGE5_DESIGN.md`.
-- **Possible next**: further productization — templates, auth, multi-host
-  scheduling, a TypeScript SDK.
+- **Done (Stage 6 — templates)**: the one baked-in image generalizes into **named
+  custom images** (E2B's headline feature). A template is a `(rootfs, snapshot)` pair
+  under `vendor/templates/<name>/`, built from its own Dockerfile via
+  `scripts/build-template.sh`; the reserved name `default` maps to the legacy `vendor/`
+  paths, so nothing prior changed. 6a wired the registry + build pipeline (the control
+  plane resolves a name to artifacts; repaired + parameterized `build-snapshot.sh`); 6b
+  added the optional `template` field to `POST /sandboxes` and `Sandbox(template=...)`
+  (absent = default, backward-compatible); 6c made the warm pool **per-template**
+  (`--pool name=K`). Name validation + pool config are unit-tested without KVM
+  (`control-plane/template_test.go`, `pools_test.go`). See `docs/STAGE6_DESIGN.md`.
+- **Possible next**: a broader **E2B alignment** — notably rewriting the in-VM daemon
+  (`server.py`) in Go (E2B's `envd`); plus auth, multi-host scheduling, a TypeScript
+  SDK, and per-template resource limits / start commands.
 
 ## Development conventions
 
@@ -97,10 +108,11 @@ sudo usermod -aG kvm "$USER"                     # then `wsl --shutdown` and reo
 docker build -t microsandbox-agent .             # the agent image the rootfs is exported from
 scripts/build-rootfs.sh                          # export the ext4 rootfs from the agent image (no root)
 scripts/build-snapshot.sh                        # build the warm snapshot for millisecond restore
+scripts/build-template.sh <name>                 # build a named custom image -> vendor/templates/<name>/ (Stage 6; then Sandbox(template="<name>"))
 scripts/build-control-plane.sh                   # build the Go control plane to vendor/control-plane (Stage 4)
 
 # Minimal end-to-end smoke (Stage 4: start the control plane first; needs the vendor artifacts):
-./vendor/control-plane &                         # owns the microVM fleet over HTTP (add --pool-size K to keep K VMs warm -> ~1ms from_snapshot creates, Stage 5)
+./vendor/control-plane &                         # owns the microVM fleet over HTTP (--pool-size K warms K default VMs; --pool name=K warms a template, Stage 5/6)
 python -c 'from microsandbox import Sandbox; s=Sandbox(); s.run_code("x=41"); print(s.run_code("print(x+1)").stdout); s.close()'
 kill %1                                           # stop the control plane
 
@@ -119,7 +131,8 @@ scripts/build-rootfs.sh && scripts/build-snapshot.sh
   snapshot path). Host-side changes (`client.py`) take effect immediately.
 - **Cadence**: split work into independently verifiable sub-steps, keep tests
   green at every step, give an honest self-review (🔴/🟡/🟢) before committing, and
-  commit only on the user's explicit go-ahead (English Conventional Commits,
-  concise). **After every commit, push to `origin/main` immediately** (no separate
-  ask needed).
+  commit only on the user's explicit go-ahead. Commit messages are a **single-line**
+  English Conventional Commit (`type(scope): summary (stage N)`, no body) + the
+  `Co-Authored-By` trailer. **After every commit, push to `origin/main` immediately**
+  (no separate ask needed).
 ```
