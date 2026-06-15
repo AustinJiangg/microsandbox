@@ -83,6 +83,24 @@ def ensure_snapshot() -> None:
     subprocess.run([str(repo_root / "scripts" / "build-snapshot.sh")], check=True)
 
 
+@functools.lru_cache(maxsize=1)
+def ensure_example_template() -> None:
+    """Build the 'example' template's rootfs on demand (docker export -> ext4, no snapshot).
+
+    Used by the Stage 6 named-template e2e; in normal use a developer pre-builds it
+    with scripts/build-template.sh example. --no-snapshot keeps it cheap and KVM-free
+    to build (the test that boots it still needs KVM, and auto-skips without it)."""
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    rootfs = repo_root / "vendor" / "templates" / "example" / "rootfs.ext4"
+    if rootfs.exists():
+        return
+    ensure_agent_image()  # the example template is FROM microsandbox-agent
+    subprocess.run(
+        [str(repo_root / "scripts" / "build-template.sh"), "example", "--no-snapshot"],
+        check=True,
+    )
+
+
 @pytest.fixture(scope="session")
 def control_plane(tmp_path_factory):
     """Build and run the Go control plane once for the whole test session.
@@ -154,5 +172,15 @@ def snapshot_sandbox(control_plane):
     """A microVM sandbox restored from a snapshot in milliseconds (the kernel inside the VM is already warm)."""
     ensure_snapshot()
     sb = Sandbox(from_snapshot=True, base_url=control_plane)
+    yield sb
+    sb.close()
+
+
+@pytest.fixture
+def example_sandbox(control_plane):
+    """A sandbox booted from the 'example' template (Stage 6): the stock image plus a
+    marker file, cold-started (no snapshot needed)."""
+    ensure_example_template()
+    sb = Sandbox(template="example", base_url=control_plane)
     yield sb
     sb.close()

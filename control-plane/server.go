@@ -81,17 +81,18 @@ func spawnHealthy(vendorDir string, tmpl template) (*microVM, error) {
 // before we return.
 func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		FromSnapshot bool `json:"from_snapshot"`
+		FromSnapshot bool   `json:"from_snapshot"`
+		Template     string `json:"template"`
 	}
-	// A missing/empty/invalid body just means the defaults (cold start); the SDK
-	// is the only caller, so we stay lenient rather than 400 on decode errors.
+	// A missing/empty/invalid body just means the defaults (cold start, default
+	// template); the SDK is the only caller, so we stay lenient rather than 400 on
+	// decode errors.
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	// 6a: every sandbox uses the default template. 6b lets POST /sandboxes pick one
-	// via a "template" field -- this resolve call is where that name will flow in --
-	// and 6c serves it from a per-template warm pool. For the default constant resolve
-	// never fails, but the error path is wired now so 6b only swaps the name in.
-	tmpl, err := resolveTemplate(s.vendorDir, defaultTemplate)
+	// 6b: the sandbox's image is picked by the request's "template" field (empty = the
+	// default image). An unknown/invalid name is the caller's error -> 400. 6c will
+	// serve a matching template from a per-template warm pool.
+	tmpl, err := resolveTemplate(s.vendorDir, req.Template)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -99,7 +100,10 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	var vm *microVM
 	switch {
-	case req.FromSnapshot && s.pool != nil:
+	// The warm pool currently holds only default-template VMs (6c makes it per
+	// template), so serve from it only for a default from_snapshot create -- a
+	// non-default template must restore its own image, never a pooled default one.
+	case req.FromSnapshot && s.pool != nil && tmpl.name == defaultTemplate:
 		vm, err = s.pool.get()
 	case req.FromSnapshot:
 		vm, err = restoreHealthy(s.vendorDir, tmpl)

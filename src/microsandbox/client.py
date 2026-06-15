@@ -50,6 +50,9 @@ class Sandbox:
             ~30ms to ready vs ~0.94s cold start). Run scripts/build-snapshot.sh first.
             Several sandboxes can be restored from the one snapshot concurrently -- the
             control plane gives each VM its own vsock socket (Stage 5a).
+        template: name of a custom image to boot, built with scripts/build-template.sh
+            (see docs/STAGE6_DESIGN.md). Defaults to the stock image. The name must be a
+            template built under vendor/templates/<name>/; an unknown name is rejected.
         base_url: where the Go control plane is reachable. Defaults to the
             MICROSANDBOX_URL env var, then http://127.0.0.1:8080.
 
@@ -64,10 +67,12 @@ class Sandbox:
         self,
         timeout_seconds: float = 30.0,
         from_snapshot: bool = False,
+        template: str | None = None,
         base_url: str | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self._from_snapshot = from_snapshot
+        self._template = template
         self._base_url = (
             base_url or os.environ.get("MICROSANDBOX_URL", _DEFAULT_CONTROL_PLANE_URL)
         ).rstrip("/")
@@ -91,9 +96,12 @@ class Sandbox:
         The control plane returns only once the VM is healthy, so there is nothing to
         wait for here. It owns the vsock bridge; the SDK never speaks vsock itself.
         """
-        info = self._control_plane(
-            "POST", "/sandboxes", {"from_snapshot": self._from_snapshot}
-        )
+        body: dict = {"from_snapshot": self._from_snapshot}
+        # Only send `template` when set, so the default case stays byte-identical to
+        # the pre-Stage-6 request (an absent field means the default template).
+        if self._template is not None:
+            body["template"] = self._template
+        info = self._control_plane("POST", "/sandboxes", body)
         self._sandbox_id = info["id"]
 
     def close(self) -> None:
