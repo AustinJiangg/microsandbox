@@ -23,9 +23,10 @@ import (
 
 // newMux wires the daemon's HTTP routes. Kept separate from the listener so tests
 // can drive it over an httptest TCP server -- no vsock, no VM (server_test.go).
-func newMux() *http.ServeMux {
+func newMux(km *kernelManager) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
+	mux.HandleFunc("POST /execute", km.handleExecute)
 	mux.HandleFunc("POST /files/read", handleFileRead)
 	mux.HandleFunc("POST /files/write", handleFileWrite)
 	mux.HandleFunc("POST /files/list", handleFileList)

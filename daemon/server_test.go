@@ -17,7 +17,7 @@ import (
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(newMux())
+	srv := httptest.NewServer(newMux(newKernelManager()))
 	t.Cleanup(srv.Close)
 	return srv
 }

@@ -35,7 +35,7 @@ func main() {
 	}
 
 	log.Printf("microsandbox daemon listening on %s", ln.Addr())
-	if err := http.Serve(ln, newMux()); err != nil {
+	if err := http.Serve(ln, newMux(newKernelManager())); err != nil {
 		log.Fatal(err)
 	}
 }
