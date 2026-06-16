@@ -27,7 +27,9 @@ proxies each request to the in-VM daemon over **vsock** (②, Firecracker's
 virtio-vsock multiplexed onto a host Unix-domain socket). The HTTP/SSE bytes on the
 vsock leg are exactly what travelled over TCP in the project's earlier stages — only
 the pipe changed. That byte-stable protocol is the whole point (see below); see
-`docs/STAGE4_DESIGN.md` for the split.
+`docs/STAGE4_DESIGN.md` for the split. As of **Stage 7** the in-VM daemon (the right
+box) is a **Go binary** (envd-equivalent), not the Python `server.py`; it drives a
+Python kernel via a Jupyter Kernel Gateway — see `docs/STAGE7_DESIGN.md`.
 
 ## Responsibilities of the components
 
@@ -59,22 +61,22 @@ is a thin **pure-HTTP** client and no longer creates the VM itself:
 
 It holds no vsock or firecracker code anymore — that moved to the control plane (4).
 
-### 3. server.py + backend.py — the daemon and the execution layer
+### 3. the in-VM daemon (`daemon/`, Go) + the kernel
 
-- `server.py` (daemon): a resident process running **inside the VM**, listening on
-  `AF_VSOCK`, handing requests to the backend, and streaming output back via SSE.
-  Corresponds to E2B's `envd`. Apart from "which kind of socket to listen on", its
-  request handling is transport-agnostic.
-- `backend.py` (backend): where code actually runs. Decoupled via the abstract
-  base class `ExecutionBackend`, with one implementation:
+As of **Stage 7** the in-VM daemon is a **Go binary** (`daemon/`, built static and
+baked into the rootfs), matching E2B's `envd`. It runs **inside the VM**, listens on
+`AF_VSOCK`, serves the same HTTP/SSE protocol, and streams output back — byte-for-byte
+what the Python daemon did (the existing e2e suite is the parity proof). It replaced
+`src/microsandbox/server.py` + `backend.py`, which stay in `src/` as the reference the
+port was built from. See `docs/STAGE7_DESIGN.md`.
 
-```
-ExecutionBackend (abstract)
-└── JupyterKernelBackend    # a resident Jupyter kernel inside the VM (stateful REPL)
-```
-
-A long-lived kernel holds a Python namespace, so variables persist across
-`run_code` calls — exactly how E2B's code interpreter behaves.
+How it runs code: the daemon does **not** run Python itself. Like envd, it launches a
+stateful Python kernel as a child and drives it over a **Jupyter Kernel Gateway**'s
+HTTP + WebSocket kernels API (`POST /api/kernels`, then the `channels` WebSocket),
+translating the kernel's iopub messages (stream / execute_result / error / status)
+into our `OutputEvent`s. A long-lived kernel holds a Python namespace, so variables
+persist across `run_code` calls — exactly how E2B's code interpreter behaves. (The
+files/commands endpoints are plain Go: the daemon's own filesystem and `sh -c`.)
 
 **Two orthogonal axes.** It's worth separating them, because conflating them is
 confusing:
@@ -141,7 +143,8 @@ The project was built up in stages, each adding one isolation technique on top o
 the same protocol: host subprocess → one-shot Docker container → resident
 in-container agent (the "ownership inversion") → stateful Jupyter kernel →
 Firecracker microVM (TCP → vsock) → a Go control-plane split (the SDK became a thin
-HTTP client). Every step followed one discipline: **add a new backend/transport
+HTTP client) → a Go in-VM daemon (envd-equivalent, driving the kernel via a Jupyter
+gateway). Every step followed one discipline: **add a new backend/transport
 implementation, keep the protocol byte-stable, and keep the changes out of the
 client as much as possible.** Once the microVM landed, the earlier backends were
 removed as scaffolding — the staged code lives on in the git history if you want to
@@ -153,7 +156,7 @@ study the progression.
 |--------------|----------------|-------|
 | client.py | E2B SDK (python/js) | user interface; a thin pure-HTTP client |
 | protocol.py | envd's gRPC/HTTP protocol | communication contract |
-| server.py (daemon) | `envd` | resident agent inside the sandbox |
-| backend.py | the in-sandbox code interpreter | the stateful kernel that runs code |
+| daemon/ (Go) | `envd` | resident agent inside the sandbox (Stage 7; was server.py) |
+| Jupyter Kernel Gateway + kernel | the in-sandbox code interpreter | the stateful Python kernel the Go daemon drives over HTTP/WS |
 | control-plane/ (Go) | `infra` (orchestrator + edge) | owns the VM fleet: spawn/restore/destroy + vsock proxy + health |
 | (firecracker config in microvm.go) | Firecracker orchestration / jailer | microVM creation and isolation |

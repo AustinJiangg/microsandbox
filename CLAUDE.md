@@ -31,9 +31,10 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    between client and daemon. **This is the most important boundary; it stayed
    byte-stable as the isolation evolved from subprocess to microVM — keep it that
    way.**
-3. **daemon + backend** — `server.py` / `backend.py`. The daemon runs **inside the
-   VM**, listening on vsock; `JupyterKernelBackend` is the stateful kernel that
-   actually runs the code.
+3. **in-VM daemon** — `daemon/` (Go), E2B's `envd`. Runs **inside the VM**, listens on
+   vsock, serves the protocol, and drives a stateful Python kernel via a Jupyter Kernel
+   Gateway (Stage 7). It replaced the Python `server.py` / `backend.py` (kept in `src/`
+   as reference).
 4. **control plane** — `control-plane/` (Go), built to `vendor/control-plane`. Owns
    the microVM fleet: spawn / restore / destroy (ported from the SDK's old
    `_spawn_microvm` / `_restore_microvm` / `close`). New in Stage 4; the wire
@@ -73,17 +74,27 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   (absent = default, backward-compatible); 6c made the warm pool **per-template**
   (`--pool name=K`). Name validation + pool config are unit-tested without KVM
   (`control-plane/template_test.go`, `pools_test.go`). See `docs/STAGE6_DESIGN.md`.
-- **Possible next**: a broader **E2B alignment** — notably rewriting the in-VM daemon
-  (`server.py`) in Go (E2B's `envd`); plus auth, multi-host scheduling, a TypeScript
+- **Done (Stage 7 — Go in-VM daemon / envd)**: the Python in-VM daemon (`server.py` +
+  `backend.py`) is rewritten as a static **Go binary** (`daemon/`), matching E2B's
+  `envd`. 7a ported health/files/commands (vsock + stdlib `net/http`); 7b did `/execute`
+  by driving a stateful Python kernel over a **Jupyter Kernel Gateway** HTTP+WebSocket
+  API (E2B's actual approach, not raw ZMQ); 7c flipped the rootfs (`build-rootfs.sh`
+  builds+injects the binary, `/init` execs it, the Dockerfile ships the kernel gateway).
+  Protocol/SDK/control-plane unchanged; the **whole Python e2e suite passes against the
+  Go daemon** (byte-stable parity). The Python daemon stays in `src/` as reference. See
+  `docs/STAGE7_DESIGN.md`.
+- **Possible next**: more **E2B alignment** — auth, multi-host scheduling, a TypeScript
   SDK, and per-template resource limits / start commands.
 
 ## Development conventions
 
 - Python ≥ 3.11. Runtime deps are introduced only where needed, with a stated
-  reason: `ipykernel` + `jupyter_client` (the `[kernel]` extra) power the in-VM
-  Jupyter kernel and are pre-installed in the agent image (lazily imported in
-  `backend.py`). The host side shells out to the `firecracker` binary (like it
-  shells out to `docker` to build the rootfs) — no Python VM library.
+  reason: the agent image ships `ipykernel` + the **Jupyter Kernel Gateway**, which the
+  Go in-VM daemon launches and drives over HTTP/WebSocket to run a stateful Python
+  kernel (Stage 7; the `[kernel]` extra + `backend.py`'s `jupyter_client` belong to the
+  retired Python daemon, kept as reference). The host side shells out to the
+  `firecracker` binary (like it shells out to `docker` to build the rootfs) — no Python
+  VM library.
 - **Language: English only.** All docs, code comments, docstrings, and commit
   messages are in English. Comments explain **why**, not what.
 - Keep `tests/` all green. The vsock-bridge unit tests now live in Go
@@ -100,7 +111,8 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 ```bash
 pip install -e ".[dev]"                          # install (dev mode)
 pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs the control plane)
-go test ./control-plane                          # the vsock-bridge unit tests (no VM/KVM needed)
+go test ./control-plane                          # control-plane unit tests: vsock bridge, pool, templates (no VM/KVM)
+go test ./daemon                                 # in-VM daemon unit tests: handlers + kernel-message translation (no VM/KVM)
 pytest tests/test_microvm.py::test_runs_in_microvm -v   # one real-VM end-to-end case
 
 # One-time microVM setup (see docs/MICROVM_DESIGN.md §7):
@@ -116,8 +128,8 @@ scripts/build-control-plane.sh                   # build the Go control plane to
 python -c 'from microsandbox import Sandbox; s=Sandbox(); s.run_code("x=41"); print(s.run_code("print(x+1)").stdout); s.close()'
 kill %1                                           # stop the control plane
 
-# After editing in-VM code (server.py / backend.py), rebuild the rootfs (+ snapshot)
-# so the VM picks up the change -- the rootfs bakes in a copy of src/ at build time:
+# After editing the in-VM daemon (daemon/*.go), rebuild the rootfs (+ snapshot) so the
+# VM picks up the change -- the rootfs bakes in the compiled daemon binary at build time:
 scripts/build-rootfs.sh && scripts/build-snapshot.sh
 ```
 
@@ -125,10 +137,11 @@ scripts/build-rootfs.sh && scripts/build-snapshot.sh
 
 - Before changing the isolation/transport layer, read `docs/ARCHITECTURE.md` to
   confirm the boundaries, then act.
-- `server.py` and `backend.py` run **inside the VM**. The running `vendor/rootfs.ext4`
-  contains a *copy* of `src/` taken at build time, so changes to in-VM code only
-  take effect after `scripts/build-rootfs.sh` (and `build-snapshot.sh` for the
-  snapshot path). Host-side changes (`client.py`) take effect immediately.
+- The in-VM daemon is `daemon/` (Go), baked into `vendor/rootfs.ext4` as a static
+  binary at build time, so changes to it only take effect after `scripts/build-rootfs.sh`
+  (and `build-snapshot.sh` for the snapshot path). Host-side changes (`client.py`) take
+  effect immediately. (`src/microsandbox/server.py` / `backend.py` are the retired Python
+  daemon, kept as reference — editing them does nothing unless you wire them back.)
 - **Cadence**: split work into independently verifiable sub-steps, keep tests
   green at every step, give an honest self-review (🔴/🟡/🟢) before committing, and
   commit only on the user's explicit go-ahead. Commit messages are a **single-line**
