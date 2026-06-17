@@ -1,10 +1,11 @@
 // Command api is the public REST front of the control plane (E2B's `api`). It owns no
 // VMs: sandbox lifecycle (POST/DELETE/GET /sandboxes) is delegated to the orchestrator
-// over gRPC, and the data path (/sandboxes/{id}/...) is -- for Stage 8 only --
-// reverse-proxied to the orchestrator's data proxy. The SDK talks only to this service,
-// so its base URL is unchanged across the split. Stage 9 introduces client-proxy and
-// the SDK sends the data path there directly, retiring the passthrough. See
-// docs/STAGE8_DESIGN.md.
+// over gRPC, the durable record of which sandboxes exist is kept in a metadata store
+// (SQLite, Stage 8c -- E2B uses Postgres), and the data path (/sandboxes/{id}/...) is
+// -- for Stage 8 only -- reverse-proxied to the orchestrator's data proxy. The SDK talks
+// only to this service, so its base URL is unchanged across the split. Stage 9
+// introduces client-proxy and the SDK sends the data path there directly, retiring the
+// passthrough. See docs/STAGE8_DESIGN.md.
 package main
 
 import (
@@ -22,12 +23,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "microsandbox/services/pkg/grpc/orchestrator"
+	"microsandbox/services/pkg/store"
 )
 
-// api holds the gRPC client to the orchestrator (lifecycle) and the reverse proxy used
-// for the temporary data-path passthrough.
+// api holds the gRPC client to the orchestrator (lifecycle), the metadata store
+// (durable record), and the reverse proxy used for the temporary data-path passthrough.
 type api struct {
 	client    pb.SandboxServiceClient
+	store     *store.Store
 	dataProxy *httputil.ReverseProxy
 }
 
@@ -35,6 +38,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "host:port for the public REST API (the SDK's base URL)")
 	orchGRPC := flag.String("orchestrator-grpc", "127.0.0.1:9090", "orchestrator gRPC address (SandboxService)")
 	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address (vsock bridge)")
+	db := flag.String("db", "vendor/microsandbox.db", "path to the SQLite metadata database")
 	flag.Parse()
 
 	// gRPC client to the orchestrator. NewClient is lazy (it connects on the first RPC,
@@ -46,8 +50,15 @@ func main() {
 	}
 	defer conn.Close()
 
+	st, err := store.Open(*db)
+	if err != nil {
+		log.Fatalf("open metadata db %s: %v", *db, err)
+	}
+	defer st.Close()
+
 	a := &api{
 		client: pb.NewSandboxServiceClient(conn),
+		store:  st,
 		// TEMPORARY (Stage 8): reverse-proxy the data path to the orchestrator's data
 		// proxy, tagging each request with X-Sandbox-Id (which the orchestrator routes
 		// on). Stage 9 replaces this with client-proxy and removes it. One proxy is
@@ -84,7 +95,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s)", *addr, *orchGRPC, *orchProxy)
+	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, db=%s)", *addr, *orchGRPC, *orchProxy, *db)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

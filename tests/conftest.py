@@ -160,7 +160,8 @@ def control_plane(tmp_path_factory):
         _wait_healthy(f"http://{proxy_addr}/health", orch, logdir / "orchestrator.log")
         api = subprocess.Popen(
             [str(repo_root / "vendor" / "api"), "--addr", api_addr,
-             "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr],
+             "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr,
+             "--db", str(logdir / "microsandbox.db")],
             stdout=api_log, stderr=subprocess.STDOUT,
         )
         _wait_healthy(base_url + "/health", api, logdir / "api.log")

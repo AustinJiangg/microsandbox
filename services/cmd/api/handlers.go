@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "microsandbox/services/pkg/grpc/orchestrator"
 )
@@ -18,9 +18,10 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleCreate: POST /sandboxes {from_snapshot, template} -> gRPC Create -> 201 {id}.
-// A missing/empty body means the defaults (cold start, default template), matching the
-// pre-split behavior; the SDK is the only caller, so we stay lenient on decode errors.
+// handleCreate: POST /sandboxes {from_snapshot, template} -> gRPC Create -> record in
+// the store -> 201 {id}. A missing/empty body means the defaults (cold start, default
+// template), matching the pre-split behavior; the SDK is the only caller, so we stay
+// lenient on decode errors.
 func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		FromSnapshot bool   `json:"from_snapshot"`
@@ -37,32 +38,54 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeGRPCError(w, err)
 		return
 	}
+
+	// Record the sandbox in the durable metadata store. Best-effort: the VM is already
+	// live and usable, so a metadata write failure is logged, not surfaced -- in this
+	// single-node stage the orchestrator's in-memory registry is the operational truth,
+	// and the store is the record that becomes authoritative across restarts / nodes.
+	templateName := req.Template
+	if templateName == "" {
+		templateName = "default"
+	}
+	if err := a.store.InsertSandbox(resp.GetSandboxId(), templateName); err != nil {
+		log.Printf("store: insert %s: %v", resp.GetSandboxId(), err)
+	}
 	writeJSON(w, http.StatusCreated, map[string]string{"id": resp.GetSandboxId()})
 }
 
-// handleDestroy: DELETE /sandboxes/{id} -> gRPC Delete -> 204 (or 404 on unknown id).
+// handleDestroy: DELETE /sandboxes/{id} -> gRPC Delete -> drop from the store -> 204
+// (or 404 on unknown id). The store delete is best-effort for the same reason as above.
 func (a *api) handleDestroy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	if _, err := a.client.Delete(ctx, &pb.SandboxDeleteRequest{SandboxId: r.PathValue("id")}); err != nil {
+	if _, err := a.client.Delete(ctx, &pb.SandboxDeleteRequest{SandboxId: id}); err != nil {
 		writeGRPCError(w, err)
 		return
+	}
+	if err := a.store.DeleteSandbox(id); err != nil {
+		log.Printf("store: delete %s: %v", id, err)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleList: GET /sandboxes -> gRPC List -> 200 {"sandboxes":[...]}. New in Stage 8b
-// (the old control plane had no list endpoint); for now it reflects the orchestrator's
-// live registry. Stage 8c serves it from the persisted metadata store instead.
+// handleList: GET /sandboxes -> 200 {"sandboxes":[{id,template,status,created_at}...]}.
+// The api lists from its own metadata store (E2B's api lists from Postgres), not by
+// asking the orchestrator -- the store is the api's durable record. The orchestrator
+// still exposes a live gRPC List for reconciliation; we don't need it here yet.
 func (a *api) handleList(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-	resp, err := a.client.List(ctx, &emptypb.Empty{})
+	rows, err := a.store.ListSandboxes()
 	if err != nil {
-		writeGRPCError(w, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sandboxes": resp.GetSandboxIds()})
+	list := make([]map[string]any, 0, len(rows))
+	for _, sb := range rows {
+		list = append(list, map[string]any{
+			"id": sb.ID, "template": sb.Template, "status": sb.Status, "created_at": sb.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sandboxes": list})
 }
 
 // handleProxy: ANY /sandboxes/{id}/{rest...} -> the temporary data-path passthrough to
