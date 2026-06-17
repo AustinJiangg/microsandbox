@@ -1,7 +1,8 @@
 """Quickstart example.
 
-Start the control plane first (Stage 4 -- it owns the microVM fleet), then run this:
-    scripts/build-control-plane.sh && ./vendor/control-plane &
+Start the host services first (Stage 8 -- the orchestrator owns the microVM fleet, the
+api is the REST front the SDK talks to), then run this:
+    scripts/dev-up.sh &
     python examples/quickstart.py
 
 It asks the control plane to boot a Firecracker microVM, runs a few snippets of code

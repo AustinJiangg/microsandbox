@@ -8,13 +8,12 @@ Design goal: keep the feel as close to E2B as possible. Typical usage:
         execution = sandbox.run_code("print('hello from sandbox')")
         print(execution.stdout)
 
-Every Sandbox is a **Firecracker microVM** managed by the Go **control plane**
-(vendor/control-plane). As of Stage 4b the SDK is a thin **pure-HTTP** client: it
-asks the control plane for a sandbox (POST /sandboxes) and runs code by POSTing
-through it (/sandboxes/{id}/execute, ...); the control plane bridges to the in-VM
-daemon over vsock. Start the control plane first (scripts/build-control-plane.sh,
-then ./vendor/control-plane); it needs the vendor/ artifacts -- see
-docs/MICROVM_DESIGN.md §7 and docs/STAGE4_DESIGN.md.
+Every Sandbox is a **Firecracker microVM** managed by the Go host services (Stage 8:
+an `api` REST front backed by a per-machine `orchestrator` over gRPC). The SDK is a
+thin **pure-HTTP** client: it asks the api for a sandbox (POST /sandboxes) and runs
+code by POSTing through it (/sandboxes/{id}/execute, ...); the services bridge to the
+in-VM daemon over vsock. Start them first (scripts/dev-up.sh); they need the vendor/
+artifacts -- see docs/MICROVM_DESIGN.md §7, docs/STAGE8_DESIGN.md and docs/STAGE4_DESIGN.md.
 
 History: this project grew stage by stage (host subprocess -> Docker container ->
 resident container -> microVM -> control-plane split). Those earlier isolation
@@ -163,9 +162,8 @@ class Sandbox:
             raise RuntimeError(f"control plane {method} {path} failed: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(
-                f"cannot reach the control plane at {self._base_url} ({exc.reason}); "
-                "is it running? build it with scripts/build-control-plane.sh, then run "
-                "./vendor/control-plane"
+                f"cannot reach the api at {self._base_url} ({exc.reason}); "
+                "is it running? start the services with scripts/dev-up.sh"
             ) from exc
 
     # ----- core API -----

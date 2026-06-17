@@ -33,10 +33,10 @@ docker build -t microsandbox-agent .   # the agent image the rootfs is exported 
 scripts/build-rootfs.sh                # export an ext4 rootfs from that image (no root needed)
 scripts/build-snapshot.sh              # optional: a warm snapshot for millisecond restore
 
-# 4) Build and start the Go control plane (Stage 4): it owns the microVM fleet, and
-#    the SDK talks to it over HTTP. Leave it running (e.g. in another terminal).
-scripts/build-control-plane.sh
-./vendor/control-plane &
+# 4) Build and start the Go host services (Stage 8): the orchestrator owns the microVM
+#    fleet (gRPC SandboxService), the api is the REST front the SDK talks to. dev-up
+#    builds + runs both; the SDK's base_url is http://127.0.0.1:8080. Leave it running.
+scripts/dev-up.sh &
 
 python examples/quickstart.py
 ```
@@ -46,7 +46,7 @@ Usage feels like E2B:
 ```python
 from microsandbox import Sandbox
 
-# (Start the control plane first: ./vendor/control-plane -- it owns the VM lifecycle.)
+# (Start the services first: scripts/dev-up.sh -- the orchestrator owns the VM lifecycle, the api is the REST front.)
 # Cold start a microVM (~0.94s: firecracker + guest kernel boot + daemon on vsock).
 with Sandbox() as sandbox:
     ex = sandbox.run_code("print('hello from the microVM')")
@@ -93,39 +93,49 @@ microsandbox/
 │   ├── STAGE4_DESIGN.md       # Stage 4: extracting the Go control plane
 │   ├── STAGE5_DESIGN.md       # Stage 5: the warm pool
 │   ├── STAGE6_DESIGN.md       # Stage 6: named templates (custom images)
-│   └── STAGE7_DESIGN.md       # Stage 7: the Go in-VM daemon (envd)
+│   ├── STAGE7_DESIGN.md       # Stage 7: the Go in-VM daemon (envd)
+│   ├── STAGE8_DESIGN.md       # Stage 8: split the control plane into api + orchestrator (gRPC)
+│   └── E2B_ALIGNMENT_ROADMAP.md  # the post-Stage-7 roadmap toward E2B's component architecture
 ├── src/microsandbox/
 │   ├── protocol.py            # client↔daemon wire protocol (the stable boundary)
-│   ├── client.py              # SDK: Sandbox / run_code -- a thin pure-HTTP client to the control plane
+│   ├── client.py              # SDK: Sandbox / run_code -- a thin pure-HTTP client to the api
 │   ├── server.py              # the retired Python in-VM daemon (Stage 7 replaced it; kept as reference)
 │   └── backend.py             # the retired Python kernel backend (reference)
 ├── daemon/                    # the Go in-VM daemon (Stage 7, E2B's envd): vsock HTTP/SSE; drives the kernel via a Jupyter gateway
-├── control-plane/             # the Go control plane (Stage 4): owns the microVM fleet (E2B's "infra")
+├── services/                  # the Go host control plane (Stage 8, E2B's "infra"), module microsandbox/services
+│   ├── cmd/api/               #   public REST front + SQLite metadata store; calls the orchestrator over gRPC
+│   ├── cmd/orchestrator/      #   owns the microVM fleet + warm pool (gRPC SandboxService) + the vsock data proxy
+│   ├── pkg/                   #   fc / pool / proxy / template / store, + grpc/ (generated stubs)
+│   └── proto/                 #   the gRPC contract (orchestrator.proto)
 ├── scripts/
 │   ├── build-rootfs.sh        # export an ext4 rootfs from the agent image (no root needed)
 │   ├── build-snapshot.sh      # build a warm Firecracker snapshot for millisecond restore
 │   ├── build-template.sh      # build a named custom image (Stage 6): Dockerfile -> rootfs (+ snapshot)
-│   └── build-control-plane.sh # build the Go control plane to vendor/control-plane
+│   ├── build-services.sh      # build the Go host services (api + orchestrator) to vendor/
+│   ├── gen-proto.sh           # regenerate the gRPC stubs from services/proto (needs protoc)
+│   └── dev-up.sh              # build + run orchestrator + api locally (SDK base_url = http://127.0.0.1:8080)
 ├── templates/                 # template recipes (Stage 6): templates/<name>/Dockerfile (built artifacts -> vendor/templates/)
 ├── examples/quickstart.py
-└── tests/                     # end-to-end / stateful / snapshot tests on real VMs (vsock-bridge unit tests are in control-plane/)
+└── tests/                     # end-to-end / stateful / snapshot / metadata tests on real VMs (host-side unit tests are in services/)
 ```
 
 ## How it works (one paragraph)
 
-The SDK (`client.py`) asks the **control plane** (`control-plane/`, Go) for a
-sandbox over HTTP; the control plane writes a declarative Firecracker config and
-starts the `firecracker` process — a microVM with its own guest kernel and an ext4
-rootfs. Inside the VM, PID 1 (`/init`) execs the **Go daemon** (`daemon/`, E2B's
-`envd`), which listens on **vsock**. The SDK then POSTs `/sandboxes/{id}/execute` to
-the control plane, which bridges it to the VM over Firecracker's vsock Unix-domain
-socket (a `CONNECT <port>` handshake, then plain HTTP/SSE) and streams the response
-straight back; the daemon drives a long-lived **Python Jupyter kernel** via a Jupyter
-Kernel Gateway. The SDK itself is pure HTTP — the vsock handshake lives in the control
-plane. The wire protocol (`protocol.py`) is the stable boundary — it never changed as
-the isolation evolved from subprocess to microVM to a control-plane split to a Go
-daemon. See `docs/ARCHITECTURE.md`, `docs/MICROVM_DESIGN.md` and the stage design docs
-(`docs/STAGE4`–`STAGE7_DESIGN.md`).
+The SDK (`client.py`) asks the **api** (`services/cmd/api`, Go) for a sandbox over
+HTTP; the api calls the **orchestrator** (`services/cmd/orchestrator`) over **gRPC**,
+which writes a declarative Firecracker config and starts the `firecracker` process — a
+microVM with its own guest kernel and an ext4 rootfs — and records the sandbox in the
+api's SQLite metadata store. Inside the VM, PID 1 (`/init`) execs the **Go daemon**
+(`daemon/`, E2B's `envd`), which listens on **vsock**. The SDK then POSTs
+`/sandboxes/{id}/execute` to the api, which (for now) reverse-proxies it to the
+orchestrator's data proxy, which bridges it to the VM over Firecracker's vsock
+Unix-domain socket (a `CONNECT <port>` handshake, then plain HTTP/SSE) and streams the
+response straight back; the daemon drives a long-lived **Python Jupyter kernel** via a
+Jupyter Kernel Gateway. The SDK itself is pure HTTP. The wire protocol (`protocol.py`)
+is the stable boundary — it never changed as the isolation evolved from subprocess to
+microVM to a control-plane split, a Go daemon, and the api/orchestrator gRPC split. See
+`docs/ARCHITECTURE.md`, `docs/E2B_ALIGNMENT_ROADMAP.md` and the stage design docs
+(`docs/STAGE4`–`STAGE8_DESIGN.md`).
 
 ## ⚠️ Safety note
 
