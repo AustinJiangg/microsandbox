@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+// Package orchestrator is the gRPC contract between the api (the caller) and the
+// per-machine orchestrator (the server). It mirrors E2B's orchestrator SandboxService
+// (e2b-dev/infra: packages/orchestrator/orchestrator.proto). Stage 8b introduces this
+// seam: the api stops calling the VM logic in-process and instead invokes it over gRPC,
+// so the two could later live on different machines -- exactly E2B's api -> orchestrator
+// boundary. See docs/STAGE8_DESIGN.md.
+package orchestrator;
+
+// go_package is the Go import path the generated code belongs to. The codegen script
+// (scripts/gen-proto.sh) passes --go_opt=module=microsandbox/services, which strips that
+// module prefix to decide the on-disk location -> services/pkg/grpc/orchestrator/.
+option go_package = "microsandbox/services/pkg/grpc/orchestrator";
+
+import "google/protobuf/empty.proto"; // the well-known empty message, for RPCs with no useful payload
+
+// SandboxService is the VM lifecycle API the api calls over gRPC. E2B's real service
+// also has Pause / Resume / Checkpoint / ListCachedBuilds; those need runtime
+// checkpointing of a *running* VM, so they arrive in a later stage. Stage 8 ports the
+// three lifecycle verbs the HTTP control plane already had.
+service SandboxService {
+  // Create boots a sandbox (cold start, or snapshot restore which is warm-pool
+  // eligible) and returns only once it has been health-probed -- "ready on delivery".
+  rpc Create(SandboxCreateRequest) returns (SandboxCreateResponse);
+
+  // Delete kills the sandbox's VM and frees its resources. Unknown id is an error.
+  rpc Delete(SandboxDeleteRequest) returns (google.protobuf.Empty);
+
+  // List returns the ids of the sandboxes this orchestrator currently holds.
+  rpc List(google.protobuf.Empty) returns (SandboxListResponse);
+}
+
+// SandboxConfig is what the api hands the orchestrator to shape a new sandbox.
+//
+// The field numbers (= 1, = 2, ...) are the *wire identity* of each field: protobuf
+// encodes them, not the names, so a number must never change or be reused once shipped
+// (that is how old and new builds stay compatible). Names are free to change.
+message SandboxConfig {
+  string template = 1;     // template/image name; "" means the default image
+  bool from_snapshot = 2;  // true: restore from the template's snapshot (fast, pool-eligible)
+  uint32 vcpu = 3;         // 0 = let the orchestrator pick its default (1)
+  uint32 mem_mb = 4;       // 0 = orchestrator default (512)
+}
+
+message SandboxCreateRequest { SandboxConfig config = 1; }
+message SandboxCreateResponse { string sandbox_id = 1; } // the "sb_..." id, already healthy
+message SandboxDeleteRequest { string sandbox_id = 1; }
+message SandboxListResponse { repeated string sandbox_ids = 1; } // repeated = a list/slice

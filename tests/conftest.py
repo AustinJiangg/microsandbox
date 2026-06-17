@@ -101,54 +101,82 @@ def ensure_example_template() -> None:
     )
 
 
+def _wait_healthy(url: str, proc: subprocess.Popen, log_path: pathlib.Path) -> None:
+    """Poll url until it answers 200, failing fast if the process exits early.
+
+    A connection refused before the server binds raises URLError (an OSError subclass),
+    so we just retry until the deadline.
+    """
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"{url}: process exited early (code {proc.returncode}); see {log_path}"
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=1) as r:
+                if r.status == 200:
+                    return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError(f"{url} did not become healthy; see {log_path}")
+
+
 @pytest.fixture(scope="session")
 def control_plane(tmp_path_factory):
-    """Build and run the Go control plane once for the whole test session.
+    """Build and run the Go services (orchestrator + api) once for the whole test session.
 
-    As of Stage 4 every Sandbox is created by asking this service (rather than the SDK
-    forking firecracker itself), so the microVM tests need it running. Skips the whole
-    microVM group when go / firecracker / kvm are unavailable, keeping pytest green on
-    machines / CI without them. Yields the control plane's base URL.
+    Stage 8b split the control plane into two binaries: the orchestrator (gRPC
+    SandboxService + the vsock data proxy) and the api (public REST, which calls the
+    orchestrator over gRPC and -- for now -- proxies the data path to it). The SDK talks
+    only to the api, so this fixture yields the api's base URL. Skips the whole microVM
+    group when go / firecracker / kvm are unavailable, keeping pytest green without them.
     """
     if not firecracker_available():
         pytest.skip("firecracker/kernel/kvm incomplete, skipping microVM cases")
     if not go_available():
-        pytest.skip("go toolchain not found, skipping control-plane cases")
+        pytest.skip("go toolchain not found, skipping services cases")
 
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     ensure_rootfs()  # the orchestrator needs the rootfs for any cold start
     subprocess.run([str(repo_root / "scripts" / "build-services.sh")], check=True)
 
-    addr = "127.0.0.1:8099"
-    base_url = f"http://{addr}"
-    log_path = tmp_path_factory.mktemp("orchestrator") / "orchestrator.log"
-    log_fh = open(log_path, "wb")
-    proc = subprocess.Popen(
+    vendor = str(repo_root / "vendor")
+    api_addr, grpc_addr, proxy_addr = "127.0.0.1:8099", "127.0.0.1:9099", "127.0.0.1:5099"
+    base_url = f"http://{api_addr}"
+
+    logdir = tmp_path_factory.mktemp("services")
+    orch_log = open(logdir / "orchestrator.log", "wb")
+    api_log = open(logdir / "api.log", "wb")
+    orch = subprocess.Popen(
         [str(repo_root / "vendor" / "orchestrator"),
-         "--addr", addr, "--vendor-dir", str(repo_root / "vendor")],
-        stdout=log_fh, stderr=subprocess.STDOUT,
+         "--grpc-addr", grpc_addr, "--proxy-addr", proxy_addr, "--vendor-dir", vendor],
+        stdout=orch_log, stderr=subprocess.STDOUT,
     )
+    api = None
     try:
-        # Wait for the control plane's own /health (a connection refused before it binds
-        # raises URLError, which is an OSError subclass).
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(base_url + "/health", timeout=1) as r:
-                    if r.status == 200:
-                        break
-            except OSError:
-                time.sleep(0.05)
-        else:
-            raise RuntimeError(f"orchestrator did not become healthy; see {log_path}")
+        # Start order: the orchestrator first (the api dials it), then the api; wait on
+        # each one's /health before moving on.
+        _wait_healthy(f"http://{proxy_addr}/health", orch, logdir / "orchestrator.log")
+        api = subprocess.Popen(
+            [str(repo_root / "vendor" / "api"), "--addr", api_addr,
+             "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr],
+            stdout=api_log, stderr=subprocess.STDOUT,
+        )
+        _wait_healthy(base_url + "/health", api, logdir / "api.log")
         yield base_url
     finally:
-        proc.terminate()  # SIGTERM -> the orchestrator destroys any VMs still running
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        log_fh.close()
+        # SIGTERM the api first, then the orchestrator (which destroys any running VMs).
+        for proc in (api, orch):
+            if proc is None:
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        orch_log.close()
+        api_log.close()
 
 
 @pytest.fixture

@@ -1,34 +1,40 @@
-// Command orchestrator is the per-machine VM service: it owns the Firecracker microVM
-// fleet (cold start / snapshot restore / destroy), the warm pool, and the vsock data
-// proxy. It is the Stage 8 successor of control-plane/ -- Stage 8a relocates that one
-// binary's logic into the services/ module (split into the fc / pool / proxy / template
-// packages) while keeping the exact same HTTP surface, so nothing above it changes yet.
-// Stage 8b puts a gRPC SandboxService here and a REST `api` in front.
+// Command orchestrator is the per-machine VM service. Stage 8b gives it two listeners:
 //
-// This file wires up flags, routing and shutdown only; the logic lives in server.go and
-// the pkg/* packages.
+//   - a gRPC SandboxService (grpc.go) -- the lifecycle seam the api calls (Create /
+//     Delete / List); this is E2B's api -> orchestrator boundary.
+//   - an HTTP data proxy (dataproxy.go) -- the vsock bridge to the in-VM daemon, routed
+//     by the X-Sandbox-Id header. GET /health on this port is the orchestrator's own
+//     liveness (no sandbox id); every other request is proxied into a VM.
+//
+// It still owns the microVM fleet + warm pool (server.go). This file wires flags, starts
+// both listeners, and tears everything down (destroying all VMs) on a signal.
 package main
 
 import (
 	"context"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"google.golang.org/grpc"
+
+	pb "microsandbox/services/pkg/grpc/orchestrator"
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "host:port to listen on")
+	grpcAddr := flag.String("grpc-addr", "127.0.0.1:9090", "host:port for the gRPC SandboxService (the api calls this)")
+	proxyAddr := flag.String("proxy-addr", "127.0.0.1:5007", "host:port for the HTTP data proxy (vsock bridge to envd)")
 	vendorDir := flag.String("vendor-dir", "vendor",
 		"directory holding firecracker / vmlinux / rootfs.ext4 / snapshot")
 	poolSize := flag.Int("pool-size", 0,
 		"keep this many default-template microVMs warm for instant from_snapshot creates (0 = disabled)")
 	var poolFlags repeatedFlag
-	flag.Var(&poolFlags, "pool",
-		"pre-warm K VMs of a named template (repeatable): --pool name=K")
+	flag.Var(&poolFlags, "pool", "pre-warm K VMs of a named template (repeatable): --pool name=K")
 	flag.Parse()
 
 	poolSpecs, err := parsePoolSpecs(poolFlags, *poolSize)
@@ -37,33 +43,46 @@ func main() {
 	}
 	srv := newServer(*vendorDir, poolSpecs)
 
-	// Go 1.22+ ServeMux: method + path-wildcard patterns. The trailing-slash pattern is
-	// the catch-all transparent proxy; the two exact patterns are the lifecycle endpoints.
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", srv.handleHealth)
-	mux.HandleFunc("POST /sandboxes", srv.handleCreate)
-	mux.HandleFunc("DELETE /sandboxes/{id}", srv.handleDestroy)
-	mux.HandleFunc("/sandboxes/{id}/{rest...}", srv.handleProxy)
-
-	httpServer := &http.Server{Addr: *addr, Handler: mux}
-
-	// Graceful shutdown: on SIGINT/SIGTERM stop accepting, then destroy every VM
-	// so we never leak firecracker processes (killing the process destroys the
-	// whole VM -- see docs/ARCHITECTURE.md).
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-		log.Println("shutting down: destroying all sandboxes")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = httpServer.Shutdown(ctx)
-		srv.destroyAll()
-		os.Exit(0)
-	}()
-
-	log.Printf("orchestrator listening on %s (vendor=%s, pools=%v)", *addr, *vendorDir, poolSpecs)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	// 1) gRPC SandboxService -- the lifecycle seam.
+	lis, err := net.Listen("tcp", *grpcAddr)
+	if err != nil {
 		log.Fatal(err)
 	}
+	grpcServer := grpc.NewServer()
+	pb.RegisterSandboxServiceServer(grpcServer, &sandboxService{srv: srv})
+
+	// 2) HTTP data proxy -- the vsock bridge, routed by X-Sandbox-Id. The "GET /health"
+	// pattern is more specific than "/", so the orchestrator's own liveness never gets
+	// proxied into a VM (and nothing proxies GET /health to a sandbox anyway).
+	proxyMux := http.NewServeMux()
+	proxyMux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	proxyMux.HandleFunc("/", srv.handleData)
+	proxyServer := &http.Server{Addr: *proxyAddr, Handler: proxyMux}
+
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("gRPC serve: %v", err)
+		}
+	}()
+	go func() {
+		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("data proxy serve: %v", err)
+		}
+	}()
+	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, pools=%v)",
+		*grpcAddr, *proxyAddr, *vendorDir, poolSpecs)
+
+	// Graceful shutdown: stop accepting, then destroy every VM so we never leak
+	// firecracker processes (killing the process destroys the whole VM).
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	log.Println("shutting down: destroying all sandboxes")
+	grpcServer.GracefulStop()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = proxyServer.Shutdown(ctx)
+	srv.destroyAll()
 }
