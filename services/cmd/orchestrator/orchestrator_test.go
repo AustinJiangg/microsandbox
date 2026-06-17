@@ -1,11 +1,17 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"microsandbox/services/pkg/pool"
+	"microsandbox/services/pkg/template"
+)
 
 // parsePoolSpecs + poolFor are pure map/string logic, so these run with no VM/KVM,
-// like template_test.go / pool_test.go. They cover the 6c additions: --pool-size maps
-// to the default template, --pool name=K to named ones, conflicts/bad input are
-// rejected at startup, and poolFor selects the right pool (or none).
+// like the pkg-level unit tests. They cover the pool wiring: --pool-size maps to the
+// default template, --pool name=K to named ones, conflicts/bad input are rejected at
+// startup, and poolFor selects the right pool (or none). Ported from
+// control-plane/pools_test.go (Stage 8a).
 
 func TestParsePoolSpecs(t *testing.T) {
 	eq := func(got, want map[string]int) bool {
@@ -64,14 +70,14 @@ func TestParsePoolSpecsErrors(t *testing.T) {
 }
 
 func TestPoolFor(t *testing.T) {
-	s := &server{pools: map[string]*pool{"default": {}, "ml-env": {}}}
-	if s.poolFor(template{name: "default"}) == nil {
+	s := &server{pools: map[string]*pool.Pool{"default": {}, "ml-env": {}}}
+	if s.poolFor(template.Template{Name: "default"}) == nil {
 		t.Error("default should be pooled")
 	}
-	if s.poolFor(template{name: "ml-env"}) == nil {
+	if s.poolFor(template.Template{Name: "ml-env"}) == nil {
 		t.Error("ml-env should be pooled")
 	}
-	if s.poolFor(template{name: "other"}) != nil {
+	if s.poolFor(template.Template{Name: "other"}) != nil {
 		t.Error("other (unpooled) should return nil")
 	}
 }

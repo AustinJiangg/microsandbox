@@ -8,18 +8,27 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"microsandbox/services/pkg/fc"
+	"microsandbox/services/pkg/pool"
+	"microsandbox/services/pkg/proxy"
+	"microsandbox/services/pkg/template"
 )
 
 // server owns the microVM fleet: it creates VMs (cold start or snapshot restore,
 // optionally handed out from a warm pool), transparently proxies the data path to
 // them over vsock, and destroys them. See docs/STAGE4_DESIGN.md (the control-plane
 // split) and docs/STAGE5_DESIGN.md (the warm pool).
+//
+// Stage 8a relocated this from control-plane/server.go into the services/ module's
+// orchestrator binary; the lifecycle/proxy logic is unchanged, it just calls the new
+// fc / pool / proxy / template packages. The gRPC seam (8b) replaces this HTTP surface.
 type server struct {
 	vendorDir string
-	pools     map[string]*pool // template name -> its warm pool; empty when no --pool/--pool-size
+	pools     map[string]*pool.Pool // template name -> its warm pool; empty when no --pool/--pool-size
 
-	mu        sync.Mutex          // guards sandboxes
-	sandboxes map[string]*microVM // sandbox id -> running VM
+	mu        sync.Mutex             // guards sandboxes
+	sandboxes map[string]*fc.MicroVM // sandbox id -> running VM
 }
 
 // newServer builds the server and one warm pool per entry in poolSpecs (template name
@@ -28,20 +37,26 @@ type server struct {
 // the original behavior of restoring on the request path. The pool's "make one VM"
 // step is restoreHealthy -- the same one the unpooled from_snapshot path uses.
 func newServer(vendorDir string, poolSpecs map[string]int) *server {
-	s := &server{vendorDir: vendorDir, sandboxes: map[string]*microVM{}, pools: map[string]*pool{}}
+	s := &server{vendorDir: vendorDir, sandboxes: map[string]*fc.MicroVM{}, pools: map[string]*pool.Pool{}}
 	for name, k := range poolSpecs {
 		// name was validated by parsePoolSpecs, so resolve cannot fail. tmpl is a
 		// fresh per-iteration variable, so each closure captures its own template.
-		tmpl, _ := resolveTemplate(vendorDir, name)
-		p := newPool(k, func() (*microVM, error) { return restoreHealthy(vendorDir, tmpl) })
+		tmpl, _ := template.Resolve(vendorDir, name)
+		p := pool.New(k, func() (pool.VM, error) {
+			vm, err := restoreHealthy(vendorDir, tmpl)
+			if err != nil {
+				return nil, err
+			}
+			return vm, nil
+		})
 		s.pools[name] = p
-		p.start()
+		p.Start()
 	}
 	return s
 }
 
 // poolFor returns the warm pool for a template, or nil if that template isn't pooled.
-func (s *server) poolFor(tmpl template) *pool { return s.pools[tmpl.name] }
+func (s *server) poolFor(tmpl template.Template) *pool.Pool { return s.pools[tmpl.Name] }
 
 // repeatedFlag collects a flag passed more than once (--pool a=1 --pool b=2).
 type repeatedFlag []string
@@ -62,14 +77,14 @@ func parsePoolSpecs(poolFlags []string, poolSize int) (map[string]int, error) {
 		if k <= 0 {
 			return fmt.Errorf("pool size for %q must be > 0, got %d", name, k)
 		}
-		if _, err := resolveTemplate("", name); err != nil { // validate the name (path-independent)
+		if _, err := template.Resolve("", name); err != nil { // validate the name (path-independent)
 			return err
 		}
 		out[name] = k
 		return nil
 	}
 	if poolSize > 0 {
-		if err := add(defaultTemplate, poolSize); err != nil {
+		if err := add(template.DefaultTemplate, poolSize); err != nil {
 			return nil, err
 		}
 	}
@@ -89,9 +104,8 @@ func parsePoolSpecs(poolFlags []string, poolSize int) (map[string]int, error) {
 	return out, nil
 }
 
-// handleHealth is the control plane's *own* liveness, not a VM's. The SDK uses
-// it to wait for the service to come up (e.g. the test fixture after launching
-// the binary).
+// handleHealth is the orchestrator's *own* liveness, not a VM's. The test fixture and
+// (from Stage 8b) the api use it to wait for the service to come up.
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -101,13 +115,13 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // error carrying the guest serial tail for diagnostics. Shared by the cold-start, the
 // unpooled restore, and the warm pool's pre-warm paths -- "ready on delivery" in one
 // place.
-func healthyOrDestroy(vm *microVM, err error) (*microVM, error) {
+func healthyOrDestroy(vm *fc.MicroVM, err error) (*fc.MicroVM, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := waitHealthy(vm.udsPath, vsockPort, 10*time.Second); err != nil {
-		tail := vm.consoleTail()
-		vm.destroy()
+	if err := proxy.WaitHealthy(vm.UDSPath, fc.VsockPort, 10*time.Second); err != nil {
+		tail := vm.ConsoleTail()
+		vm.Destroy()
 		return nil, fmt.Errorf("sandbox %v; %s", err, tail)
 	}
 	return vm, nil
@@ -115,21 +129,21 @@ func healthyOrDestroy(vm *microVM, err error) (*microVM, error) {
 
 // restoreHealthy / spawnHealthy mint an id, create a VM (restored from the snapshot /
 // cold-started), and block until it is healthy.
-func restoreHealthy(vendorDir string, tmpl template) (*microVM, error) {
-	return healthyOrDestroy(restoreMicroVM(newID(), vendorDir, tmpl))
+func restoreHealthy(vendorDir string, tmpl template.Template) (*fc.MicroVM, error) {
+	return healthyOrDestroy(fc.Restore(fc.NewID(), vendorDir, tmpl))
 }
 
-func spawnHealthy(vendorDir string, tmpl template) (*microVM, error) {
-	return healthyOrDestroy(spawnMicroVM(newID(), vendorDir, tmpl))
+func spawnHealthy(vendorDir string, tmpl template.Template) (*fc.MicroVM, error) {
+	return healthyOrDestroy(fc.Spawn(fc.NewID(), vendorDir, tmpl))
 }
 
 // handleCreate: POST /sandboxes -- spawn (or restore from snapshot) a microVM.
-// Body: {"from_snapshot": bool}. Returns 201 {"id"} only once the VM is healthy
-// ("ready on delivery"). The SDK reaches the VM through the proxy (handleProxy), so
-// it never needs the uds path.
+// Body: {"from_snapshot": bool, "template": string}. Returns 201 {"id"} only once the
+// VM is healthy ("ready on delivery"). The SDK reaches the VM through the proxy
+// (handleProxy), so it never needs the uds path.
 //
 // A from_snapshot create is served from the warm pool when one is configured
-// (pool.get hands out a pre-warmed VM in ~ms, or restores synchronously if the pool
+// (pool.Get hands out a pre-warmed VM in ~ms, or restores synchronously if the pool
 // is momentarily empty); otherwise it restores inline. Either way the VM is healthy
 // before we return.
 func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -142,10 +156,9 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// decode errors.
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	// 6b: the sandbox's image is picked by the request's "template" field (empty = the
-	// default image). An unknown/invalid name is the caller's error -> 400. 6c will
-	// serve a matching template from a per-template warm pool.
-	tmpl, err := resolveTemplate(s.vendorDir, req.Template)
+	// The sandbox's image is picked by the request's "template" field (empty = the
+	// default image). An unknown/invalid name is the caller's error -> 400.
+	tmpl, err := template.Resolve(s.vendorDir, req.Template)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -155,10 +168,14 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// its own image inline. A pooled VM is always the right image -- each pool restores
 	// from its template's own snapshot (newServer).
 	p := s.poolFor(tmpl)
-	var vm *microVM
+	var vm *fc.MicroVM
 	switch {
 	case req.FromSnapshot && p != nil:
-		vm, err = p.get()
+		var v pool.VM
+		v, err = p.Get()
+		if err == nil {
+			vm = v.(*fc.MicroVM) // the pool only ever holds *fc.MicroVM (newServer's restore)
+		}
 	case req.FromSnapshot:
 		vm, err = restoreHealthy(s.vendorDir, tmpl)
 	default:
@@ -170,13 +187,12 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.sandboxes[vm.id] = vm
+	s.sandboxes[vm.ID] = vm
 	s.mu.Unlock()
-	writeJSON(w, http.StatusCreated, map[string]string{"id": vm.id})
+	writeJSON(w, http.StatusCreated, map[string]string{"id": vm.ID})
 }
 
-// handleDestroy: DELETE /sandboxes/{id} -- kill the VM and clean up. Ported from
-// client.py's close(). Unknown id -> 404.
+// handleDestroy: DELETE /sandboxes/{id} -- kill the VM and clean up. Unknown id -> 404.
 func (s *server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.mu.Lock()
@@ -189,13 +205,13 @@ func (s *server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such sandbox: " + id})
 		return
 	}
-	vm.destroy()
+	vm.Destroy()
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleProxy: ANY /sandboxes/{id}/<rest> -- transparently bridge the request to
 // the in-VM daemon at /<rest> over vsock (the data path: /execute, /files/*,
-// /commands). The control plane stays protocol-agnostic here -- it pipes bytes, so
+// /commands). The orchestrator stays protocol-agnostic here -- it pipes bytes, so
 // protocol.py remains the single source of truth.
 func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -206,19 +222,19 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such sandbox: " + id})
 		return
 	}
-	vsockProxy(vm.udsPath, vsockPort, r.PathValue("rest")).ServeHTTP(w, r)
+	proxy.VsockProxy(vm.UDSPath, fc.VsockPort, r.PathValue("rest")).ServeHTTP(w, r)
 }
 
 // destroyAll terminates every running VM -- the warm pools' idle VMs first, then the
 // active ones in the registry. Called on shutdown so nothing leaks.
 func (s *server) destroyAll() {
 	for _, p := range s.pools {
-		p.drain()
+		p.Drain()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, vm := range s.sandboxes {
-		vm.destroy()
+		vm.Destroy()
 		delete(s.sandboxes, id)
 	}
 }

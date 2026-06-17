@@ -20,7 +20,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NAME="${1:-}"
 [ -n "$NAME" ] || { echo "usage: scripts/build-template.sh <name> [dockerfile] [--no-snapshot]" >&2; exit 1; }
-# Mirror the control plane's name rule (control-plane/template.go), so a name that
+# Mirror the orchestrator's name rule (services/pkg/template/template.go), so a name that
 # builds is also a name that resolves at runtime.
 echo "$NAME" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,63}$' || {
   echo "invalid template name '$NAME': must match [a-z0-9][a-z0-9_-]* (max 64 chars)" >&2; exit 1; }

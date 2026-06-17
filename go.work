@@ -1,0 +1,9 @@
+// Go workspace tying the host services and the in-VM daemon together, so editor
+// tooling and `go test ./...` span both modules from the repo root. Each module
+// (services = host control plane, daemon = envd) still builds standalone.
+go 1.25.0
+
+use (
+	./daemon
+	./services
+)

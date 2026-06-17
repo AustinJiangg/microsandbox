@@ -1,7 +1,7 @@
-package main
+package pool
 
 // Unit tests for the warm pool (Stage 5b). The "make one VM" step is injected, so
-// get / refill / drain / the size cap are all exercised with a fake restorer and no
+// Get / refill / Drain / the size cap are all exercised with a fake restorer and no
 // firecracker / KVM -- the same approach proxy_test.go takes for the vsock bridge.
 // These run anywhere Go is installed.
 
@@ -27,18 +27,28 @@ func eventually(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Fatalf("condition not met within %s", timeout)
 }
 
-// fakeRestorer stands in for restoreHealthy: it produces dummy microVMs (a real temp
-// workdir so destroy() is observable, but no firecracker process) and can be made to
-// fail or to block mid-restore -- enough to drive every pool path without a VM.
+// fakeVM is a stand-in handle: Destroy() removes a real temp workdir, so a test can
+// observe that drain / late-warm cleanup actually ran -- no firecracker process.
+type fakeVM struct{ workdir string }
+
+func (v *fakeVM) Destroy() {
+	if v.workdir != "" {
+		os.RemoveAll(v.workdir)
+	}
+}
+
+// fakeRestorer stands in for the orchestrator's restoreHealthy: it produces dummy VMs
+// (a real temp workdir so Destroy() is observable) and can be made to fail or to block
+// mid-restore -- enough to drive every pool path without a VM.
 type fakeRestorer struct {
 	mu    sync.Mutex
 	calls int
 	fail  bool
 	block chan struct{} // if non-nil, each restore waits on it (to observe the in-flight cap)
-	dirs  []string      // workdirs handed to produced VMs, so a test can check destroy() ran
+	dirs  []string      // workdirs handed to produced VMs, so a test can check Destroy() ran
 }
 
-func (f *fakeRestorer) restore() (*microVM, error) {
+func (f *fakeRestorer) restore() (VM, error) {
 	f.mu.Lock()
 	f.calls++
 	block, fail := f.block, f.fail
@@ -57,8 +67,8 @@ func (f *fakeRestorer) restore() (*microVM, error) {
 	f.mu.Lock()
 	f.dirs = append(f.dirs, dir)
 	f.mu.Unlock()
-	// No proc, no udsPath: destroy() then only os.RemoveAll(workdir), which we observe.
-	return &microVM{id: newID(), workdir: dir}, nil
+	// No proc, no uds: Destroy() then only os.RemoveAll(workdir), which we observe.
+	return &fakeVM{workdir: dir}, nil
 }
 
 func (f *fakeRestorer) callCount() int {
@@ -75,79 +85,79 @@ func (f *fakeRestorer) workdirs() []string {
 
 func TestPoolFillsToSize(t *testing.T) {
 	f := &fakeRestorer{}
-	p := newPool(3, f.restore)
-	p.start()
+	p := New(3, f.restore)
+	p.Start()
 
-	eventually(t, 2*time.Second, func() bool { return p.readyLen() == 3 })
+	eventually(t, 2*time.Second, func() bool { return p.ReadyLen() == 3 })
 	if got := f.callCount(); got != 3 {
 		t.Fatalf("restore called %d times, want exactly 3 (filled to size, no over-warming)", got)
 	}
-	p.drain()
+	p.Drain()
 }
 
 func TestPoolGetHitsWarmThenRefills(t *testing.T) {
 	f := &fakeRestorer{}
-	p := newPool(2, f.restore)
-	p.start()
-	eventually(t, 2*time.Second, func() bool { return p.readyLen() == 2 })
+	p := New(2, f.restore)
+	p.Start()
+	eventually(t, 2*time.Second, func() bool { return p.ReadyLen() == 2 })
 
-	vm, err := p.get()
+	vm, err := p.Get()
 	if err != nil || vm == nil {
-		t.Fatalf("get() = (%v, %v); want a warm VM", vm, err)
+		t.Fatalf("Get() = (%v, %v); want a warm VM", vm, err)
 	}
 	// The handed-out slot is refilled in the background, back up to size.
-	eventually(t, 2*time.Second, func() bool { return p.readyLen() == 2 })
+	eventually(t, 2*time.Second, func() bool { return p.ReadyLen() == 2 })
 	if got := f.callCount(); got != 3 {
 		t.Fatalf("restore called %d times, want 3 (2 initial + 1 refill)", got)
 	}
-	vm.destroy()
-	p.drain()
+	vm.Destroy()
+	p.Drain()
 }
 
 func TestPoolGetFallsBackWhenEmpty(t *testing.T) {
 	f := &fakeRestorer{}
-	p := newPool(1, f.restore) // not started: the ready queue is empty
+	p := New(1, f.restore) // not started: the ready queue is empty
 
-	vm, err := p.get()
+	vm, err := p.Get()
 	if err != nil || vm == nil {
-		t.Fatalf("get() on an empty pool = (%v, %v); want a synchronously restored VM", vm, err)
+		t.Fatalf("Get() on an empty pool = (%v, %v); want a synchronously restored VM", vm, err)
 	}
 	if f.callCount() < 1 {
 		t.Fatalf("expected at least one (synchronous) restore, got %d", f.callCount())
 	}
-	vm.destroy()
-	p.drain()
+	vm.Destroy()
+	p.Drain()
 }
 
 func TestPoolGetSurfacesRestoreError(t *testing.T) {
 	f := &fakeRestorer{fail: true}
-	p := newPool(1, f.restore)
+	p := New(1, f.restore)
 
-	if _, err := p.get(); err == nil {
-		t.Fatal("get() on an empty pool with a failing restore should surface the error")
+	if _, err := p.Get(); err == nil {
+		t.Fatal("Get() on an empty pool with a failing restore should surface the error")
 	}
 	// Background warms fail too, but are swallowed: the pool stays empty, no hot loop.
-	if n := p.readyLen(); n != 0 {
-		t.Fatalf("readyLen = %d, want 0 after failed warms", n)
+	if n := p.ReadyLen(); n != 0 {
+		t.Fatalf("ReadyLen = %d, want 0 after failed warms", n)
 	}
-	p.drain()
+	p.Drain()
 }
 
 func TestPoolDrainDestroysAndStops(t *testing.T) {
 	f := &fakeRestorer{}
-	p := newPool(3, f.restore)
-	p.start()
-	eventually(t, 2*time.Second, func() bool { return p.readyLen() == 3 })
+	p := New(3, f.restore)
+	p.Start()
+	eventually(t, 2*time.Second, func() bool { return p.ReadyLen() == 3 })
 	dirs := f.workdirs()
 
-	p.drain()
+	p.Drain()
 
-	if n := p.readyLen(); n != 0 {
-		t.Fatalf("readyLen = %d after drain, want 0", n)
+	if n := p.ReadyLen(); n != 0 {
+		t.Fatalf("ReadyLen = %d after drain, want 0", n)
 	}
 	for _, d := range dirs {
 		if _, err := os.Stat(d); !os.IsNotExist(err) {
-			t.Errorf("workdir %s still exists after drain; destroy() did not run", d)
+			t.Errorf("workdir %s still exists after drain; Destroy() did not run", d)
 		}
 	}
 	// Closed pool: refill is a no-op (no new restores).
@@ -160,8 +170,8 @@ func TestPoolDrainDestroysAndStops(t *testing.T) {
 
 func TestPoolNeverExceedsSize(t *testing.T) {
 	f := &fakeRestorer{block: make(chan struct{})}
-	p := newPool(2, f.restore)
-	p.start()
+	p := New(2, f.restore)
+	p.Start()
 
 	// All `size` warms enter restore() and block there; the in-flight cap stops a 3rd.
 	eventually(t, 2*time.Second, func() bool { return f.callCount() == 2 })
@@ -171,6 +181,6 @@ func TestPoolNeverExceedsSize(t *testing.T) {
 	}
 
 	close(f.block) // release; the warms complete and fill the pool
-	eventually(t, 2*time.Second, func() bool { return p.readyLen() == 2 })
-	p.drain()
+	eventually(t, 2*time.Second, func() bool { return p.ReadyLen() == 2 })
+	p.Drain()
 }

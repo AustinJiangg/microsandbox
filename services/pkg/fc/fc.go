@@ -1,4 +1,9 @@
-package main
+// Package fc is the Firecracker microVM lifecycle: cold start from a rootfs, restore
+// from a snapshot, and destroy. Ported verbatim from control-plane/microvm.go (Stage
+// 8a: relocated; MicroVM.ID / MicroVM.UDSPath and the Spawn/Restore/Destroy entry
+// points are exported now that the orchestrator drives them from cmd/orchestrator).
+// The host side shells out to the `firecracker` binary -- there is no Go VM library.
+package fc
 
 import (
 	"bytes"
@@ -15,12 +20,14 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"microsandbox/services/pkg/template"
 )
 
 // Firecracker microVM topology -- must match the rootfs's /init and the snapshot.
 // Ported from client.py's _MICROVM_* constants.
 const (
-	vsockPort = 1024 // vsock port the daemon listens on inside the VM
+	VsockPort = 1024 // vsock port the daemon listens on inside the VM (exported: callers probe/proxy it)
 	guestCID  = 3    // guest's vsock CID (host is fixed at 2)
 	vcpus     = 1
 	memMiB    = 512 // a Jupyter kernel runs inside the VM; 256 is tight, so give 512
@@ -29,30 +36,30 @@ const (
 	accessW = 0x2 // W_OK
 )
 
-// microVM is a handle to one running Firecracker process and its per-VM working
+// MicroVM is a handle to one running Firecracker process and its per-VM working
 // directory (config.json / api.sock / console.log / -- for cold start -- the
 // vsock UDS). Ported from client.py's _spawn_microvm / _restore_microvm / close.
-type microVM struct {
-	id      string
+type MicroVM struct {
+	ID      string
 	proc    *exec.Cmd
 	workdir string
-	udsPath string // Firecracker multiplexes the guest vsock onto this UDS; the SDK connects to it
+	UDSPath string // Firecracker multiplexes the guest vsock onto this UDS; the data proxy connects to it
 }
 
-// newID mints a unique sandbox id (no external uuid dependency).
-func newID() string {
+// NewID mints a unique sandbox id (no external uuid dependency).
+func NewID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return "sb_" + hex.EncodeToString(b)
 }
 
-// checkHostArtifacts surfaces template-independent environment problems before
+// CheckHostArtifacts surfaces template-independent environment problems before
 // startup with actionable guidance: the firecracker binary, the guest kernel, and
 // an accessible /dev/kvm. The per-template rootfs / snapshot are checked separately
-// by spawnMicroVM / restoreMicroVM against the resolved template (Stage 6) -- they
-// now live under vendor/templates/<name>/ rather than at one fixed path. Ported from
-// client.py's _check_microvm_available.
-func checkHostArtifacts(vendorDir string) error {
+// by Spawn / Restore against the resolved template (Stage 6) -- they now live under
+// vendor/templates/<name>/ rather than at one fixed path. Ported from client.py's
+// _check_microvm_available.
+func CheckHostArtifacts(vendorDir string) error {
 	for _, f := range []struct{ path, hint string }{
 		{filepath.Join(vendorDir, "firecracker"), "see docs/MICROVM_DESIGN.md §7 for setup"},
 		{filepath.Join(vendorDir, "vmlinux"), "see docs/MICROVM_DESIGN.md §7 for setup"},
@@ -71,15 +78,15 @@ func checkHostArtifacts(vendorDir string) error {
 	return nil
 }
 
-// spawnMicroVM cold-starts a Firecracker microVM (from the template's rootfs) with
-// the daemon running inside, exposed via vsock. Ported from client.py's _spawn_microvm.
-func spawnMicroVM(id, vendorDir string, tmpl template) (*microVM, error) {
-	if err := checkHostArtifacts(vendorDir); err != nil {
+// Spawn cold-starts a Firecracker microVM (from the template's rootfs) with the daemon
+// running inside, exposed via vsock. Ported from client.py's _spawn_microvm.
+func Spawn(id, vendorDir string, tmpl template.Template) (*MicroVM, error) {
+	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(tmpl.rootfs); err != nil {
+	if _, err := os.Stat(tmpl.Rootfs); err != nil {
 		return nil, fmt.Errorf("missing rootfs %s for template %q; run scripts/build-rootfs.sh"+
-			" (or scripts/build-template.sh %s) first", tmpl.rootfs, tmpl.name, tmpl.name)
+			" (or scripts/build-template.sh %s) first", tmpl.Rootfs, tmpl.Name, tmpl.Name)
 	}
 	workdir, err := os.MkdirTemp("", "microsandbox-vm-")
 	if err != nil {
@@ -97,7 +104,7 @@ func spawnMicroVM(id, vendorDir string, tmpl template) (*microVM, error) {
 		},
 		"drives": []any{map[string]any{
 			"drive_id":       "rootfs",
-			"path_on_host":   tmpl.rootfs,
+			"path_on_host":   tmpl.Rootfs,
 			"is_root_device": true,
 			"is_read_only":   true, // all writes go to the in-VM tmpfs /tmp
 		}},
@@ -120,35 +127,35 @@ func spawnMicroVM(id, vendorDir string, tmpl template) (*microVM, error) {
 	return vm, nil
 }
 
-// restoreMicroVM restores a microVM from a pre-generated snapshot (~30ms to
-// ready vs ~0.94s cold start). Ported from client.py's _restore_microvm.
+// Restore restores a microVM from a pre-generated snapshot (~30ms to ready vs ~0.94s
+// cold start). Ported from client.py's _restore_microvm.
 //
 // The snapshot bakes in a fixed vsock uds path (vendor/snapshot/fc.vsock), which
 // alone would limit us to one restore at a time. We override it per-VM at load
 // time via Firecracker v1.16.0's vsock_override, so N VMs can be restored from the
 // one snapshot -- each listening on its own workdir/fc.vsock. This is the basis for
 // the warm pool (Stage 5). See docs/STAGE5_DESIGN.md.
-func restoreMicroVM(id, vendorDir string, tmpl template) (*microVM, error) {
-	if err := checkHostArtifacts(vendorDir); err != nil {
+func Restore(id, vendorDir string, tmpl template.Template) (*MicroVM, error) {
+	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
 	}
-	snap := tmpl.snapshotDir
+	snap := tmpl.SnapshotDir
 	vmstate := filepath.Join(snap, "vmstate")
 	memfile := filepath.Join(snap, "memfile")
 	if _, err := os.Stat(vmstate); err != nil {
 		return nil, fmt.Errorf("missing snapshot (%s) for template %q; run scripts/build-snapshot.sh"+
-			" (or scripts/build-template.sh %s) first", snap, tmpl.name, tmpl.name)
+			" (or scripts/build-template.sh %s) first", snap, tmpl.Name, tmpl.Name)
 	}
 	if _, err := os.Stat(memfile); err != nil {
 		return nil, fmt.Errorf("missing snapshot (%s) for template %q; run scripts/build-snapshot.sh"+
-			" (or scripts/build-template.sh %s) first", snap, tmpl.name, tmpl.name)
+			" (or scripts/build-template.sh %s) first", snap, tmpl.Name, tmpl.Name)
 	}
 	// The snapshot references its rootfs by the absolute path baked in at build time,
 	// so that rootfs must still be present for the load to succeed (Stage 6: it lives
 	// under the template's own dir).
-	if _, err := os.Stat(tmpl.rootfs); err != nil {
+	if _, err := os.Stat(tmpl.Rootfs); err != nil {
 		return nil, fmt.Errorf("missing rootfs %s for template %q (the snapshot references it);"+
-			" rebuild with scripts/build-template.sh %s", tmpl.rootfs, tmpl.name, tmpl.name)
+			" rebuild with scripts/build-template.sh %s", tmpl.Rootfs, tmpl.Name, tmpl.Name)
 	}
 
 	workdir, err := os.MkdirTemp("", "microsandbox-vm-")
@@ -175,8 +182,8 @@ func restoreMicroVM(id, vendorDir string, tmpl template) (*microVM, error) {
 		"resume_vm":      true,
 	}, 15*time.Second)
 	if err != nil || (status != 200 && status != 204) {
-		tail := vm.consoleTail()
-		vm.destroy()
+		tail := vm.ConsoleTail()
+		vm.Destroy()
 		return nil, fmt.Errorf("snapshot/load failed: status=%d err=%v; %s", status, err, tail)
 	}
 	return vm, nil
@@ -186,7 +193,7 @@ func restoreMicroVM(id, vendorDir string, tmpl template) (*microVM, error) {
 // its stdout/stderr (the guest serial console) to workdir/console.log. We can't
 // use a pipe: the guest console writes continuously and a full pipe buffer would
 // stall the VM, so it lands in a file we can tail for diagnostics.
-func startFirecracker(id, vendorDir, workdir, uds string, args ...string) (*microVM, error) {
+func startFirecracker(id, vendorDir, workdir, uds string, args ...string) (*MicroVM, error) {
 	console, err := os.Create(filepath.Join(workdir, "console.log"))
 	if err != nil {
 		return nil, err
@@ -199,13 +206,13 @@ func startFirecracker(id, vendorDir, workdir, uds string, args ...string) (*micr
 	if err != nil {
 		return nil, err
 	}
-	return &microVM{id: id, proc: cmd, workdir: workdir, udsPath: uds}, nil
+	return &MicroVM{ID: id, proc: cmd, workdir: workdir, UDSPath: uds}, nil
 }
 
-// destroy kills the firecracker process (which destroys the whole VM -- memory
+// Destroy kills the firecracker process (which destroys the whole VM -- memory
 // and device state vanish with the process) and removes the working directory.
 // Ported from client.py's close().
-func (vm *microVM) destroy() {
+func (vm *MicroVM) Destroy() {
 	if vm.proc != nil && vm.proc.Process != nil {
 		_ = vm.proc.Process.Signal(syscall.SIGTERM)
 		done := make(chan error, 1)
@@ -222,9 +229,9 @@ func (vm *microVM) destroy() {
 	}
 }
 
-// consoleTail grabs the tail of the guest serial log, for startup-failure
+// ConsoleTail grabs the tail of the guest serial log, for startup-failure
 // diagnostics only. Ported from client.py's _microvm_log.
-func (vm *microVM) consoleTail() string {
+func (vm *MicroVM) ConsoleTail() string {
 	data, err := os.ReadFile(filepath.Join(vm.workdir, "console.log"))
 	if err != nil {
 		return ""

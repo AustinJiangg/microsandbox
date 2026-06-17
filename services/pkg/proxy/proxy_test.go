@@ -1,4 +1,4 @@
-package main
+package proxy
 
 // Unit tests for the vsock bridge (the Go port of the old Python test_transport.py).
 // A local AF_UNIX server impersonates Firecracker's vsock UDS, feeding fixed bytes
@@ -112,7 +112,7 @@ func TestVsockProxyStreamsSSE(t *testing.T) {
 
 	// Exercise the full proxy ServeHTTP path through a front HTTP server.
 	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		vsockProxy(uds, 1024, "execute").ServeHTTP(w, r)
+		VsockProxy(uds, 1024, "execute").ServeHTTP(w, r)
 	}))
 	defer front.Close()
 
@@ -147,13 +147,13 @@ func TestVsockHealthy(t *testing.T) {
 		http.ReadRequest(br) // consume GET /health
 		io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 	})
-	if !vsockHealthy(uds, 1024) {
-		t.Fatal("vsockHealthy = false, want true")
+	if !VsockHealthy(uds, 1024) {
+		t.Fatal("VsockHealthy = false, want true")
 	}
 }
 
 func TestVsockHealthyFalseWhenNoSocket(t *testing.T) {
-	if vsockHealthy(filepath.Join(t.TempDir(), "absent.sock"), 1024) {
-		t.Fatal("vsockHealthy = true for a missing socket, want false")
+	if VsockHealthy(filepath.Join(t.TempDir(), "absent.sock"), 1024) {
+		t.Fatal("VsockHealthy = true for a missing socket, want false")
 	}
 }

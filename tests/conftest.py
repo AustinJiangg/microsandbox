@@ -4,8 +4,8 @@ Every Sandbox is created via the Go control plane, so the tests need the go
 toolchain plus firecracker + a guest kernel + rootfs under vendor/ and an
 accessible /dev/kvm. When any of those is missing the microVM fixtures skip as a
 group, so `pytest` still completes on machines without them. The vsock bridge's
-own unit tests now live in Go (control-plane/proxy_test.go, run with
-`go test ./control-plane`) and need none of this.
+own unit tests now live in Go (services/pkg/proxy/proxy_test.go, run with
+`go test ./services/...`) and need none of this.
 """
 
 import functools
@@ -116,15 +116,15 @@ def control_plane(tmp_path_factory):
         pytest.skip("go toolchain not found, skipping control-plane cases")
 
     repo_root = pathlib.Path(__file__).resolve().parents[1]
-    ensure_rootfs()  # the control plane needs the rootfs for any cold start
-    subprocess.run([str(repo_root / "scripts" / "build-control-plane.sh")], check=True)
+    ensure_rootfs()  # the orchestrator needs the rootfs for any cold start
+    subprocess.run([str(repo_root / "scripts" / "build-services.sh")], check=True)
 
     addr = "127.0.0.1:8099"
     base_url = f"http://{addr}"
-    log_path = tmp_path_factory.mktemp("control-plane") / "cp.log"
+    log_path = tmp_path_factory.mktemp("orchestrator") / "orchestrator.log"
     log_fh = open(log_path, "wb")
     proc = subprocess.Popen(
-        [str(repo_root / "vendor" / "control-plane"),
+        [str(repo_root / "vendor" / "orchestrator"),
          "--addr", addr, "--vendor-dir", str(repo_root / "vendor")],
         stdout=log_fh, stderr=subprocess.STDOUT,
     )
@@ -140,10 +140,10 @@ def control_plane(tmp_path_factory):
             except OSError:
                 time.sleep(0.05)
         else:
-            raise RuntimeError(f"control plane did not become healthy; see {log_path}")
+            raise RuntimeError(f"orchestrator did not become healthy; see {log_path}")
         yield base_url
     finally:
-        proc.terminate()  # SIGTERM -> the control plane destroys any VMs still running
+        proc.terminate()  # SIGTERM -> the orchestrator destroys any VMs still running
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:

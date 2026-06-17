@@ -1,11 +1,12 @@
-// Command control-plane is the microsandbox control plane: a small HTTP service
-// that owns the Firecracker microVM fleet. The Python SDK (client.py) used to
-// fork firecracker itself; from Stage 4 on it asks this service over HTTP for a
-// sandbox and runs code through it. See docs/STAGE4_DESIGN.md.
+// Command orchestrator is the per-machine VM service: it owns the Firecracker microVM
+// fleet (cold start / snapshot restore / destroy), the warm pool, and the vsock data
+// proxy. It is the Stage 8 successor of control-plane/ -- Stage 8a relocates that one
+// binary's logic into the services/ module (split into the fc / pool / proxy / template
+// packages) while keeping the exact same HTTP surface, so nothing above it changes yet.
+// Stage 8b puts a gRPC SandboxService here and a REST `api` in front.
 //
-// This file wires up flags, routing and shutdown only. The real logic lives in
-// server.go (handlers + VM registry), microvm.go (firecracker lifecycle) and,
-// in Stage 4b, proxy.go (the transparent vsock bridge).
+// This file wires up flags, routing and shutdown only; the logic lives in server.go and
+// the pkg/* packages.
 package main
 
 import (
@@ -36,9 +37,8 @@ func main() {
 	}
 	srv := newServer(*vendorDir, poolSpecs)
 
-	// Go 1.22+ ServeMux: method + path-wildcard patterns. The trailing-slash
-	// pattern is the catch-all transparent proxy (Stage 4b); the two exact
-	// patterns are the lifecycle endpoints.
+	// Go 1.22+ ServeMux: method + path-wildcard patterns. The trailing-slash pattern is
+	// the catch-all transparent proxy; the two exact patterns are the lifecycle endpoints.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", srv.handleHealth)
 	mux.HandleFunc("POST /sandboxes", srv.handleCreate)
@@ -62,7 +62,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("control-plane listening on %s (vendor=%s, pools=%v)", *addr, *vendorDir, poolSpecs)
+	log.Printf("orchestrator listening on %s (vendor=%s, pools=%v)", *addr, *vendorDir, poolSpecs)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

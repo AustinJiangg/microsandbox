@@ -1,4 +1,10 @@
-package main
+// Package proxy is the host side of the vsock data path: it bridges plain HTTP
+// requests to the in-VM daemon (envd) over Firecracker's vsock UDS, and probes the
+// daemon's /health the same way. Ported verbatim from control-plane/proxy.go (Stage
+// 8a: relocated; the three entry points are exported now that the orchestrator -- and,
+// from Stage 9, client-proxy -- live in other packages). It knows nothing about VMs:
+// callers pass the per-VM uds path + vsock port (fc.MicroVM.UDSPath, fc.VsockPort).
+package proxy
 
 import (
 	"bufio"
@@ -69,10 +75,10 @@ func (b *connClosingBody) Close() error {
 	return err
 }
 
-// vsockProxy returns a reverse proxy that forwards /sandboxes/{id}/<rest> to the
-// in-VM daemon at /<rest> over vsock. FlushInterval -1 flushes every write
-// immediately, so the daemon's SSE stream (/execute) reaches the SDK live.
-func vsockProxy(udsPath string, vsockPort int, rest string) *httputil.ReverseProxy {
+// VsockProxy returns a reverse proxy that forwards a request to the in-VM daemon at
+// /<rest> over vsock. FlushInterval -1 flushes every write immediately, so the
+// daemon's SSE stream (/execute) reaches the SDK live.
+func VsockProxy(udsPath string, vsockPort int, rest string) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = "http"
@@ -86,13 +92,13 @@ func vsockProxy(udsPath string, vsockPort int, rest string) *httputil.ReversePro
 	}
 }
 
-// waitHealthy polls the in-VM daemon's /health over vsock until it answers 200 or
+// WaitHealthy polls the in-VM daemon's /health over vsock until it answers 200 or
 // the timeout elapses. Ported from client.py's _wait_until_healthy; the control
 // plane now does it, so a sandbox is healthy by the time POST /sandboxes returns.
-func waitHealthy(udsPath string, vsockPort int, timeout time.Duration) error {
+func WaitHealthy(udsPath string, vsockPort int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if vsockHealthy(udsPath, vsockPort) {
+		if VsockHealthy(udsPath, vsockPort) {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -100,7 +106,8 @@ func waitHealthy(udsPath string, vsockPort int, timeout time.Duration) error {
 	return fmt.Errorf("did not become healthy within %s", timeout)
 }
 
-func vsockHealthy(udsPath string, vsockPort int) bool {
+// VsockHealthy does one /health probe over vsock, returning whether it answered 200.
+func VsockHealthy(udsPath string, vsockPort int) bool {
 	conn, err := net.DialTimeout("unix", udsPath, time.Second)
 	if err != nil {
 		return false
