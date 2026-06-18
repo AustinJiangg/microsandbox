@@ -124,13 +124,15 @@ def _wait_healthy(url: str, proc: subprocess.Popen, log_path: pathlib.Path) -> N
 
 @pytest.fixture(scope="session")
 def control_plane(tmp_path_factory):
-    """Build and run the Go services (orchestrator + api) once for the whole test session.
+    """Build and run the Go services (orchestrator + client-proxy + api) once per session.
 
-    Stage 8b split the control plane into two binaries: the orchestrator (gRPC
-    SandboxService + the vsock data proxy) and the api (public REST, which calls the
-    orchestrator over gRPC and -- for now -- proxies the data path to it). The SDK talks
-    only to the api, so this fixture yields the api's base URL. Skips the whole microVM
-    group when go / firecracker / kvm are unavailable, keeping pytest green without them.
+    Stage 8b split the control plane into orchestrator (gRPC SandboxService + the vsock
+    data proxy) and api (public REST). Stage 9 adds client-proxy (the edge data proxy that
+    owns the routing catalog): the api registers each sandbox's route in client-proxy on
+    create, and -- once Stage 9b lands -- the SDK sends the data path through client-proxy.
+    Registration is load-bearing (a create rolls back if it fails), so the trio must all be
+    up here. The SDK talks to the api (lifecycle) so this fixture yields the api base URL.
+    Skips the whole microVM group when go / firecracker / kvm are unavailable.
     """
     if not firecracker_available():
         pytest.skip("firecracker/kernel/kvm incomplete, skipping microVM cases")
@@ -143,32 +145,42 @@ def control_plane(tmp_path_factory):
 
     vendor = str(repo_root / "vendor")
     api_addr, grpc_addr, proxy_addr = "127.0.0.1:8099", "127.0.0.1:9099", "127.0.0.1:5099"
+    cp_data_addr, cp_internal_addr = "127.0.0.1:8098", "127.0.0.1:5098"
     base_url = f"http://{api_addr}"
 
     logdir = tmp_path_factory.mktemp("services")
     orch_log = open(logdir / "orchestrator.log", "wb")
+    cp_log = open(logdir / "client-proxy.log", "wb")
     api_log = open(logdir / "api.log", "wb")
     orch = subprocess.Popen(
         [str(repo_root / "vendor" / "orchestrator"),
          "--grpc-addr", grpc_addr, "--proxy-addr", proxy_addr, "--vendor-dir", vendor],
         stdout=orch_log, stderr=subprocess.STDOUT,
     )
-    api = None
+    cp = api = None
     try:
-        # Start order: the orchestrator first (the api dials it), then the api; wait on
-        # each one's /health before moving on.
+        # Start order: orchestrator (the api dials it for lifecycle), then client-proxy
+        # (the api writes routes to it), then the api; wait on each one's /health.
         _wait_healthy(f"http://{proxy_addr}/health", orch, logdir / "orchestrator.log")
+        cp = subprocess.Popen(
+            [str(repo_root / "vendor" / "client-proxy"),
+             "--addr", cp_data_addr, "--internal-addr", cp_internal_addr],
+            stdout=cp_log, stderr=subprocess.STDOUT,
+        )
+        _wait_healthy(f"http://{cp_data_addr}/health", cp, logdir / "client-proxy.log")
         api = subprocess.Popen(
             [str(repo_root / "vendor" / "api"), "--addr", api_addr,
              "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr,
+             "--client-proxy-internal", cp_internal_addr,
              "--db", str(logdir / "microsandbox.db")],
             stdout=api_log, stderr=subprocess.STDOUT,
         )
         _wait_healthy(base_url + "/health", api, logdir / "api.log")
         yield base_url
     finally:
-        # SIGTERM the api first, then the orchestrator (which destroys any running VMs).
-        for proc in (api, orch):
+        # SIGTERM the api first, then client-proxy, then the orchestrator (which destroys
+        # any running VMs).
+        for proc in (api, cp, orch):
             if proc is None:
                 continue
             proc.terminate()
@@ -177,6 +189,7 @@ def control_plane(tmp_path_factory):
             except subprocess.TimeoutExpired:
                 proc.kill()
         orch_log.close()
+        cp_log.close()
         api_log.close()
 
 

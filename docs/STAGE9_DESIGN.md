@@ -218,19 +218,23 @@ untouched; no new module — this all lives in the existing `microsandbox/servic
 
 ## 6. Three independently verifiable sub-steps
 
-### Stage 9a — `pkg/catalog` + `client-proxy`; wire api→client-proxy registration (api keeps its passthrough)
+### Stage 9a — `pkg/catalog` + `client-proxy`; wire api→client-proxy registration; start the trio (api keeps its passthrough)
 Add `pkg/catalog` (interface + `InMemory` + tests). Stand up `cmd/client-proxy` with both
 listeners (data + internal control), unit-tested with `httptest`. Give `api` a catalog client
-that registers on Create / deregisters on Delete (with the rollback-on-failure of Decision 4) —
-but **leave `api`'s data passthrough in place**, so the SDK is unaffected and the path the e2e
-suite exercises is unchanged. **Verify:** `go test ./services/...` green (new catalog +
-client-proxy unit tests) + full Python e2e green (unchanged SDK path).
+that registers on Create / deregisters on Delete (with the rollback-on-failure of Decision 4).
+Because registration is **load-bearing** (Decision 4), `conftest.py` and `dev-up.sh` must start
+the **trio** (orchestrator + client-proxy + api) in this sub-step, so registration succeeds
+end-to-end — otherwise every Create would roll back. But **leave `api`'s data passthrough in
+place and the SDK unchanged**, so the data path the e2e suite exercises is still
+api→orchestrator; `client-proxy` is up and being written to, but not yet on the SDK's data
+path. **Verify:** `go test ./services/...` green (new catalog + client-proxy unit tests) + full
+Python e2e green (registration now happening on every create; data still via the passthrough).
 
-### Stage 9b — flip the SDK's data path to `client-proxy`; conftest + dev-up start the trio
-`api`'s `POST /sandboxes` returns `data_url`; the SDK sends its data calls there with
-`X-Sandbox-Id`. `conftest.py` and `dev-up.sh` start orchestrator + client-proxy + api. The e2e
-suite now exercises the full new path; `api`'s passthrough is still present but unused.
-**Verify:** full e2e green through `client-proxy` (the parity proof).
+### Stage 9b — flip the SDK's data path to `client-proxy`
+`api`'s `POST /sandboxes` returns `data_url` (new `--data-url` flag); the SDK sends its data
+calls there with `X-Sandbox-Id` instead of through the api. The e2e suite now exercises the
+full new path (SDK → client-proxy → catalog → orchestrator → vsock → envd); `api`'s passthrough
+is still present but unused. **Verify:** full e2e green through `client-proxy` (the parity proof).
 
 ### Stage 9c — remove `api`'s data passthrough; `api` is lifecycle-only
 Delete `handleProxy`, the `dataProxy` field, and the `/sandboxes/{id}/{rest...}` route.

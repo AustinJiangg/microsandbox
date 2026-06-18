@@ -39,8 +39,23 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Register the sandbox's data-path route in the catalog (client-proxy reads it to
+	// route data requests). This is load-bearing -- a sandbox with no route is unreachable
+	// -- so on failure we roll the just-built VM back (gRPC Delete) rather than return a
+	// booted-but-unroutable zombie. (E2B's api writes the Redis catalog here.)
+	if err := a.catalog.Register(resp.GetSandboxId(), a.nodeAddr); err != nil {
+		rb, cancelRB := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelRB()
+		if _, derr := a.client.Delete(rb, &pb.SandboxDeleteRequest{SandboxId: resp.GetSandboxId()}); derr != nil {
+			log.Printf("rollback: delete %s after failed route register: %v", resp.GetSandboxId(), derr)
+		}
+		writeJSON(w, http.StatusBadGateway,
+			map[string]string{"error": "could not register sandbox route: " + err.Error()})
+		return
+	}
+
 	// Record the sandbox in the durable metadata store. Best-effort: the VM is already
-	// live and usable, so a metadata write failure is logged, not surfaced -- in this
+	// live and routable, so a metadata write failure is logged, not surfaced -- in this
 	// single-node stage the orchestrator's in-memory registry is the operational truth,
 	// and the store is the record that becomes authoritative across restarts / nodes.
 	templateName := req.Template
@@ -63,6 +78,9 @@ func (a *api) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		writeGRPCError(w, err)
 		return
 	}
+	// Drop the catalog route (best-effort: a stale route only yields a self-healing 404)
+	// and the durable metadata row.
+	a.catalog.Deregister(id)
 	if err := a.store.DeleteSandbox(id); err != nil {
 		log.Printf("store: delete %s: %v", id, err)
 	}

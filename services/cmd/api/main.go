@@ -27,17 +27,22 @@ import (
 )
 
 // api holds the gRPC client to the orchestrator (lifecycle), the metadata store
-// (durable record), and the reverse proxy used for the temporary data-path passthrough.
+// (durable record), the catalog client (registers each sandbox's data-path route in
+// client-proxy), the node value it registers, and -- temporarily, Stage 8/9a -- the
+// reverse proxy used for the data-path passthrough (removed in Stage 9c).
 type api struct {
 	client    pb.SandboxServiceClient
 	store     *store.Store
+	catalog   *catalogClient
+	nodeAddr  string // the node (orchestrator data-proxy addr) registered for each sandbox
 	dataProxy *httputil.ReverseProxy
 }
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "host:port for the public REST API (the SDK's base URL)")
 	orchGRPC := flag.String("orchestrator-grpc", "127.0.0.1:9090", "orchestrator gRPC address (SandboxService)")
-	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address (vsock bridge)")
+	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address: the node value registered in the catalog (and, until Stage 9c, the passthrough target)")
+	clientProxyInternal := flag.String("client-proxy-internal", "127.0.0.1:5008", "client-proxy internal control address (the api writes sandbox routes here)")
 	db := flag.String("db", "vendor/microsandbox.db", "path to the SQLite metadata database")
 	flag.Parse()
 
@@ -57,8 +62,10 @@ func main() {
 	defer st.Close()
 
 	a := &api{
-		client: pb.NewSandboxServiceClient(conn),
-		store:  st,
+		client:   pb.NewSandboxServiceClient(conn),
+		store:    st,
+		catalog:  newCatalogClient(*clientProxyInternal),
+		nodeAddr: *orchProxy,
 		// TEMPORARY (Stage 8): reverse-proxy the data path to the orchestrator's data
 		// proxy, tagging each request with X-Sandbox-Id (which the orchestrator routes
 		// on). Stage 9 replaces this with client-proxy and removes it. One proxy is
@@ -95,7 +102,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, db=%s)", *addr, *orchGRPC, *orchProxy, *db)
+	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, client-proxy-internal=%s, db=%s)",
+		*addr, *orchGRPC, *orchProxy, *clientProxyInternal, *db)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
