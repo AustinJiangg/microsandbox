@@ -172,6 +172,7 @@ def control_plane(tmp_path_factory):
             [str(repo_root / "vendor" / "api"), "--addr", api_addr,
              "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr,
              "--client-proxy-internal", cp_internal_addr,
+             "--data-url", f"http://{cp_data_addr}",
              "--db", str(logdir / "microsandbox.db")],
             stdout=api_log, stderr=subprocess.STDOUT,
         )

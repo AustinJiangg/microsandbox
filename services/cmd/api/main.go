@@ -35,6 +35,7 @@ type api struct {
 	store     *store.Store
 	catalog   *catalogClient
 	nodeAddr  string // the node (orchestrator data-proxy addr) registered for each sandbox
+	dataURL   string // the public client-proxy data URL handed back to the SDK (where to send data)
 	dataProxy *httputil.ReverseProxy
 }
 
@@ -43,6 +44,7 @@ func main() {
 	orchGRPC := flag.String("orchestrator-grpc", "127.0.0.1:9090", "orchestrator gRPC address (SandboxService)")
 	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address: the node value registered in the catalog (and, until Stage 9c, the passthrough target)")
 	clientProxyInternal := flag.String("client-proxy-internal", "127.0.0.1:5008", "client-proxy internal control address (the api writes sandbox routes here)")
+	dataURL := flag.String("data-url", "http://127.0.0.1:8081", "public client-proxy data URL returned to the SDK as where to send the data path")
 	db := flag.String("db", "vendor/microsandbox.db", "path to the SQLite metadata database")
 	flag.Parse()
 
@@ -66,6 +68,7 @@ func main() {
 		store:    st,
 		catalog:  newCatalogClient(*clientProxyInternal),
 		nodeAddr: *orchProxy,
+		dataURL:  *dataURL,
 		// TEMPORARY (Stage 8): reverse-proxy the data path to the orchestrator's data
 		// proxy, tagging each request with X-Sandbox-Id (which the orchestrator routes
 		// on). Stage 9 replaces this with client-proxy and removes it. One proxy is
@@ -102,8 +105,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, client-proxy-internal=%s, db=%s)",
-		*addr, *orchGRPC, *orchProxy, *clientProxyInternal, *db)
+	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, client-proxy-internal=%s, data-url=%s, db=%s)",
+		*addr, *orchGRPC, *orchProxy, *clientProxyInternal, *dataURL, *db)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

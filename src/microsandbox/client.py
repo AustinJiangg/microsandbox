@@ -8,12 +8,13 @@ Design goal: keep the feel as close to E2B as possible. Typical usage:
         execution = sandbox.run_code("print('hello from sandbox')")
         print(execution.stdout)
 
-Every Sandbox is a **Firecracker microVM** managed by the Go host services (Stage 8:
-an `api` REST front backed by a per-machine `orchestrator` over gRPC). The SDK is a
-thin **pure-HTTP** client: it asks the api for a sandbox (POST /sandboxes) and runs
-code by POSTing through it (/sandboxes/{id}/execute, ...); the services bridge to the
-in-VM daemon over vsock. Start them first (scripts/dev-up.sh); they need the vendor/
-artifacts -- see docs/MICROVM_DESIGN.md §7, docs/STAGE8_DESIGN.md and docs/STAGE4_DESIGN.md.
+Every Sandbox is a **Firecracker microVM** managed by the Go host services (Stage 9:
+an `api` REST front for lifecycle, a per-machine `orchestrator` over gRPC, and a
+`client-proxy` edge that owns the routing catalog). The SDK is a thin **pure-HTTP**
+client: it asks the api for a sandbox (POST /sandboxes) and runs code by POSTing to
+client-proxy (POST /execute with an X-Sandbox-Id header, ...); the services bridge to
+the in-VM daemon over vsock. Start them first (scripts/dev-up.sh); they need the vendor/
+artifacts -- see docs/MICROVM_DESIGN.md §7, docs/STAGE9_DESIGN.md and docs/STAGE8_DESIGN.md.
 
 History: this project grew stage by stage (host subprocess -> Docker container ->
 resident container -> microVM -> control-plane split). Those earlier isolation
@@ -33,10 +34,12 @@ from typing import Any
 
 from .protocol import EventType, Execution, ExecuteRequest, OutputEvent
 
-# Where to reach the control plane; overridable per-Sandbox (base_url=) or via env.
-# As of Stage 4b the SDK speaks only plain HTTP to the control plane -- the vsock
-# handshake + bridge now live in the control plane (control-plane/proxy.go), not here.
-_DEFAULT_CONTROL_PLANE_URL = "http://127.0.0.1:8080"
+# Where to reach the services; overridable per-Sandbox (base_url= / data_url=) or via env.
+# The SDK speaks only plain HTTP -- the vsock handshake + bridge live in the services
+# (services/pkg/proxy), not here. Stage 9 split the two faces: lifecycle goes to the api
+# (base_url), the data path to client-proxy (data_url, learned from the create response).
+_DEFAULT_CONTROL_PLANE_URL = "http://127.0.0.1:8080"  # the api (lifecycle): POST/DELETE/GET /sandboxes
+_DEFAULT_DATA_PLANE_URL = "http://127.0.0.1:8081"  # client-proxy (data): /execute, /files/*, /commands
 
 
 class Sandbox:
@@ -52,14 +55,18 @@ class Sandbox:
         template: name of a custom image to boot, built with scripts/build-template.sh
             (see docs/STAGE6_DESIGN.md). Defaults to the stock image. The name must be a
             template built under vendor/templates/<name>/; an unknown name is rejected.
-        base_url: where the Go control plane is reachable. Defaults to the
+        base_url: where the api (lifecycle) is reachable. Defaults to the
             MICROSANDBOX_URL env var, then http://127.0.0.1:8080.
+        data_url: where client-proxy (the data path) is reachable. Normally learned from
+            the create response; set this (or MICROSANDBOX_DATA_URL) to override it, else
+            http://127.0.0.1:8081.
 
-    The SDK is a thin pure-HTTP client. On construction it asks the control plane to
-    spawn or restore a microVM (POST /sandboxes), which returns only once the VM is
-    healthy ("ready on delivery"). run_code / files / commands then POST through the
-    control plane (/sandboxes/{id}/...), which bridges to the in-VM daemon over vsock.
-    close() (or leaving the `with` block) destroys it (DELETE /sandboxes/{id}).
+    The SDK is a thin pure-HTTP client. On construction it asks the api to spawn or
+    restore a microVM (POST /sandboxes), which returns only once the VM is healthy
+    ("ready on delivery") along with the data_url to reach it. run_code / files /
+    commands then POST to client-proxy (data_url) with an X-Sandbox-Id header, which
+    routes to the in-VM daemon over vsock. close() (or leaving the `with` block) destroys
+    it (DELETE /sandboxes/{id} on the api).
     """
 
     def __init__(
@@ -68,6 +75,7 @@ class Sandbox:
         from_snapshot: bool = False,
         template: str | None = None,
         base_url: str | None = None,
+        data_url: str | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self._from_snapshot = from_snapshot
@@ -75,7 +83,11 @@ class Sandbox:
         self._base_url = (
             base_url or os.environ.get("MICROSANDBOX_URL", _DEFAULT_CONTROL_PLANE_URL)
         ).rstrip("/")
-        self._sandbox_id: str | None = None  # the control plane's handle for the VM (set by _create)
+        # The data path goes to client-proxy. Its URL is normally learned from the create
+        # response; an explicit data_url= / MICROSANDBOX_DATA_URL overrides that.
+        self._data_url_override = data_url or os.environ.get("MICROSANDBOX_DATA_URL")
+        self._data_url: str | None = None  # set by _create (override, response, or default)
+        self._sandbox_id: str | None = None  # the api's handle for the VM (set by _create)
 
         # File / shell namespaces, with a feel aligned to E2B's sandbox.files /
         # sandbox.commands. They only talk to the control plane when called.
@@ -102,6 +114,11 @@ class Sandbox:
             body["template"] = self._template
         info = self._control_plane("POST", "/sandboxes", body)
         self._sandbox_id = info["id"]
+        # The api tells the SDK where to reach the sandbox's data path (client-proxy). An
+        # explicit override wins; else use the response; else the default.
+        self._data_url = (
+            self._data_url_override or info.get("data_url") or _DEFAULT_DATA_PLANE_URL
+        ).rstrip("/")
 
     def close(self) -> None:
         # Ask the control plane to destroy the VM. Idempotent: once the id is cleared,
@@ -122,11 +139,15 @@ class Sandbox:
 
     # ----- HTTP to the control plane -----
 
-    def _sandbox_path(self, path: str) -> str:
-        """Map a daemon endpoint (e.g. /execute, /files/read) to its control-plane proxy path."""
+    def _data_headers(self) -> dict:
+        """Headers that route a data request to this sandbox via client-proxy.
+
+        client-proxy routes by the X-Sandbox-Id header (the daemon endpoint is just the
+        request path), so a data call carries the id here rather than in the URL.
+        """
         if self._sandbox_id is None:
             raise RuntimeError("sandbox is closed")
-        return f"/sandboxes/{self._sandbox_id}{path}"
+        return {"X-Sandbox-Id": self._sandbox_id}
 
     def _control_plane(
         self,
@@ -134,20 +155,24 @@ class Sandbox:
         path: str,
         body: dict | None = None,
         timeout: float | None = None,
+        base: str | None = None,
+        headers: dict | None = None,
     ) -> dict:
-        """Make one HTTP call to the control plane, returning the parsed JSON (or {}).
+        """Make one HTTP call to a service, returning the parsed JSON (or {}).
 
-        Used for both lifecycle (/sandboxes) and the proxied data path (/sandboxes/{id}/
-        files|commands). A non-2xx carrying {"error": ...} becomes a RuntimeError; an
-        unreachable control plane becomes a RuntimeError with a hint to start it.
-        timeout=None blocks (a command may legitimately run a while).
+        Lifecycle calls go to the api (base_url, the default); data calls pass
+        base=self._data_url and headers={"X-Sandbox-Id": ...} to reach client-proxy. A
+        non-2xx carrying {"error": ...} becomes a RuntimeError; an unreachable service
+        becomes a RuntimeError with a hint to start it. timeout=None blocks (a command may
+        legitimately run a while).
         """
+        base = base or self._base_url
         data = json.dumps(body).encode() if body is not None else None
+        req_headers = dict(headers or {})
+        if data is not None:
+            req_headers.setdefault("Content-Type", "application/json")
         request = urllib.request.Request(
-            self._base_url + path,
-            data=data,
-            method=method,
-            headers={"Content-Type": "application/json"} if data is not None else {},
+            base + path, data=data, method=method, headers=req_headers
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as resp:
@@ -159,10 +184,10 @@ class Sandbox:
                 detail = json.loads(detail).get("error", detail)
             except json.JSONDecodeError:
                 pass
-            raise RuntimeError(f"control plane {method} {path} failed: {detail}") from exc
+            raise RuntimeError(f"{method} {path} failed: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(
-                f"cannot reach the api at {self._base_url} ({exc.reason}); "
+                f"cannot reach {base} ({exc.reason}); "
                 "is it running? start the services with scripts/dev-up.sh"
             ) from exc
 
@@ -199,19 +224,19 @@ class Sandbox:
         return execution
 
     def _stream(self, code: str, language: str) -> Iterator[OutputEvent]:
-        """POST /execute (via the control-plane proxy) and parse the SSE stream line by line.
+        """POST /execute to client-proxy and parse the SSE stream line by line.
 
-        The control plane proxies the daemon's SSE response straight through, so the SDK
-        reads it over plain HTTP -- no vsock on this side anymore.
+        client-proxy reverse-proxies the daemon's SSE response straight through (flushing
+        every write), so the SDK reads it over plain HTTP -- no vsock on this side.
         """
         request = ExecuteRequest(
             code=code, language=language, timeout_seconds=self.timeout_seconds
         )
         http_request = urllib.request.Request(
-            self._base_url + self._sandbox_path("/execute"),
+            self._data_url + "/execute",
             data=request.to_json().encode(),
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **self._data_headers()},
         )
         # No read timeout: an execution can run for a while; the daemon enforces
         # timeout_seconds and ends the stream.
@@ -226,12 +251,14 @@ class Sandbox:
                 yield OutputEvent.from_sse_payload(payload)
 
     def _post_json(self, path: str, payload: dict) -> dict:
-        """POST JSON to one of the sandbox's daemon endpoints (via the control-plane proxy).
+        """POST JSON to one of the sandbox's daemon endpoints (via client-proxy).
 
         The file/command endpoints go through here (run_code uses _stream's SSE instead).
         A daemon error (non-200 carrying {"error": ...}) surfaces as a RuntimeError.
         """
-        return self._control_plane("POST", self._sandbox_path(path), payload)
+        return self._control_plane(
+            "POST", path, payload, base=self._data_url, headers=self._data_headers()
+        )
 
 
 # ----- file / shell namespaces (attached to Sandbox, with a feel aligned to E2B) -----

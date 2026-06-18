@@ -18,7 +18,7 @@ cp=$!
 "$repo_root/vendor/api" \
 	--addr 127.0.0.1:8080 \
 	--orchestrator-grpc 127.0.0.1:9090 --orchestrator-proxy 127.0.0.1:5007 \
-	--client-proxy-internal 127.0.0.1:5008 \
+	--client-proxy-internal 127.0.0.1:5008 --data-url http://127.0.0.1:8081 \
 	--db "$repo_root/vendor/microsandbox.db" &
 api=$!
 

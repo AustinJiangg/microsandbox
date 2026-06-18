@@ -65,7 +65,9 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if err := a.store.InsertSandbox(resp.GetSandboxId(), templateName); err != nil {
 		log.Printf("store: insert %s: %v", resp.GetSandboxId(), err)
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"id": resp.GetSandboxId()})
+	// Hand the SDK the id plus where to reach its data path (client-proxy). The data_url
+	// is constant across sandboxes this stage; Stage 12 makes it a per-sandbox hostname.
+	writeJSON(w, http.StatusCreated, map[string]string{"id": resp.GetSandboxId(), "data_url": a.dataURL})
 }
 
 // handleDestroy: DELETE /sandboxes/{id} -> gRPC Delete -> drop from the store -> 204
