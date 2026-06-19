@@ -33,7 +33,8 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from .protocol import EventType, Execution, ExecuteRequest, OutputEvent
+from .connect import server_stream
+from .protocol import EventType, Execution, OutputEvent
 
 # Where to reach the services; overridable per-Sandbox (base_url= / data_url=) or via env.
 # The SDK speaks only plain HTTP -- the vsock handshake + bridge live in the services
@@ -225,31 +226,17 @@ class Sandbox:
         return execution
 
     def _stream(self, code: str, language: str) -> Iterator[OutputEvent]:
-        """POST /execute to client-proxy and parse the SSE stream line by line.
+        """Run code via the code-interpreter's server-streaming Execute (ConnectRPC).
 
-        client-proxy reverse-proxies the daemon's SSE response straight through (flushing
-        every write), so the SDK reads it over plain HTTP -- no vsock on this side.
+        client-proxy routes /codeinterpreter.* to the code-interpreter's vsock port; the
+        Connect stream's frames flush through live, so this yields each OutputEvent as the
+        cell runs -- the Connect-protocol successor to the daemon's old /execute SSE.
         """
-        request = ExecuteRequest(
-            code=code, language=language, timeout_seconds=self.timeout_seconds
-        )
-        http_request = urllib.request.Request(
-            self._data_url + "/execute",
-            data=request.to_json().encode(),
-            method="POST",
-            headers={"Content-Type": "application/json", **self._data_headers()},
-        )
-        # No read timeout: an execution can run for a while; the daemon enforces
-        # timeout_seconds and ends the stream.
-        with urllib.request.urlopen(http_request) as resp:
-            for raw in resp:
-                line = raw.decode(errors="replace").rstrip("\n")
-                if not line.startswith("data: "):
-                    continue
-                payload = line[len("data: "):]
-                if not payload:
-                    continue
-                yield OutputEvent.from_sse_payload(payload)
+        url = self._data_url + "/codeinterpreter.CodeInterpreterService/Execute"
+        # protojson uses camelCase JSON names: timeoutSeconds maps to the proto's timeout_seconds.
+        message = {"code": code, "language": language, "timeoutSeconds": self.timeout_seconds}
+        for msg in server_stream(url, message, headers=self._data_headers()):
+            yield _output_event(msg)
 
     def _post_json(self, path: str, payload: dict) -> dict:
         """POST JSON to one of the sandbox's daemon endpoints (via client-proxy).
@@ -309,6 +296,21 @@ class _Commands:
             stderr=data["stderr"],
             exit_code=data["exit_code"],
         )
+
+
+def _output_event(msg: dict) -> OutputEvent:
+    """Build an OutputEvent from a code-interpreter stream message (Stage 11).
+
+    protojson omits zero/empty values, so the fields default. exit_code (protojson's
+    camelCase 'exitCode') is meaningful only on the 'end' event, where the old daemon
+    always conveyed a number -- so default a missing one to 0 there, keeping success /
+    exit_code behavior identical to the SSE days.
+    """
+    etype = EventType(msg.get("type", "end"))
+    exit_code = None
+    if etype == EventType.END:
+        exit_code = int(msg.get("exitCode", msg.get("exit_code", 0)))
+    return OutputEvent(type=etype, data=msg.get("data", ""), exit_code=exit_code)
 
 
 # ----- template build API (Stage 10), aligned with E2B's `template build` -----

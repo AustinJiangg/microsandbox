@@ -27,10 +27,14 @@ import (
 // Firecracker microVM topology -- must match the rootfs's /init and the snapshot.
 // Ported from client.py's _MICROVM_* constants.
 const (
-	VsockPort = 1024 // vsock port the daemon listens on inside the VM (exported: callers probe/proxy it)
-	guestCID  = 3    // guest's vsock CID (host is fixed at 2)
-	vcpus     = 1
-	memMiB    = 512 // a Jupyter kernel runs inside the VM; 256 is tight, so give 512
+	VsockPort = 1024 // envd's vsock port inside the VM (exported: callers probe/proxy it)
+	// CodeInterpreterVsockPort is the second in-VM service (Stage 11): the code-interpreter
+	// (the stateful Python kernel). Firecracker multiplexes both ports onto the one vsock
+	// UDS via CONNECT <port>; the orchestrator routes /codeinterpreter.* here.
+	CodeInterpreterVsockPort = 1025
+	guestCID                 = 3 // guest's vsock CID (host is fixed at 2)
+	vcpus                    = 1
+	memMiB                   = 512 // a Jupyter kernel runs inside the VM; 256 is tight, so give 512
 
 	accessR = 0x4 // R_OK
 	accessW = 0x2 // W_OK

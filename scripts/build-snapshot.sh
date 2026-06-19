@@ -51,13 +51,14 @@ echo "[build-snapshot] warming up the Jupyter kernel (health + running a 'pass' 
 # the warm-up carries its own ~20-line client (stdlib only) rather than importing the
 # SDK. The daemon answers with `Connection: close`, so reading to EOF is safe.
 python3 - "$UDS" <<'PY'
-import socket, sys, time, json
+import socket, struct, sys, time, json
 
-uds, port = sys.argv[1], 1024
+uds = sys.argv[1]
+ENVD_PORT, CI_PORT = 1024, 1025  # Stage 11: envd (health) vs code-interpreter (kernel)
 
-def vsock_request(method, path, body=b"", headers=None):
+def vsock_request(port, method, path, body=b"", headers=None):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(65)  # the first /execute pays the Jupyter kernel cold start
+    s.settimeout(65)  # the first Execute pays the Jupyter kernel cold start
     s.connect(uds)
     s.sendall(b"CONNECT %d\n" % port)            # Firecracker host->guest vsock handshake
     ack = b""
@@ -84,9 +85,10 @@ def vsock_request(method, path, body=b"", headers=None):
     s.close()
     return data
 
+# Wait for envd's /health on the envd port.
 for _ in range(300):
     try:
-        if vsock_request("GET", "/health").startswith(b"HTTP/1.1 200"):
+        if vsock_request(ENVD_PORT, "GET", "/health").startswith(b"HTTP/1.1 200"):
             break
     except OSError:
         pass
@@ -94,8 +96,13 @@ for _ in range(300):
 else:
     sys.exit("health failed: daemon not ready")
 
-body = json.dumps({"code": "pass", "language": "python", "timeout_seconds": 60}).encode()
-vsock_request("POST", "/execute", body=body, headers={"Content-Type": "application/json"})
+# Warm the kernel via the code-interpreter's server-streaming Execute (ConnectRPC). The
+# request is one Connect envelope ([flags=0][4-byte big-endian len][json]); reading the
+# streamed response to EOF blocks until the cell finishes -- i.e. until the kernel is warm.
+msg = json.dumps({"code": "pass", "language": "python", "timeoutSeconds": 60}).encode()
+envelope = struct.pack(">BI", 0, len(msg)) + msg
+vsock_request(CI_PORT, "POST", "/codeinterpreter.CodeInterpreterService/Execute", body=envelope,
+              headers={"Content-Type": "application/connect+json", "Connect-Protocol-Version": "1"})
 print("[build-snapshot] kernel is ready")
 PY
 

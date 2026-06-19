@@ -26,10 +26,17 @@ func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such sandbox: " + id})
 		return
 	}
-	// The daemon endpoint is the request path (e.g. /execute); VsockProxy re-adds the
-	// leading slash, so hand it the path without it.
+	// Two in-VM services on two vsock ports (Stage 11b): a ConnectRPC request to the
+	// code-interpreter (/codeinterpreter.*) goes to its port; everything else (envd:
+	// Filesystem / Process / health + the legacy HTTP endpoints) goes to envd's port.
+	port := fc.VsockPort
+	if strings.HasPrefix(r.URL.Path, "/codeinterpreter.") {
+		port = fc.CodeInterpreterVsockPort
+	}
+	// The daemon endpoint is the request path; VsockProxy re-adds the leading slash, so
+	// hand it the path without it.
 	rest := strings.TrimPrefix(r.URL.Path, "/")
-	proxy.VsockProxy(vm.UDSPath, fc.VsockPort, rest).ServeHTTP(w, r)
+	proxy.VsockProxy(vm.UDSPath, port, rest).ServeHTTP(w, r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
