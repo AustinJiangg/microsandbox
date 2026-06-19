@@ -8,6 +8,8 @@ staying green as usual on other machines / CI.
 """
 
 import pathlib
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -76,3 +78,21 @@ def test_vm_lifecycle_cleanup(sandbox: Sandbox) -> None:
     # The control plane destroyed the VM, so it no longer knows this id.
     with pytest.raises(RuntimeError):
         sandbox._control_plane("DELETE", f"/sandboxes/{sandbox_id}")
+
+
+def test_api_is_lifecycle_only(sandbox: Sandbox) -> None:
+    """Stage 9c: the data path lives on client-proxy, not the api. The api's old
+    passthrough route (/sandboxes/{id}/...) is gone, so hitting it directly now 404s --
+    while the SDK's data calls (which go to client-proxy via the learned data_url) work.
+    """
+    # The SDK's data path works -- it goes to client-proxy, not the api.
+    assert sandbox.run_code("print(1)").stdout.strip() == "1"
+
+    # The api no longer proxies the data path: the old passthrough URL 404s.
+    url = f"{sandbox._base_url}/sandboxes/{sandbox._sandbox_id}/execute"
+    req = urllib.request.Request(
+        url, data=b"{}", method="POST", headers={"Content-Type": "application/json"}
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req)
+    assert exc.value.code == 404

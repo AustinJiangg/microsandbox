@@ -36,14 +36,18 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    Gateway (Stage 7). It replaced the Python `server.py` / `backend.py` (kept in `src/`
    as reference).
 4. **control plane** — `services/` (Go module `microsandbox/services`), split into
-   E2B-shaped services (Stage 8). **`cmd/api`** is the public REST front (owns a SQLite
-   metadata store, `pkg/store`); it calls **`cmd/orchestrator`** over **gRPC**
-   (`SandboxService`). The orchestrator owns the microVM fleet + warm pool
+   E2B-shaped services (Stages 8–9). **`cmd/api`** is the **lifecycle-only** public REST
+   front (owns a SQLite metadata store, `pkg/store`); it calls **`cmd/orchestrator`** over
+   **gRPC** (`SandboxService`). The orchestrator owns the microVM fleet + warm pool
    (`pkg/{fc,pool,template}`) and a header-routed vsock **data proxy** (`pkg/proxy`) that
-   bridges the data path to the daemon. The SDK still talks to one HTTP endpoint (the
-   api). Stage 4 first extracted all this as a single `control-plane/` binary; Stage 8
-   dissolved it into `services/`. See `docs/STAGE8_DESIGN.md` + `docs/E2B_ALIGNMENT_ROADMAP.md`
-   (Stage 4: `docs/STAGE4_DESIGN.md`).
+   bridges the data path to the daemon. **`cmd/client-proxy`** (Stage 9) is the edge data
+   proxy: it owns a routing **catalog** (`pkg/catalog`, sandbox→node, written by the api on
+   create) and routes each data request by its `X-Sandbox-Id` header to the orchestrator's
+   proxy. So the SDK talks to **two** endpoints — the api (lifecycle) and client-proxy
+   (data, learned from the create response). Stage 4 first extracted all this as a single
+   `control-plane/` binary; Stage 8 dissolved it into `services/`; Stage 9 sank the data
+   path off the api. See `docs/STAGE9_DESIGN.md` + `docs/STAGE8_DESIGN.md` +
+   `docs/E2B_ALIGNMENT_ROADMAP.md` (Stage 4: `docs/STAGE4_DESIGN.md`).
 
 **Key principle**: isolation strength comes from *where the daemon runs* and *how
 the client connects* (client/transport concerns), not from the backend. The
@@ -97,11 +101,18 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   store** (`pkg/store`, cgo-free `modernc.org/sqlite`). Protocol + SDK stayed byte-stable —
   the whole Python e2e suite passes (32/32). See `docs/STAGE8_DESIGN.md` +
   `docs/E2B_ALIGNMENT_ROADMAP.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): Stage 9 **`client-proxy`** + a
-  sandbox catalog (sink the data path off the api so it is lifecycle-only); Stage 10
-  **`TemplateService`** (the template builder) inside the orchestrator; then deferred —
-  `envd` → ConnectRPC `Process`/`Filesystem`, TAP networking, auth, multi-host
-  scheduling, a TypeScript SDK.
+- **Done (Stage 9 — `client-proxy` + sandbox catalog)**: the data plane is sunk off the
+  api, which is now **lifecycle-only**. 9a added `pkg/catalog` (in-memory, Redis-shaped
+  `sandbox→node`) and stood up **`cmd/client-proxy`** (a public data port + an internal
+  control port the api writes routes to), with the api registering each route on create
+  (load-bearing — a failure rolls the VM back); 9b flipped the SDK's data path to
+  client-proxy (api `POST /sandboxes` returns `data_url`; data goes there with an
+  `X-Sandbox-Id` header); 9c removed the api's temporary passthrough. Protocol + SDK surface
+  stayed byte-stable — the whole Python e2e suite passes (33/33). See `docs/STAGE9_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): Stage 10 **`TemplateService`**
+  (the template builder) inside the orchestrator + `pkg/storage`; then deferred — `envd` →
+  ConnectRPC `Process`/`Filesystem`, TAP networking + real `<port>-<id>` hostnames, auth,
+  multi-host scheduling, a TypeScript SDK.
 
 ## Development conventions
 
@@ -115,10 +126,11 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 - **Language: English only.** All docs, code comments, docstrings, and commit
   messages are in English. Comments explain **why**, not what.
 - Keep `tests/` all green. The host-side unit tests now live in Go
-  (`go test ./services/...` — vsock bridge, pool, templates, the metadata store, no
-  VM/KVM needed); the Python end-to-end / stateful / snapshot / metadata tests run on
-  real VMs (driven through the api + orchestrator) and auto-skip when go / firecracker /
-  `/dev/kvm` / the vendor artifacts are missing.
+  (`go test ./services/...` — vsock bridge, pool, templates, the metadata store, the
+  catalog + client-proxy routing, no VM/KVM needed); the Python end-to-end / stateful /
+  snapshot / metadata tests run on real VMs (driven through the api + client-proxy +
+  orchestrator) and auto-skip when go / firecracker / `/dev/kvm` / the vendor artifacts
+  are missing.
 - **Safety rule**: the microVM is the first isolation strong enough to *discuss*
   untrusted code, but it is a learning implementation, **not security-audited** —
   never imply in docs or code that it is safe to expose as a service or feed
@@ -128,8 +140,8 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 
 ```bash
 pip install -e ".[dev]"                          # install (dev mode)
-pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs the api + orchestrator)
-go test ./services/...                           # host-side unit tests: vsock bridge, pool, templates, metadata store (no VM/KVM)
+pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs api + client-proxy + orchestrator)
+go test ./services/...                           # host-side unit tests: vsock bridge, pool, templates, metadata store, catalog + client-proxy (no VM/KVM)
 go test ./daemon                                 # in-VM daemon unit tests: handlers + kernel-message translation (no VM/KVM)
 pytest tests/test_microvm.py::test_runs_in_microvm -v   # one real-VM end-to-end case
 
@@ -139,13 +151,13 @@ docker build -t microsandbox-agent .             # the agent image the rootfs is
 scripts/build-rootfs.sh                          # export the ext4 rootfs from the agent image (no root)
 scripts/build-snapshot.sh                        # build the warm snapshot for millisecond restore
 scripts/build-template.sh <name>                 # build a named custom image -> vendor/templates/<name>/ (Stage 6; then Sandbox(template="<name>"))
-scripts/build-services.sh                        # build the Go host services (api + orchestrator) to vendor/ (Stage 8)
+scripts/build-services.sh                        # build the Go host services (api + client-proxy + orchestrator) to vendor/ (Stage 8-9)
 scripts/gen-proto.sh                              # regenerate the gRPC stubs from services/proto (only when a .proto changes; needs protoc)
 
-# Minimal end-to-end smoke (Stage 8: start the api + orchestrator first; needs the vendor artifacts):
-scripts/dev-up.sh &                              # builds + runs orchestrator + api; SDK base_url = http://127.0.0.1:8080 (pass --pool-size K / --pool name=K to warm VMs)
+# Minimal end-to-end smoke (Stages 8-9: start orchestrator + client-proxy + api first; needs the vendor artifacts):
+scripts/dev-up.sh &                              # builds + runs all three; SDK base_url = http://127.0.0.1:8080 (pass --pool-size K / --pool name=K to warm VMs)
 python -c 'from microsandbox import Sandbox; s=Sandbox(); s.run_code("x=41"); print(s.run_code("print(x+1)").stdout); s.close()'
-kill %1                                           # stop the services (dev-up traps the signal and stops both)
+kill %1                                           # stop the services (dev-up traps the signal and stops all three)
 
 # After editing the in-VM daemon (daemon/*.go), rebuild the rootfs (+ snapshot) so the
 # VM picks up the change -- the rootfs bakes in the compiled daemon binary at build time:
@@ -157,8 +169,8 @@ scripts/build-rootfs.sh && scripts/build-snapshot.sh
 - Before changing the isolation/transport layer, read `docs/ARCHITECTURE.md` to
   confirm the boundaries, then act.
 - The host control plane lives in `services/` (Go module `microsandbox/services`):
-  `cmd/{api,orchestrator}` are the binaries, `pkg/{fc,pool,proxy,template,store}` the
-  libraries, `proto/` the gRPC contract (generated stubs in `pkg/grpc/`, committed — rerun
+  `cmd/{api,client-proxy,orchestrator}` are the binaries, `pkg/{fc,pool,proxy,template,store,catalog}`
+  the libraries, `proto/` the gRPC contract (generated stubs in `pkg/grpc/`, committed — rerun
   `scripts/gen-proto.sh` only when a `.proto` changes, which needs `protoc`). Host-side
   changes take effect at the next `scripts/build-services.sh`; no rootfs rebuild needed
   (that is only for the daemon).

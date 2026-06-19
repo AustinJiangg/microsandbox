@@ -1,11 +1,11 @@
-// Command api is the public REST front of the control plane (E2B's `api`). It owns no
-// VMs: sandbox lifecycle (POST/DELETE/GET /sandboxes) is delegated to the orchestrator
-// over gRPC, the durable record of which sandboxes exist is kept in a metadata store
-// (SQLite, Stage 8c -- E2B uses Postgres), and the data path (/sandboxes/{id}/...) is
-// -- for Stage 8 only -- reverse-proxied to the orchestrator's data proxy. The SDK talks
-// only to this service, so its base URL is unchanged across the split. Stage 9
-// introduces client-proxy and the SDK sends the data path there directly, retiring the
-// passthrough. See docs/STAGE8_DESIGN.md.
+// Command api is the public REST front of the control plane (E2B's `api`), and as of
+// Stage 9c it is lifecycle-only: it owns no VMs and never touches the data path. Sandbox
+// lifecycle (POST/DELETE/GET /sandboxes) is delegated to the orchestrator over gRPC, the
+// durable record of which sandboxes exist is kept in a metadata store (SQLite, Stage 8c
+// -- E2B uses Postgres), and on create the api registers the sandbox's data route in
+// client-proxy's catalog (returning the data_url the SDK posts the data path to). The
+// data plane goes SDK -> client-proxy -> orchestrator -> vsock -> envd, never through
+// here. See docs/STAGE9_DESIGN.md.
 package main
 
 import (
@@ -13,7 +13,6 @@ import (
 	"flag"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,23 +25,22 @@ import (
 	"microsandbox/services/pkg/store"
 )
 
-// api holds the gRPC client to the orchestrator (lifecycle), the metadata store
-// (durable record), the catalog client (registers each sandbox's data-path route in
-// client-proxy), the node value it registers, and -- temporarily, Stage 8/9a -- the
-// reverse proxy used for the data-path passthrough (removed in Stage 9c).
+// api holds the gRPC client to the orchestrator (lifecycle), the metadata store (durable
+// record), the catalog client (registers each sandbox's data-path route in client-proxy),
+// and the node value it registers. As of Stage 9c the api is lifecycle-only -- it no
+// longer proxies the data path.
 type api struct {
-	client    pb.SandboxServiceClient
-	store     *store.Store
-	catalog   *catalogClient
-	nodeAddr  string // the node (orchestrator data-proxy addr) registered for each sandbox
-	dataURL   string // the public client-proxy data URL handed back to the SDK (where to send data)
-	dataProxy *httputil.ReverseProxy
+	client   pb.SandboxServiceClient
+	store    *store.Store
+	catalog  *catalogClient
+	nodeAddr string // the node (orchestrator data-proxy addr) registered for each sandbox
+	dataURL  string // the public client-proxy data URL handed back to the SDK (where to send data)
 }
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "host:port for the public REST API (the SDK's base URL)")
 	orchGRPC := flag.String("orchestrator-grpc", "127.0.0.1:9090", "orchestrator gRPC address (SandboxService)")
-	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address: the node value registered in the catalog (and, until Stage 9c, the passthrough target)")
+	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address: the node value registered in the catalog for each sandbox")
 	clientProxyInternal := flag.String("client-proxy-internal", "127.0.0.1:5008", "client-proxy internal control address (the api writes sandbox routes here)")
 	dataURL := flag.String("data-url", "http://127.0.0.1:8081", "public client-proxy data URL returned to the SDK as where to send the data path")
 	db := flag.String("db", "vendor/microsandbox.db", "path to the SQLite metadata database")
@@ -69,30 +67,16 @@ func main() {
 		catalog:  newCatalogClient(*clientProxyInternal),
 		nodeAddr: *orchProxy,
 		dataURL:  *dataURL,
-		// TEMPORARY (Stage 8): reverse-proxy the data path to the orchestrator's data
-		// proxy, tagging each request with X-Sandbox-Id (which the orchestrator routes
-		// on). Stage 9 replaces this with client-proxy and removes it. One proxy is
-		// reused for all requests; the per-request id/rest come from the matched route
-		// via pr.In.PathValue.
-		dataProxy: &httputil.ReverseProxy{
-			Rewrite: func(pr *httputil.ProxyRequest) {
-				pr.Out.URL.Scheme = "http"
-				pr.Out.URL.Host = *orchProxy
-				pr.Out.URL.Path = "/" + pr.In.PathValue("rest")
-				pr.Out.URL.RawQuery = ""
-				pr.Out.Host = *orchProxy
-				pr.Out.Header.Set("X-Sandbox-Id", pr.In.PathValue("id"))
-			},
-			FlushInterval: -1, // flush every write so the daemon's SSE (/execute) streams live
-		},
 	}
 
+	// Lifecycle-only routes (Stage 9c): the data path lives on client-proxy now. A request
+	// to /sandboxes/{id}/<anything> matches none of these and gets a 404, which is correct
+	// -- the SDK no longer sends the data path here.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", a.handleHealth)
 	mux.HandleFunc("POST /sandboxes", a.handleCreate)
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.handleDestroy)
 	mux.HandleFunc("GET /sandboxes", a.handleList)
-	mux.HandleFunc("/sandboxes/{id}/{rest...}", a.handleProxy)
 
 	httpServer := &http.Server{Addr: *addr, Handler: mux}
 	go func() {

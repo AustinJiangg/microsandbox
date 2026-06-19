@@ -108,12 +108,6 @@ func (a *api) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sandboxes": list})
 }
 
-// handleProxy: ANY /sandboxes/{id}/{rest...} -> the temporary data-path passthrough to
-// the orchestrator's data proxy (Stage 8 only; removed in Stage 9).
-func (a *api) handleProxy(w http.ResponseWriter, r *http.Request) {
-	a.dataProxy.ServeHTTP(w, r)
-}
-
 // writeGRPCError maps a gRPC status code back to the HTTP status the SDK expects,
 // preserving the {"error": ...} body shape the old control plane used. This is what
 // keeps the SDK's behavior byte-stable across the gRPC split: a bad template still
