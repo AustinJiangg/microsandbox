@@ -18,12 +18,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 
+	"microsandbox/services/pkg/build"
 	pb "microsandbox/services/pkg/grpc/orchestrator"
+	pbtmpl "microsandbox/services/pkg/grpc/templatemanager"
+	"microsandbox/services/pkg/storage"
 )
 
 func main() {
@@ -35,6 +39,8 @@ func main() {
 		"keep this many default-template microVMs warm for instant from_snapshot creates (0 = disabled)")
 	var poolFlags repeatedFlag
 	flag.Var(&poolFlags, "pool", "pre-warm K VMs of a named template (repeatable): --pool name=K")
+	scriptsDir := flag.String("scripts-dir", "",
+		"dir with build-rootfs.sh / build-snapshot.sh for template builds (default: sibling of --vendor-dir)")
 	flag.Parse()
 
 	poolSpecs, err := parsePoolSpecs(poolFlags, *poolSize)
@@ -43,6 +49,15 @@ func main() {
 	}
 	srv := newServer(*vendorDir, poolSpecs)
 
+	// Template builder (Stage 10): the scripts dir defaults to the sibling of vendor (their
+	// repo layout), overridable by flag. The builder writes artifacts in place under
+	// vendorDir/templates/<name>/ via the storage provider.
+	sd := *scriptsDir
+	if sd == "" {
+		sd = filepath.Join(filepath.Dir(*vendorDir), "scripts")
+	}
+	tmplBuilder := build.New(storage.NewLocal(*vendorDir), sd)
+
 	// 1) gRPC SandboxService -- the lifecycle seam.
 	lis, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {
@@ -50,6 +65,7 @@ func main() {
 	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterSandboxServiceServer(grpcServer, &sandboxService{srv: srv})
+	pbtmpl.RegisterTemplateServiceServer(grpcServer, newTemplateService(tmplBuilder))
 
 	// 2) HTTP data proxy -- the vsock bridge, routed by X-Sandbox-Id. The "GET /health"
 	// pattern is more specific than "/", so the orchestrator's own liveness never gets
@@ -71,8 +87,8 @@ func main() {
 			log.Fatalf("data proxy serve: %v", err)
 		}
 	}()
-	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, pools=%v)",
-		*grpcAddr, *proxyAddr, *vendorDir, poolSpecs)
+	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, scripts=%s, pools=%v)",
+		*grpcAddr, *proxyAddr, *vendorDir, sd, poolSpecs)
 
 	// Graceful shutdown: stop accepting, then destroy every VM so we never leak
 	// firecracker processes (killing the process destroys the whole VM).

@@ -29,6 +29,14 @@ func New(sp storage.StorageProvider, scriptsDir string) *Builder {
 	return &Builder{storage: sp, scriptsDir: scriptsDir, run: runCmd}
 }
 
+// ValidateName reports whether name is a buildable template name, delegating to the storage
+// provider (which rejects "default" and invalid names). The orchestrator calls it to fail a
+// TemplateCreate synchronously rather than as an async build failure.
+func (b *Builder) ValidateName(name string) error {
+	_, err := b.storage.TemplateDir(name)
+	return err
+}
+
 // runCmd executes a command, returning its combined output (for the build log) and an error
 // carrying that output's tail on failure.
 func runCmd(name string, args ...string) (string, error) {

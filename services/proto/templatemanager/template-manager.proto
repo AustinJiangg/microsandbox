@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+// Package templatemanager is the gRPC contract for building custom templates. It mirrors
+// E2B's TemplateService (e2b-dev/infra: packages/shared/pkg/grpc/template-manager), which
+// E2B also hosts inside the orchestrator -- the builder needs the same docker + KVM +
+// firecracker the VM fleet does. Stage 10 adds it: the api calls TemplateCreate to kick an
+// asynchronous build and polls TemplateBuildStatus -- E2B's "accept sync, build async, poll
+// status" model. See docs/STAGE10_DESIGN.md.
+package templatemanager;
+
+// go_package is the Go import path the generated code belongs to; gen-proto.sh passes
+// --go_opt=module=microsandbox/services, which strips that prefix to place the files at
+// services/pkg/grpc/templatemanager/.
+option go_package = "microsandbox/services/pkg/grpc/templatemanager";
+
+// TemplateService builds a named (rootfs, snapshot) image from a Dockerfile recipe.
+service TemplateService {
+  // TemplateCreate starts an asynchronous build and returns a build id immediately; the
+  // build runs in the background (docker build -> build-rootfs.sh -> build-snapshot.sh).
+  // Poll its progress with TemplateBuildStatus.
+  rpc TemplateCreate(TemplateCreateRequest) returns (TemplateCreateResponse);
+
+  // TemplateBuildStatus reports a build's current state. An unknown build id is an error.
+  rpc TemplateBuildStatus(TemplateBuildStatusRequest) returns (TemplateBuildStatusResponse);
+}
+
+// TemplateCreateRequest is the recipe to build. The field numbers are the wire identity --
+// never change or reuse one once shipped (see orchestrator.proto for the why).
+message TemplateCreateRequest {
+  string name = 1;          // template name (validated; "default" is rejected -- it is the stock image)
+  string dockerfile = 2;    // the recipe contents (FROM microsandbox-agent + RUN ...)
+  bool with_snapshot = 3;   // also build the warm snapshot (for from_snapshot starts)
+}
+message TemplateCreateResponse { string build_id = 1; } // "bld_..."; poll status with it
+
+message TemplateBuildStatusRequest { string build_id = 1; }
+message TemplateBuildStatusResponse {
+  // State is the build's lifecycle: BUILDING is the initial state; it ends at SUCCESS or
+  // FAILED. (proto3 enums must have a zero value, which is the natural initial state here.)
+  enum State {
+    BUILDING = 0;
+    SUCCESS = 1;
+    FAILED = 2;
+  }
+  State state = 1;
+  string detail = 2;        // last log line / error message (empty while building cleanly)
+}

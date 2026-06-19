@@ -37,6 +37,7 @@ done
 protoc -I proto \
 	--go_out=. --go_opt=module=microsandbox/services \
 	--go-grpc_out=. --go-grpc_opt=module=microsandbox/services \
-	proto/orchestrator/orchestrator.proto
+	proto/orchestrator/orchestrator.proto \
+	proto/templatemanager/template-manager.proto
 
-echo "generated: services/pkg/grpc/orchestrator/*.pb.go"
+echo "generated: services/pkg/grpc/{orchestrator,templatemanager}/*.pb.go"
