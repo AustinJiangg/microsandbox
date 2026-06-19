@@ -44,9 +44,12 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    proxy: it owns a routing **catalog** (`pkg/catalog`, sandbox→node, written by the api on
    create) and routes each data request by its `X-Sandbox-Id` header to the orchestrator's
    proxy. So the SDK talks to **two** endpoints — the api (lifecycle) and client-proxy
-   (data, learned from the create response). Stage 4 first extracted all this as a single
-   `control-plane/` binary; Stage 8 dissolved it into `services/`; Stage 9 sank the data
-   path off the api. See `docs/STAGE9_DESIGN.md` + `docs/STAGE8_DESIGN.md` +
+   (data, learned from the create response). The orchestrator also hosts a
+   **`TemplateService`** (Stage 10): the api's `POST /templates` kicks an async template
+   build there (`pkg/build` wrapping the build scripts, `pkg/storage` placing the artifacts).
+   Stage 4 first extracted all this as a single `control-plane/` binary; Stage 8 dissolved it
+   into `services/`; Stage 9 sank the data path off the api. See `docs/STAGE10_DESIGN.md` +
+   `docs/STAGE9_DESIGN.md` + `docs/STAGE8_DESIGN.md` +
    `docs/E2B_ALIGNMENT_ROADMAP.md` (Stage 4: `docs/STAGE4_DESIGN.md`).
 
 **Key principle**: isolation strength comes from *where the daemon runs* and *how
@@ -109,10 +112,20 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   client-proxy (api `POST /sandboxes` returns `data_url`; data goes there with an
   `X-Sandbox-Id` header); 9c removed the api's temporary passthrough. Protocol + SDK surface
   stayed byte-stable — the whole Python e2e suite passes (33/33). See `docs/STAGE9_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): Stage 10 **`TemplateService`**
-  (the template builder) inside the orchestrator + `pkg/storage`; then deferred — `envd` →
-  ConnectRPC `Process`/`Filesystem`, TAP networking + real `<port>-<id>` hostnames, auth,
-  multi-host scheduling, a TypeScript SDK.
+- **Done (Stage 10 — `TemplateService` + `pkg/storage`)**: building a custom template is now
+  an async, programmatic operation (E2B's "accept sync, build async, poll status"). 10a added
+  `pkg/storage` (`StorageProvider` + `Local`) and `pkg/build` (`Builder` wrapping `docker build`
+  → `build-rootfs.sh` → `build-snapshot.sh`, with an injectable exec for KVM-free tests); 10b
+  added the **gRPC `TemplateService`** in the orchestrator (`TemplateCreate` kicks a build
+  goroutine, `TemplateBuildStatus` polled); 10c gave the api `POST /templates` + `GET
+  /templates/builds/{id}` (a `builds` table in `pkg/store`) and the SDK `build_template(...)`.
+  Artifacts are published **in place** at `vendor/templates/<name>/` because the snapshot bakes
+  in its rootfs's absolute path (so no build-id staging). The whole Python e2e suite passes
+  (34/34). See `docs/STAGE10_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): deferred — Stage 11 `envd` →
+  ConnectRPC `Process`/`Filesystem` (+ split `run_code()` into a `code-interpreter`); Stage 12
+  TAP/netns networking + real `<port>-<id>` hostnames (then SQLite→Postgres, in-mem→Redis,
+  Local→object storage go live); then auth, multi-host scheduling, a TypeScript SDK.
 
 ## Development conventions
 
@@ -169,8 +182,9 @@ scripts/build-rootfs.sh && scripts/build-snapshot.sh
 - Before changing the isolation/transport layer, read `docs/ARCHITECTURE.md` to
   confirm the boundaries, then act.
 - The host control plane lives in `services/` (Go module `microsandbox/services`):
-  `cmd/{api,client-proxy,orchestrator}` are the binaries, `pkg/{fc,pool,proxy,template,store,catalog}`
-  the libraries, `proto/` the gRPC contract (generated stubs in `pkg/grpc/`, committed — rerun
+  `cmd/{api,client-proxy,orchestrator}` are the binaries,
+  `pkg/{fc,pool,proxy,template,store,catalog,storage,build}` the libraries, `proto/` the gRPC
+  contract (`orchestrator` + `templatemanager`; generated stubs in `pkg/grpc/`, committed — rerun
   `scripts/gen-proto.sh` only when a `.proto` changes, which needs `protoc`). Host-side
   changes take effect at the next `scripts/build-services.sh`; no rootfs rebuild needed
   (that is only for the daemon).
@@ -182,7 +196,7 @@ scripts/build-rootfs.sh && scripts/build-snapshot.sh
 - **Cadence**: split work into independently verifiable sub-steps, keep tests
   green at every step, give an honest self-review (🔴/🟡/🟢) before committing, and
   commit only on the user's explicit go-ahead. Commit messages are a **single-line**
-  English Conventional Commit (`type(scope): summary (stage N)`, no body) + the
-  `Co-Authored-By` trailer. **After every commit, push to `origin/main` immediately**
-  (no separate ask needed).
+  English Conventional Commit, kept concise: `type: summary (stage N)` (no `(scope)`, no
+  body) + the `Co-Authored-By` trailer. **After every commit, push to `origin/main`
+  immediately** (no separate ask needed).
 ```

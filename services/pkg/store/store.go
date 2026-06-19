@@ -32,12 +32,21 @@ type Store struct {
 }
 
 // schema is applied on Open; IF NOT EXISTS makes it safe to run every startup (a poor
-// man's migration -- a real one would version these).
+// man's migration -- a real one would version these). The builds table arrives with the
+// TemplateService (Stage 10): the api records each template build and its outcome, like
+// E2B's api owns templates/builds in Postgres.
 const schema = `
 CREATE TABLE IF NOT EXISTS sandboxes (
     id         TEXT PRIMARY KEY,
     template   TEXT NOT NULL,
     status     TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS builds (
+    build_id   TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    detail     TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`
 
@@ -93,6 +102,50 @@ func (s *Store) ListSandboxes() ([]Sandbox, error) {
 			return nil, err
 		}
 		out = append(out, sb)
+	}
+	return out, rows.Err()
+}
+
+// Build is one persisted template-build row.
+type Build struct {
+	BuildID   string
+	Name      string
+	State     string // building | success | failed
+	Detail    string
+	CreatedAt string
+}
+
+// InsertBuild records a newly started build. state starts as "building"; created_at is
+// filled by SQLite. The api inserts this when the orchestrator accepts a TemplateCreate.
+func (s *Store) InsertBuild(buildID, name string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO builds (build_id, name, state) VALUES (?, ?, 'building')`, buildID, name)
+	return err
+}
+
+// UpdateBuild records the latest state/detail of a build (the api calls it as it polls the
+// orchestrator). Updating an absent build affects zero rows, which is not an error.
+func (s *Store) UpdateBuild(buildID, state, detail string) error {
+	_, err := s.db.Exec(
+		`UPDATE builds SET state = ?, detail = ? WHERE build_id = ?`, state, detail, buildID)
+	return err
+}
+
+// ListBuilds returns all build records, newest first.
+func (s *Store) ListBuilds() ([]Build, error) {
+	rows, err := s.db.Query(
+		`SELECT build_id, name, state, detail, created_at FROM builds ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Build
+	for rows.Next() {
+		var b Build
+		if err := rows.Scan(&b.BuildID, &b.Name, &b.State, &b.Detail, &b.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
 	}
 	return out, rows.Err()
 }

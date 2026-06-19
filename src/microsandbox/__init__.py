@@ -4,11 +4,12 @@ The public API exposes only the SDK layer; the underlying server / backend are
 implementation details.
 """
 
-from .client import Sandbox
+from .client import Sandbox, build_template
 from .protocol import EventType, Execution, ExecuteRequest, OutputEvent
 
 __all__ = [
     "Sandbox",
+    "build_template",
     "Execution",
     "ExecuteRequest",
     "OutputEvent",

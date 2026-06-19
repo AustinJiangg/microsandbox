@@ -106,13 +106,15 @@ orchestrator creates, inside which the daemon happens to run the kernel backend.
 ### 4. control plane — `services/` (Go): api + client-proxy + orchestrator
 
 New in Stage 4 as one `control-plane/` binary; Stage 8 split it into a `services/`
-module that mirrors E2B's seams, and Stage 9 added the edge data proxy:
+module that mirrors E2B's seams, Stage 9 added the edge data proxy, and Stage 10 added
+the template builder:
 
-- **`cmd/api`** — the public REST front (`POST` / `DELETE` / `GET /sandboxes`), now
-  **lifecycle-only**. It owns a SQLite **metadata store** (`pkg/store`) and calls the
-  orchestrator over **gRPC** for the lifecycle. On create it registers the sandbox's
-  data-path route in client-proxy's catalog (and rolls the VM back if that fails), then
-  hands the SDK the `data_url`. The data bytes never pass through it.
+- **`cmd/api`** — the public REST front, now **lifecycle-only** for sandboxes
+  (`POST` / `DELETE` / `GET /sandboxes`) plus the template build API (`POST /templates`,
+  `GET /templates/builds/{id}`). It owns a SQLite **metadata store** (`pkg/store`:
+  sandboxes + builds) and calls the orchestrator over **gRPC**. On create it registers the
+  sandbox's data-path route in client-proxy's catalog (and rolls the VM back if that
+  fails), then hands the SDK the `data_url`. The data bytes never pass through it.
 - **`cmd/client-proxy`** — E2B's **edge data proxy** (Stage 9). It owns the routing
   **catalog** (`pkg/catalog`, sandbox → node; in-memory now, Redis-shaped for later), runs
   a public data port and an internal control port (the api writes routes there), and
@@ -123,12 +125,16 @@ module that mirrors E2B's seams, and Stage 9 added the edge data proxy:
   `pkg/pool` (the warm pool), plus a **data proxy** (`pkg/proxy`): a request carrying the
   `X-Sandbox-Id` header is bridged to the in-VM daemon over vsock. It pipes bytes, so
   `protocol.py` stays the single source of truth, and it runs the `/health` probe so a
-  sandbox is healthy by the time Create returns ("ready on delivery").
+  sandbox is healthy by the time Create returns ("ready on delivery"). It also serves a gRPC
+  **`TemplateService`** (Stage 10): `TemplateCreate` kicks an async build (`pkg/build`
+  wrapping `docker build` → `build-rootfs.sh` → `build-snapshot.sh`, placing artifacts via
+  `pkg/storage`); the api polls `TemplateBuildStatus`. Like E2B, the builder lives here
+  because it needs the same docker + KVM + firecracker the VM fleet does.
 
 Corresponds to E2B's `infra` (api + client-proxy + orchestrator). Keeping these boundaries
 is what lets the SDK stay a thin client, the data path move off the api, and the
-orchestrator be swapped or scaled independently. See `docs/STAGE9_DESIGN.md` and
-`docs/STAGE8_DESIGN.md`.
+orchestrator be swapped or scaled independently. See `docs/STAGE10_DESIGN.md`,
+`docs/STAGE9_DESIGN.md` and `docs/STAGE8_DESIGN.md`.
 
 ### Transport (vsock)
 
@@ -171,7 +177,8 @@ in-container agent (the "ownership inversion") → stateful Jupyter kernel →
 Firecracker microVM (TCP → vsock) → a Go control-plane split (the SDK became a thin
 HTTP client) → a Go in-VM daemon (envd-equivalent, driving the kernel via a Jupyter
 gateway) → an api + orchestrator gRPC split (Stage 8, mirroring E2B's services) → a
-client-proxy + routing catalog (Stage 9, sinking the data plane off the api). Every
+client-proxy + routing catalog (Stage 9, sinking the data plane off the api) → an async
+template builder (Stage 10, E2B's TemplateService). Every
 step followed one discipline: **add a new backend/transport implementation, keep the
 protocol byte-stable, and keep the changes out of the client as much as possible.** Once
 the microVM landed, the earlier backends were removed as scaffolding — the staged code
@@ -187,7 +194,9 @@ lives on in the git history if you want to study the progression.
 | Jupyter Kernel Gateway + kernel | the in-sandbox code interpreter | the stateful Python kernel the Go daemon drives over HTTP/WS |
 | services/cmd/api (Go) | `api` | public REST front, lifecycle-only; owns the metadata store; picks a node, calls the orchestrator over gRPC, writes the catalog |
 | services/cmd/client-proxy (Go) | `client-proxy` | edge data proxy; routes the data path by `X-Sandbox-Id` via the catalog (Stage 9; E2B keys on `<port>-<id>` hostnames) |
-| services/cmd/orchestrator (Go) | `orchestrator` | per-machine VM fleet: spawn/restore/destroy + warm pool + vsock data proxy + health |
-| services/pkg/store (SQLite) | the api's Postgres | durable sandbox metadata (E2B uses Postgres + sqlc) |
+| services/cmd/orchestrator (Go) | `orchestrator` | per-machine VM fleet + warm pool + vsock data proxy + health + the template builder |
+| services/pkg/build + TemplateService | `template-manager` (in E2B's orchestrator) | async template builds, polled for status (Stage 10) |
+| services/pkg/store (SQLite) | the api's Postgres | durable sandbox + build metadata (E2B uses Postgres + sqlc) |
 | services/pkg/catalog (in-memory) | the `sandbox-catalog` (Redis) | sandbox → node routing the client-proxy reads (E2B uses Redis) |
+| services/pkg/storage (Local dir) | object storage (GCS/S3) | where template artifacts live (E2B keys by build id; we publish in place) |
 | (firecracker config in services/pkg/fc) | Firecracker orchestration / jailer | microVM creation and isolation |

@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "microsandbox/services/pkg/grpc/orchestrator"
+	pbt "microsandbox/services/pkg/grpc/templatemanager"
 	"microsandbox/services/pkg/store"
 )
 
@@ -30,11 +31,12 @@ import (
 // and the node value it registers. As of Stage 9c the api is lifecycle-only -- it no
 // longer proxies the data path.
 type api struct {
-	client   pb.SandboxServiceClient
-	store    *store.Store
-	catalog  *catalogClient
-	nodeAddr string // the node (orchestrator data-proxy addr) registered for each sandbox
-	dataURL  string // the public client-proxy data URL handed back to the SDK (where to send data)
+	client    pb.SandboxServiceClient
+	templates pbt.TemplateServiceClient
+	store     *store.Store
+	catalog   *catalogClient
+	nodeAddr  string // the node (orchestrator data-proxy addr) registered for each sandbox
+	dataURL   string // the public client-proxy data URL handed back to the SDK (where to send data)
 }
 
 func main() {
@@ -62,11 +64,12 @@ func main() {
 	defer st.Close()
 
 	a := &api{
-		client:   pb.NewSandboxServiceClient(conn),
-		store:    st,
-		catalog:  newCatalogClient(*clientProxyInternal),
-		nodeAddr: *orchProxy,
-		dataURL:  *dataURL,
+		client:    pb.NewSandboxServiceClient(conn),
+		templates: pbt.NewTemplateServiceClient(conn),
+		store:     st,
+		catalog:   newCatalogClient(*clientProxyInternal),
+		nodeAddr:  *orchProxy,
+		dataURL:   *dataURL,
 	}
 
 	// Lifecycle-only routes (Stage 9c): the data path lives on client-proxy now. A request
@@ -77,6 +80,11 @@ func main() {
 	mux.HandleFunc("POST /sandboxes", a.handleCreate)
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.handleDestroy)
 	mux.HandleFunc("GET /sandboxes", a.handleList)
+	// Template builds (Stage 10): create kicks an async build in the orchestrator; the SDK
+	// polls the build status; list is the api's durable record.
+	mux.HandleFunc("POST /templates", a.handleTemplateCreate)
+	mux.HandleFunc("GET /templates", a.handleTemplateList)
+	mux.HandleFunc("GET /templates/builds/{id}", a.handleTemplateBuildStatus)
 
 	httpServer := &http.Server{Addr: *addr, Handler: mux}
 	go func() {

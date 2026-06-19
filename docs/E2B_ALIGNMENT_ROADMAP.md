@@ -8,6 +8,11 @@
 >
 > The per-stage detail lives in its own design doc (`docs/STAGE8_DESIGN.md`, …) as
 > each stage is picked up; this file is the map that ties them together.
+>
+> **Progress:** Stages 8 (api + orchestrator gRPC split), 9 (client-proxy + routing catalog),
+> and 10 (TemplateService + `pkg/storage`) are **done** — see their design docs and the
+> "Done" list in `CLAUDE.md`. The remainder below (Stage 11 `envd` rewrite, Stage 12 TAP
+> networking, then auth / multi-host / a TS SDK) is the **deferred** forward plan.
 
 ## 1. Why this document
 

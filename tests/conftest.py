@@ -227,3 +227,11 @@ def example_sandbox(control_plane):
     sb = Sandbox(template="example", base_url=control_plane)
     yield sb
     sb.close()
+
+
+@pytest.fixture
+def api_template_build(control_plane):
+    """Ensure the agent base image exists (template recipes are FROM it) and yield the api
+    URL, for the Stage 10 test that builds a template through the api's TemplateService."""
+    ensure_agent_image()
+    return control_plane

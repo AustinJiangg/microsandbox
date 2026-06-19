@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
@@ -308,3 +309,91 @@ class _Commands:
             stderr=data["stderr"],
             exit_code=data["exit_code"],
         )
+
+
+# ----- template build API (Stage 10), aligned with E2B's `template build` -----
+
+
+def build_template(
+    name: str,
+    dockerfile: str,
+    *,
+    with_snapshot: bool = True,
+    base_url: str | None = None,
+    poll_interval: float = 1.0,
+    timeout: float = 600.0,
+) -> None:
+    """Build a custom template image from a Dockerfile recipe, blocking until it is ready.
+
+    The local equivalent of `e2b template build`: it POSTs the recipe to the api, which
+    kicks an asynchronous build in the orchestrator (docker build -> rootfs -> snapshot),
+    then polls the build status until it succeeds (returns) or fails (raises RuntimeError
+    with the build's error detail). On success the image boots with Sandbox(template=name).
+
+    The recipe is the Dockerfile contents (FROM microsandbox-agent + RUN ...); arbitrary
+    local-file COPY is out of scope (no build-context upload yet). Pass with_snapshot=False
+    to skip the warm snapshot -- a faster build, but from_snapshot won't work until one is
+    built.
+
+    Args:
+        name: the template name to publish (an existing one is replaced); "default" is
+            rejected (it is the baked stock image).
+        dockerfile: the recipe contents.
+        base_url: where the api is reachable (defaults to MICROSANDBOX_URL, then :8080).
+        poll_interval: seconds between status polls.
+        timeout: seconds to wait for the build before raising.
+    """
+    api = (
+        base_url or os.environ.get("MICROSANDBOX_URL", _DEFAULT_CONTROL_PLANE_URL)
+    ).rstrip("/")
+
+    created = _api_request(
+        "POST",
+        api + "/templates",
+        {"name": name, "dockerfile": dockerfile, "with_snapshot": with_snapshot},
+    )
+    build_id = created["build_id"]
+
+    deadline = time.monotonic() + timeout
+    while True:
+        status = _api_request("GET", api + f"/templates/builds/{build_id}")
+        state = status.get("state")
+        if state == "success":
+            return
+        if state == "failed":
+            raise RuntimeError(
+                f"template build {build_id} failed: {status.get('detail', '')}"
+            )
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"template build {build_id} did not finish within {timeout}s (last state: {state})"
+            )
+        time.sleep(poll_interval)
+
+
+def _api_request(method: str, url: str, body: dict | None = None) -> dict:
+    """One HTTP call to the api, returning parsed JSON (or {}). A module-level twin of
+    Sandbox._control_plane, for the lifecycle-free template build API."""
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    try:
+        with urllib.request.urlopen(request) as resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        try:
+            detail = json.loads(detail).get("error", detail)
+        except json.JSONDecodeError:
+            pass
+        raise RuntimeError(f"{method} {url} failed: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"cannot reach the api at {url} ({exc.reason}); "
+            "is it running? start the services with scripts/dev-up.sh"
+        ) from exc

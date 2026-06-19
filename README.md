@@ -78,6 +78,13 @@ with Sandbox(from_snapshot=True) as sandbox:
 # (swap the marker line in that Dockerfile for `RUN pip install ...` to make a real env.)
 with Sandbox(template="example") as sandbox:
     print(sandbox.files.read("/etc/microsandbox-template"))   # hello from the example template
+
+# Build a template through the API (Stage 10): submit a Dockerfile recipe, the orchestrator
+# builds it asynchronously, build_template polls until it is ready, then boot it by name.
+from microsandbox import build_template
+build_template("myenv", "FROM microsandbox-agent\nRUN pip install cowsay", with_snapshot=False)
+with Sandbox(template="myenv") as sandbox:
+    print(sandbox.run_code("import cowsay; cowsay.cow('hi')").stdout)
 ```
 
 ## Project structure
@@ -97,6 +104,7 @@ microsandbox/
 │   ├── STAGE7_DESIGN.md       # Stage 7: the Go in-VM daemon (envd)
 │   ├── STAGE8_DESIGN.md       # Stage 8: split the control plane into api + orchestrator (gRPC)
 │   ├── STAGE9_DESIGN.md       # Stage 9: client-proxy + routing catalog (data path off the api)
+│   ├── STAGE10_DESIGN.md      # Stage 10: TemplateService (async template builds) + pkg/storage
 │   └── E2B_ALIGNMENT_ROADMAP.md  # the post-Stage-7 roadmap toward E2B's component architecture
 ├── src/microsandbox/
 │   ├── protocol.py            # client↔daemon wire protocol (the stable boundary)
@@ -104,12 +112,12 @@ microsandbox/
 │   ├── server.py              # the retired Python in-VM daemon (Stage 7 replaced it; kept as reference)
 │   └── backend.py             # the retired Python kernel backend (reference)
 ├── daemon/                    # the Go in-VM daemon (Stage 7, E2B's envd): vsock HTTP/SSE; drives the kernel via a Jupyter gateway
-├── services/                  # the Go host control plane (Stages 8-9, E2B's "infra"), module microsandbox/services
-│   ├── cmd/api/               #   lifecycle-only REST front + SQLite metadata store; calls the orchestrator over gRPC
+├── services/                  # the Go host control plane (Stages 8-10, E2B's "infra"), module microsandbox/services
+│   ├── cmd/api/               #   lifecycle-only REST front + SQLite store + the /templates build API; calls the orchestrator over gRPC
 │   ├── cmd/client-proxy/      #   edge data proxy (Stage 9): routes the data path by X-Sandbox-Id via the catalog
-│   ├── cmd/orchestrator/      #   owns the microVM fleet + warm pool (gRPC SandboxService) + the vsock data proxy
-│   ├── pkg/                   #   fc / pool / proxy / template / store / catalog, + grpc/ (generated stubs)
-│   └── proto/                 #   the gRPC contract (orchestrator.proto)
+│   ├── cmd/orchestrator/      #   microVM fleet + warm pool (SandboxService) + vsock data proxy + the template builder (TemplateService)
+│   ├── pkg/                   #   fc / pool / proxy / template / store / catalog / storage / build, + grpc/ (generated stubs)
+│   └── proto/                 #   the gRPC contracts (orchestrator.proto, template-manager.proto)
 ├── scripts/
 │   ├── build-rootfs.sh        # export an ext4 rootfs from the agent image (no root needed)
 │   ├── build-snapshot.sh      # build a warm Firecracker snapshot for millisecond restore
