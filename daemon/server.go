@@ -9,16 +9,8 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"sort"
-	"strconv"
-	"time"
 )
 
 // newMux wires the daemon's HTTP routes. Kept separate from the listener so tests
@@ -31,6 +23,10 @@ func newMux(km *kernelManager) *http.ServeMux {
 	mux.HandleFunc("POST /files/write", handleFileWrite)
 	mux.HandleFunc("POST /files/list", handleFileList)
 	mux.HandleFunc("POST /commands", handleCommand)
+	// Stage 11a: the ConnectRPC envd services (Filesystem + Process), mounted alongside the
+	// HTTP endpoints above. Nothing routes to them yet -- the SDK flips in 11c, and the HTTP
+	// endpoints are removed then. The connect paths don't collide with the HTTP routes.
+	registerEnvdServices(mux)
 	return mux
 }
 
@@ -39,6 +35,8 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFileRead: POST /files/read <- {"path"} -> {"content"}; missing/unreadable -> 404.
+// The filesystem/process logic lives in envd.go's helpers, shared with the ConnectRPC
+// services so the HTTP and Connect paths cannot drift while both exist (Stage 11a).
 func handleFileRead(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
@@ -46,17 +44,16 @@ func handleFileRead(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	data, err := os.ReadFile(req.Path)
+	content, err := readFile(req.Path)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"content": string(data)})
+	writeJSON(w, http.StatusOK, map[string]string{"content": content})
 }
 
-// handleFileWrite: POST /files/write <- {"path","content"} -> {"ok":true}. Like
-// server.py it creates intermediate dirs; a read-only root (writing outside /tmp)
-// surfaces as 400.
+// handleFileWrite: POST /files/write <- {"path","content"} -> {"ok":true}. Creates
+// intermediate dirs; a read-only root (writing outside /tmp) surfaces as 400.
 func handleFileWrite(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path    string `json:"path"`
@@ -65,18 +62,14 @@ func handleFileWrite(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(req.Path), 0o755); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := os.WriteFile(req.Path, []byte(req.Content), 0o644); err != nil {
+	if err := writeFile(req.Path, req.Content); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleFileList: POST /files/list <- {"path"} -> {"entries":[{"name","is_dir"}]}.
+// handleFileList: POST /files/list <- {"path"} -> {"entries":[{"name","is_dir"}]} (sorted).
 func handleFileList(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
@@ -84,7 +77,7 @@ func handleFileList(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	dirents, err := os.ReadDir(req.Path)
+	dirents, err := listDir(req.Path)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
@@ -95,16 +88,14 @@ func handleFileList(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := make([]entry, 0, len(dirents))
 	for _, d := range dirents {
-		entries = append(entries, entry{Name: d.Name(), IsDir: d.IsDir()})
+		entries = append(entries, entry{Name: d.Name, IsDir: d.IsDir})
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
 }
 
 // handleCommand: POST /commands <- {"command","timeout_seconds"} ->
-// {"stdout","stderr","exit_code"}. Runs via `sh -c` in the daemon's own environment
-// (= inside the VM). On timeout the process is killed and a fixed message returned
-// with exit_code -1, mirroring server.py.
+// {"stdout","stderr","exit_code"}. Runs via `sh -c` inside the VM; on timeout returns a
+// fixed message with exit_code -1 (mirroring server.py). See runCommand in envd.go.
 func handleCommand(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Command        string  `json:"command"`
@@ -113,35 +104,10 @@ func handleCommand(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	timeout := req.TimeoutSeconds
-	if timeout <= 0 {
-		timeout = 30
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout*float64(time.Second)))
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", req.Command)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-
-	if ctx.Err() == context.DeadlineExceeded {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"stdout":    "",
-			"stderr":    "command timed out after " + strconv.FormatFloat(timeout, 'g', -1, 64) + "s",
-			"exit_code": -1,
-		})
-		return
-	}
-	exitCode := 0
-	if cmd.ProcessState != nil {
-		exitCode = cmd.ProcessState.ExitCode()
-	} else if err != nil {
-		exitCode = -1 // failed to start (e.g. /bin/sh missing)
-	}
+	stdout, stderr, exitCode := runCommand(req.Command, req.TimeoutSeconds)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"stdout":    stdout.String(),
-		"stderr":    stderr.String(),
+		"stdout":    stdout,
+		"stderr":    stderr,
 		"exit_code": exitCode,
 	})
 }

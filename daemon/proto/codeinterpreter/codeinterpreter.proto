@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+// Package codeinterpreter is the ConnectRPC contract for running code in the stateful
+// Python kernel (Stage 11), matching E2B's separate code-interpreter service. Execute is
+// server-streaming: it streams OutputEvents (stdout / stderr / error / end) as the cell
+// runs -- the Connect-over-HTTP/1.1 equivalent of the Stage-7 daemon's /execute SSE.
+// Implemented in 11b (the kernel moves here onto its own vsock port). See docs/STAGE11_DESIGN.md.
+package codeinterpreter;
+
+option go_package = "microsandbox/daemon/genpb/codeinterpreter";
+
+// CodeInterpreterService drives a long-lived Python kernel (variables persist across calls).
+service CodeInterpreterService {
+  rpc Execute(ExecuteRequest) returns (stream OutputEvent);
+}
+
+message ExecuteRequest {
+  string code = 1;
+  string language = 2;        // "" = python
+  double timeout_seconds = 3; // 0 = default (30s)
+}
+
+// OutputEvent mirrors protocol.py's OutputEvent. type is one of stdout|stderr|error|end;
+// exit_code is meaningful only on the "end" event (0 ok, 1 raised, -1 timeout) and ignored
+// otherwise -- so a plain int32 (default 0) reproduces the prior "only on end" semantics.
+message OutputEvent {
+  string type = 1;
+  string data = 2;
+  int32 exit_code = 3;
+}

@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+// Package envd is the in-VM daemon's ConnectRPC contract (Stage 11), matching E2B's envd:
+// a Filesystem service and a Process service. It replaces the hand-rolled HTTP/JSON
+// endpoints (/files/*, /commands) the Stage-7 daemon served; the message shapes mirror that
+// JSON exactly, so behavior is unchanged -- only the framing (Connect over HTTP/1.1) moves.
+// The stateful Python kernel (/execute) lives in a separate code-interpreter service.
+// See docs/STAGE11_DESIGN.md.
+package envd;
+
+option go_package = "microsandbox/daemon/genpb/envd";
+
+// FilesystemService reads/writes/lists files on the VM's own filesystem (the sandbox's).
+service FilesystemService {
+  rpc Read(ReadRequest) returns (ReadResponse);     // {path} -> {content}
+  rpc Write(WriteRequest) returns (WriteResponse);  // {path, content} -> {}
+  rpc List(ListRequest) returns (ListResponse);     // {path} -> repeated Entry
+}
+
+// ProcessService runs shell commands inside the VM. E2B's Process streams Start; ours is
+// unary run-to-completion (today's /commands), with streaming left for a later stage.
+service ProcessService {
+  rpc Run(RunRequest) returns (RunResponse);        // {command, timeout_seconds} -> {stdout, stderr, exit_code}
+}
+
+message ReadRequest { string path = 1; }
+message ReadResponse { string content = 1; }
+
+message WriteRequest {
+  string path = 1;
+  string content = 2;
+}
+message WriteResponse {}
+
+message ListRequest { string path = 1; }
+message Entry {
+  string name = 1;
+  bool is_dir = 2;
+}
+message ListResponse { repeated Entry entries = 1; }
+
+message RunRequest {
+  string command = 1;
+  double timeout_seconds = 2; // 0 = daemon default (30s)
+}
+message RunResponse {
+  string stdout = 1;
+  string stderr = 2;
+  int32 exit_code = 3; // -1 on timeout / failed-to-start, mirroring the Python daemon
+}

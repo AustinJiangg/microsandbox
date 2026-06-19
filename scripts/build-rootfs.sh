@@ -37,6 +37,14 @@ docker rm "$cid" >/dev/null
 # At a minimum python3 must be present; otherwise the export clearly went wrong, so fail early to ease debugging.
 test -x "$STAGING/usr/local/bin/python3" || { echo "exported rootfs has no python3, aborting" >&2; exit 1; }
 
+# The in-VM daemon drives the kernel via `jupyter kernelgateway`, so the gateway's entry
+# point must be in the image. A stale agent image without it boots fine but fails every
+# run_code with "kernel gateway did not become ready" -- fail loudly here instead of
+# shipping a rootfs that can't run code. Rebuild the image: docker build -t microsandbox-agent .
+test -x "$STAGING/usr/local/bin/jupyter-kernelgateway" || {
+  echo "exported rootfs has no jupyter-kernelgateway (stale agent image?); rebuild it: docker build -t microsandbox-agent ." >&2
+  exit 1; }
+
 echo "[build-rootfs] building the Go daemon (static, linux/amd64) and injecting it ..."
 # Stage 7: the in-VM daemon is now a static Go binary (E2B's envd), not the Python
 # package. CGO-free so it runs in the minimal guest with no libc deps; the Jupyter
