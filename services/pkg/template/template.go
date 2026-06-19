@@ -35,6 +35,11 @@ const DefaultTemplate = "default"
 // vendor/templates/<name>/ (e.g. "../../etc"); lowercase-only keeps names canonical.
 var templateNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
+// ValidName reports whether name is a legal template name (a single safe path component:
+// [a-z0-9][a-z0-9_-]* up to 64 chars). Shared by Resolve and the storage/build layers so
+// "a name that builds is a name that resolves" stays a single rule, not a duplicated regex.
+func ValidName(name string) bool { return templateNameRE.MatchString(name) }
+
 // Resolve maps a requested name to its artifact paths. It is pure (path computation +
 // name validation only) -- existence is checked later by fc.Spawn / fc.Restore -- so it
 // is unit-testable without a filesystem or a VM. "" and "default" resolve to the legacy
@@ -48,7 +53,7 @@ func Resolve(vendorDir, name string) (Template, error) {
 			SnapshotDir: filepath.Join(vendorDir, "snapshot"),
 		}, nil
 	}
-	if !templateNameRE.MatchString(name) {
+	if !ValidName(name) {
 		return Template{}, fmt.Errorf(
 			"invalid template name %q: must match [a-z0-9][a-z0-9_-]* (max 64 chars)", name)
 	}

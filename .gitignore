@@ -2,8 +2,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .eggs/
-build/
-dist/
+# Anchored to the repo root: these are the top-level Python packaging outputs, not a Go
+# source package that happens to be named build/ (e.g. services/pkg/build/).
+/build/
+/dist/
 .pytest_cache/
 .venv/
 venv/
