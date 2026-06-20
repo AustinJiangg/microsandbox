@@ -1,12 +1,9 @@
 package main
 
-import "encoding/json"
-
-// OutputEvent mirrors protocol.py's OutputEvent: one streamed SSE event, daemon ->
-// client. The SSE bytes must match protocol.py.to_sse() exactly, since the SDK parses
-// them line by line. ExitCode is a *int so it is emitted only for the END event:
-// protocol.py includes "exit_code" only when it is not None, and 0 is a real END
-// value, so a pointer with omitempty (nil omits, &0 includes) reproduces that exactly.
+// OutputEvent is the daemon's internal representation of one streamed kernel output
+// (stdout / stderr / error / end). As of Stage 11 the code-interpreter service
+// (codeinterpreter.go) maps each into a Connect stream frame; ExitCode is a *int so the
+// "end" event can carry a real 0 while the others carry none.
 type OutputEvent struct {
 	Type     string `json:"type"`
 	Data     string `json:"data"`
@@ -20,13 +17,5 @@ const (
 	evError  = "error"
 	evEnd    = "end"
 )
-
-// sse renders the event as one SSE frame, byte-identical to protocol.py.to_sse():
-//
-//	data: {"type":"...","data":"..."[,"exit_code":N]}\n\n
-func (e OutputEvent) sse() string {
-	b, _ := json.Marshal(e)
-	return "data: " + string(b) + "\n\n"
-}
 
 func endEvent(code int) OutputEvent { return OutputEvent{Type: evEnd, ExitCode: &code} }

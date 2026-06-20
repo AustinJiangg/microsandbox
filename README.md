@@ -105,13 +105,15 @@ microsandbox/
 │   ├── STAGE8_DESIGN.md       # Stage 8: split the control plane into api + orchestrator (gRPC)
 │   ├── STAGE9_DESIGN.md       # Stage 9: client-proxy + routing catalog (data path off the api)
 │   ├── STAGE10_DESIGN.md      # Stage 10: TemplateService (async template builds) + pkg/storage
+│   ├── STAGE11_DESIGN.md      # Stage 11: envd -> ConnectRPC (Process/Filesystem) + a separate code-interpreter
 │   └── E2B_ALIGNMENT_ROADMAP.md  # the post-Stage-7 roadmap toward E2B's component architecture
 ├── src/microsandbox/
-│   ├── protocol.py            # client↔daemon wire protocol (the stable boundary)
-│   ├── client.py              # SDK: Sandbox / run_code -- a thin pure-HTTP client to the api
+│   ├── connect.py             # hand-rolled ConnectRPC client (Stage 11): unary + server-streaming over urllib
+│   ├── protocol.py            # SDK result types (Execution/OutputEvent) + reference for the retired SSE wire
+│   ├── client.py              # SDK: Sandbox / run_code -- pure-HTTP lifecycle, ConnectRPC data path
 │   ├── server.py              # the retired Python in-VM daemon (Stage 7 replaced it; kept as reference)
 │   └── backend.py             # the retired Python kernel backend (reference)
-├── daemon/                    # the Go in-VM daemon (Stage 7, E2B's envd): vsock HTTP/SSE; drives the kernel via a Jupyter gateway
+├── daemon/                    # the Go in-VM daemon (E2B's envd): ConnectRPC envd + code-interpreter on two vsock ports (Stage 11); proto/ + genpb/
 ├── services/                  # the Go host control plane (Stages 8-10, E2B's "infra"), module microsandbox/services
 │   ├── cmd/api/               #   lifecycle-only REST front + SQLite store + the /templates build API; calls the orchestrator over gRPC
 │   ├── cmd/client-proxy/      #   edge data proxy (Stage 9): routes the data path by X-Sandbox-Id via the catalog
@@ -138,17 +140,20 @@ which writes a declarative Firecracker config and starts the `firecracker` proce
 microVM with its own guest kernel and an ext4 rootfs — and records the sandbox in the
 api's SQLite metadata store, and registers the sandbox's data route in **client-proxy**'s
 catalog. Inside the VM, PID 1 (`/init`) execs the **Go daemon** (`daemon/`, E2B's `envd`),
-which listens on **vsock**. The SDK then POSTs `/execute` to **client-proxy** (the data URL
-the api returned) with an `X-Sandbox-Id` header; client-proxy looks the sandbox up in its
-routing **catalog** and reverse-proxies to the orchestrator's data proxy, which bridges it
-to the VM over Firecracker's vsock Unix-domain socket (a `CONNECT <port>` handshake, then
-plain HTTP/SSE) and streams the response straight back; the daemon drives a long-lived
-**Python Jupyter kernel** via a Jupyter Kernel Gateway. The SDK itself is pure HTTP. The
-wire protocol (`protocol.py`) is the stable boundary — it never changed as the isolation
-evolved from subprocess to microVM to a control-plane split, a Go daemon, the
-api/orchestrator gRPC split, and the client-proxy/catalog data-plane split. See
-`docs/ARCHITECTURE.md`, `docs/E2B_ALIGNMENT_ROADMAP.md` and the stage design docs
-(`docs/STAGE4`–`STAGE9_DESIGN.md`).
+which listens on **vsock** as two ConnectRPC services — `envd` (Filesystem + Process) and a
+separate `code-interpreter` (the kernel) — on two vsock ports. The SDK sends the data path to
+**client-proxy** (the data URL the api returned) with an `X-Sandbox-Id` header, speaking
+**ConnectRPC**: `run_code` is the code-interpreter's server-streaming `Execute`; files/commands
+are envd's unary RPCs. client-proxy looks the sandbox up in its routing **catalog** and
+reverse-proxies to the orchestrator's data proxy, which routes by the ConnectRPC path to the
+right vsock port and bridges into the VM (a `CONNECT <port>` handshake, then the Connect
+protocol over HTTP/1.1), streaming the response straight back; the code-interpreter drives a
+long-lived **Python Jupyter kernel** via a Jupyter Kernel Gateway. Through Stage 10 the
+client↔daemon wire (`protocol.py`) was byte-stable as the isolation evolved (subprocess →
+microVM → control-plane split → Go daemon → api/orchestrator gRPC → client-proxy/catalog);
+**Stage 11 deliberately moved it to ConnectRPC**, so the e2e suite is now a *behavioral* parity
+oracle. See `docs/ARCHITECTURE.md`, `docs/E2B_ALIGNMENT_ROADMAP.md` and the stage design docs
+(`docs/STAGE4`–`STAGE11_DESIGN.md`).
 
 ## ⚠️ Safety note
 

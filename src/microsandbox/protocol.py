@@ -1,18 +1,19 @@
-"""The wire protocol between the client and the sandbox daemon.
+"""The client↔daemon data shapes: the SDK's result types, and (now reference) the
+original SSE wire protocol.
 
-Why this is its own module:
-    This is the single most important boundary in the whole project. In Stage 0
-    the daemon is just a local subprocess, but from Stage 1 on it runs inside a
-    Docker container, and in Stage 3 inside a Firecracker microVM. No matter how
-    the underlying isolation changes, as long as this protocol stays stable the
-    client (SDK) barely needs to change. This is exactly E2B's design philosophy:
-    decouple "what to execute" from "where to execute it".
+History & why this module exists:
+    Through Stage 10 this *was* the wire protocol -- the single most important boundary in
+    the project. The daemon's isolation changed many times (subprocess -> Docker ->
+    Firecracker microVM) but this stayed byte-stable, so the SDK barely changed; that
+    decoupling of "what to execute" from "where to execute it" is E2B's core philosophy,
+    and it let the project evolve with a byte-for-byte e2e parity oracle.
 
-The protocol itself is simple:
-    - The client POSTs a piece of code to the daemon
-    - The daemon streams back a series of OutputEvents via SSE (Server-Sent Events)
-    - Each event is a single line of JSON describing a chunk of stdout / stderr,
-      or the final end-of-execution status
+    Stage 11 deliberately ended that: the client↔daemon wire is now **ConnectRPC** (see
+    src/microsandbox/connect.py + daemon/proto/*.proto), so the e2e oracle became
+    *behavioral* parity, not byte parity. What stays live here are the SDK's result types
+    -- Execution, EventType, OutputEvent -- which run_code / commands still build and
+    return. ExecuteRequest and the SSE serialization (to_sse / from_sse_payload / to_json)
+    are retired, kept as reference for the pre-Stage-11 protocol (like server.py / backend.py).
 """
 
 from __future__ import annotations

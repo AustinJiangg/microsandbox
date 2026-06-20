@@ -2,9 +2,9 @@ package main
 
 import "testing"
 
-// translate + the SSE rendering are pure, so they pin the /execute byte contract
-// (the mapping ported from backend.py._translate, and the exact `data: {...}` frame)
-// with no kernel, no VM.
+// translate is pure (a kernel iopub message -> OutputEvent, ported from backend.py's
+// _translate), so it is pinned here with no kernel and no VM. The code-interpreter service
+// maps the resulting OutputEvents into Connect stream frames (Stage 11).
 
 func TestTranslate(t *testing.T) {
 	cases := []struct {
@@ -43,15 +43,5 @@ func TestTranslateErrorStripsANSI(t *testing.T) {
 	}
 	if ev.Data != "Traceback\nValueError: x\n" {
 		t.Errorf("data = %q, want ANSI-stripped joined traceback", ev.Data)
-	}
-}
-
-func TestSSEFraming(t *testing.T) {
-	if got := (OutputEvent{Type: evStdout, Data: "hi"}).sse(); got != "data: {\"type\":\"stdout\",\"data\":\"hi\"}\n\n" {
-		t.Errorf("stdout sse = %q", got)
-	}
-	// END carries exit_code (even 0); other events omit it.
-	if got := endEvent(0).sse(); got != "data: {\"type\":\"end\",\"data\":\"\",\"exit_code\":0}\n\n" {
-		t.Errorf("end sse = %q", got)
 	}
 }

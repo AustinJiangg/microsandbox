@@ -25,6 +25,40 @@ from collections.abc import Iterator
 _FLAG_END = 0x02
 
 
+def unary(
+    url: str,
+    message: dict,
+    headers: dict | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """Call a unary Connect RPC: POST the JSON message, return the JSON response (or {}).
+
+    Connect unary with the JSON codec is just a plain POST of the message and a JSON reply;
+    a non-2xx carries a Connect error ({code, message}), surfaced as a RuntimeError.
+    """
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(message).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            **(headers or {}),
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"{url} failed: {_error_detail(exc)}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"cannot reach {url} ({exc.reason}); "
+            "is it running? start the services with scripts/dev-up.sh"
+        ) from exc
+
+
 def server_stream(
     url: str,
     message: dict,

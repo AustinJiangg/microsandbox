@@ -22,7 +22,7 @@ func main() {
 	// Dev/test over TCP: no orchestrator to route by port, so serve envd + code-interpreter
 	// together on the one --addr (the real e2e path is vsock, below).
 	if *addr != "" {
-		mux := newMux(km)
+		mux := newMux()
 		registerCodeInterpreterService(mux, km)
 		ln, err := net.Listen("tcp", *addr)
 		if err != nil {
@@ -60,7 +60,7 @@ func main() {
 	}()
 
 	log.Printf("microsandbox daemon: envd on %s, code-interpreter on %s", envdLn.Addr(), ciLn.Addr())
-	if err := http.Serve(envdLn, newMux(km)); err != nil {
+	if err := http.Serve(envdLn, newMux()); err != nil {
 		log.Fatal(err)
 	}
 }

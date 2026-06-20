@@ -27,14 +27,18 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    `Sandbox().run_code(...)`. A thin **pure-HTTP** client: it drives the **api**
    (`POST`/`DELETE /sandboxes`) and runs code through it (`/sandboxes/{id}/...`);
    it holds no vsock code anymore.
-2. **protocol (wire protocol)** — `src/microsandbox/protocol.py`. The contract
-   between client and daemon. **This is the most important boundary; it stayed
-   byte-stable as the isolation evolved from subprocess to microVM — keep it that
-   way.**
-3. **in-VM daemon** — `daemon/` (Go), E2B's `envd`. Runs **inside the VM**, listens on
-   vsock, serves the protocol, and drives a stateful Python kernel via a Jupyter Kernel
-   Gateway (Stage 7). It replaced the Python `server.py` / `backend.py` (kept in `src/`
-   as reference).
+2. **protocol (client↔daemon contract)** — through Stage 10 this was `protocol.py`, kept
+   **byte-stable** as the isolation evolved (subprocess → microVM) so the SDK barely
+   changed — the project's defining discipline. **Stage 11 deliberately ended it:** the
+   client↔daemon wire is now **ConnectRPC** (`src/microsandbox/connect.py` +
+   `daemon/proto/*.proto`), so the e2e suite is now a **behavioral** parity oracle, not
+   byte-for-byte. `protocol.py` stays as the SDK's result types
+   (Execution/OutputEvent/EventType) + reference for the old SSE wire.
+3. **in-VM daemon** — `daemon/` (Go), E2B's `envd`. Runs **inside the VM** on **two vsock
+   ports** (Stage 11): `envd` (ConnectRPC `FilesystemService` + `ProcessService` + a plain
+   `/health`) and a separate `code-interpreter` (ConnectRPC streaming `Execute`, driving a
+   stateful Python kernel via a Jupyter Kernel Gateway). It replaced the Python `server.py`
+   / `backend.py` (kept in `src/` as reference).
 4. **control plane** — `services/` (Go module `microsandbox/services`), split into
    E2B-shaped services (Stages 8–9). **`cmd/api`** is the **lifecycle-only** public REST
    front (owns a SQLite metadata store, `pkg/store`); it calls **`cmd/orchestrator`** over
@@ -122,10 +126,19 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   Artifacts are published **in place** at `vendor/templates/<name>/` because the snapshot bakes
   in its rootfs's absolute path (so no build-id staging). The whole Python e2e suite passes
   (34/34). See `docs/STAGE10_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): deferred — Stage 11 `envd` →
-  ConnectRPC `Process`/`Filesystem` (+ split `run_code()` into a `code-interpreter`); Stage 12
-  TAP/netns networking + real `<port>-<id>` hostnames (then SQLite→Postgres, in-mem→Redis,
-  Local→object storage go live); then auth, multi-host scheduling, a TypeScript SDK.
+- **Done (Stage 11 — `envd` → ConnectRPC + a separate `code-interpreter`)**: the in-VM daemon
+  now matches E2B's shape, and this **ended the byte-stable-protocol discipline** (the wire is
+  ConnectRPC; the e2e is now a *behavioral* oracle). 11a stood up `envd`'s Connect
+  `FilesystemService`/`ProcessService` alongside the HTTP endpoints (+ `connect-go`, codegen
+  into `daemon/genpb/`); 11b moved the kernel into a `code-interpreter` Connect service on its
+  **own vsock port** (orchestrator routes `/codeinterpreter.*` to it; `fc.CodeInterpreterVsockPort`)
+  and flipped `run_code` to Connect server-streaming (`src/microsandbox/connect.py`, a hand-rolled
+  Connect-JSON client, **no new Python dep**); 11c flipped files/commands to envd Connect unary,
+  removed the daemon's HTTP endpoints, and retired `protocol.py`'s SSE wire. e2e 36/36
+  (behavioral). See `docs/STAGE11_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): deferred — Stage 12 TAP/netns
+  networking + real `<port>-<id>` hostnames (then SQLite→Postgres, in-mem→Redis, Local→object
+  storage go live); then auth, multi-host scheduling, a TypeScript SDK.
 
 ## Development conventions
 
@@ -172,9 +185,13 @@ scripts/dev-up.sh &                              # builds + runs all three; SDK 
 python -c 'from microsandbox import Sandbox; s=Sandbox(); s.run_code("x=41"); print(s.run_code("print(x+1)").stdout); s.close()'
 kill %1                                           # stop the services (dev-up traps the signal and stops all three)
 
-# After editing the in-VM daemon (daemon/*.go), rebuild the rootfs (+ snapshot) so the
-# VM picks up the change -- the rootfs bakes in the compiled daemon binary at build time:
-scripts/build-rootfs.sh && scripts/build-snapshot.sh
+# After editing the in-VM daemon (daemon/*.go), rebuild the rootfs (+ snapshot) so the VM
+# picks up the change -- the rootfs bakes in the compiled daemon binary at build time. Also
+# rebuild ANY built template rootfs (they bake the same daemon; the e2e fixture only builds a
+# rootfs when absent, so a stale one silently runs the OLD daemon). If a daemon/proto changed,
+# rerun scripts/gen-proto.sh first (needs protoc + protoc-gen-connect-go).
+scripts/build-rootfs.sh && scripts/build-snapshot.sh           # the default image
+scripts/build-template.sh example --no-snapshot                 # + each built template under vendor/templates/
 ```
 
 ## Working notes for Claude
@@ -196,7 +213,7 @@ scripts/build-rootfs.sh && scripts/build-snapshot.sh
 - **Cadence**: split work into independently verifiable sub-steps, keep tests
   green at every step, give an honest self-review (🔴/🟡/🟢) before committing, and
   commit only on the user's explicit go-ahead. Commit messages are a **single-line**
-  English Conventional Commit, kept concise: `type: summary (stage N)` (no `(scope)`, no
-  body) + the `Co-Authored-By` trailer. **After every commit, push to `origin/main`
-  immediately** (no separate ask needed).
+  English Conventional Commit, kept minimal: **`type: summary`** — no `(scope)`, no
+  `(stage N)` suffix, no body — plus the `Co-Authored-By` trailer. **After every commit,
+  push to `origin/main` immediately** (no separate ask needed).
 ```

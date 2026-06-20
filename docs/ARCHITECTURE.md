@@ -37,27 +37,30 @@ SQLite metadata store) calling the per-machine **orchestrator**
 **catalog** (`pkg/catalog`, sandbox → node) that the api writes on create, and routes each
 data request by its `X-Sandbox-Id` header to the right orchestrator's vsock data proxy,
 which bridges to the in-VM daemon. The api is now **lifecycle-only** — the data bytes never
-pass through it. The HTTP/SSE bytes on the vsock leg are exactly what travelled over TCP in
-the project's earlier stages — only the pipe changed, and that byte-stable protocol is the
-whole point (see below). As of **Stage 7** the in-VM daemon is a **Go binary**
-(envd-equivalent) driving a Python kernel via a Jupyter Kernel Gateway. See
-`docs/STAGE9_DESIGN.md` / `docs/STAGE8_DESIGN.md` for the split and
-`docs/E2B_ALIGNMENT_ROADMAP.md` for where it is heading.
+pass through it. As of **Stage 11** the in-VM daemon is **two ConnectRPC services** (E2B's
+`envd` + a separate `code-interpreter`) on two vsock ports; the data leg is the Connect
+protocol over HTTP/1.1, riding the same vsock bridge the earlier HTTP/SSE did. Through Stage
+10 that wire was byte-stable (the project's defining discipline); Stage 11 deliberately moved
+it to ConnectRPC, so the e2e suite is now a **behavioral** parity oracle (see below). See
+`docs/STAGE11_DESIGN.md` / `docs/STAGE9_DESIGN.md` / `docs/STAGE8_DESIGN.md` and
+`docs/E2B_ALIGNMENT_ROADMAP.md`.
 
 ## Responsibilities of the components
 
-### 1. protocol.py — the contract (most important)
+### 1. the client↔daemon contract: `protocol.py` (history) → ConnectRPC (now)
 
-Defines what travels between client and daemon:
-- `ExecuteRequest`: the code to run, the language, the timeout.
-- `OutputEvent`: one streamed output (stdout / stderr / error / end).
-- `Execution`: the final result object the client builds by aggregating events.
+Through Stage 10 `protocol.py` *was* the wire: `ExecuteRequest` / `OutputEvent` /
+`Execution`, streamed as SSE. **Why it mattered**: the isolation layer was swapped many
+times (subprocess → container → microVM), but because this protocol stayed **byte-stable**,
+the client barely changed — the pivot that let the project evolve incrementally, with a
+byte-for-byte e2e parity oracle. E2B likewise decouples its SDK from the runtime via a stable
+client↔envd protocol.
 
-**Why it's pulled out separately**: the isolation layer was swapped several times
-while the project grew (subprocess → container → microVM), but because this
-protocol stayed byte-stable, the client barely changed. This is the pivot that
-let the project evolve incrementally. E2B likewise decouples its SDK from the
-underlying runtime via a stable client↔envd protocol.
+**Stage 11 deliberately ended the byte-stable discipline**: the wire is now **ConnectRPC**
+(`src/microsandbox/connect.py` hand-rolls a Connect-JSON client; `daemon/proto/*.proto`
+defines the services), so the e2e suite became a **behavioral** parity oracle. `protocol.py`
+remains as the SDK's result types (`Execution` / `OutputEvent` / `EventType`) and as
+reference for the retired SSE wire.
 
 ### 2. client.py — the SDK
 
@@ -68,29 +71,34 @@ two faces:
 
 - on construction it asks the **api** to spawn/restore a VM (`POST /sandboxes`), which
   returns only once the VM is healthy, plus the `data_url` to reach it.
-- `run_code` / files / commands POST to **client-proxy** (`data_url` + `/execute`,
-  `/files/*`, `/commands`) with an `X-Sandbox-Id` header; the `/execute` SSE streams
-  straight back.
+- `run_code` / files / commands speak **ConnectRPC** to **client-proxy** (`data_url`) with an
+  `X-Sandbox-Id` header (Stage 11): `run_code` is the code-interpreter's server-streaming
+  `Execute`; files/commands are envd's unary `Filesystem` / `Process` RPCs.
 - `close()` asks the **api** to destroy the VM (`DELETE /sandboxes/{id}`).
 
 It holds no vsock or firecracker code anymore — that lives in the orchestrator (4).
 
 ### 3. the in-VM daemon (`daemon/`, Go) + the kernel
 
-As of **Stage 7** the in-VM daemon is a **Go binary** (`daemon/`, built static and
-baked into the rootfs), matching E2B's `envd`. It runs **inside the VM**, listens on
-`AF_VSOCK`, serves the same HTTP/SSE protocol, and streams output back — byte-for-byte
-what the Python daemon did (the existing e2e suite is the parity proof). It replaced
-`src/microsandbox/server.py` + `backend.py`, which stay in `src/` as the reference the
-port was built from. See `docs/STAGE7_DESIGN.md`.
+A static **Go binary** (`daemon/`, baked into the rootfs), matching E2B's `envd`. It runs
+**inside the VM** on **two vsock ports** (Stage 11):
 
-How it runs code: the daemon does **not** run Python itself. Like envd, it launches a
-stateful Python kernel as a child and drives it over a **Jupyter Kernel Gateway**'s
-HTTP + WebSocket kernels API (`POST /api/kernels`, then the `channels` WebSocket),
-translating the kernel's iopub messages (stream / execute_result / error / status)
-into our `OutputEvent`s. A long-lived kernel holds a Python namespace, so variables
-persist across `run_code` calls — exactly how E2B's code interpreter behaves. (The
-files/commands endpoints are plain Go: the daemon's own filesystem and `sh -c`.)
+- **`envd`** — ConnectRPC `FilesystemService` (read/write/list on the VM's own filesystem)
+  + `ProcessService` (run a command via `sh -c`) + a plain `GET /health`.
+- **`code-interpreter`** — a ConnectRPC server-streaming `Execute` that drives the kernel.
+
+Firecracker multiplexes both onto the one vsock UDS (`CONNECT <port>`); the orchestrator
+routes `/codeinterpreter.*` to the second port. It replaced `src/microsandbox/server.py` +
+`backend.py` (kept in `src/` as reference). See `docs/STAGE7_DESIGN.md` (the Go rewrite) and
+`docs/STAGE11_DESIGN.md` (the ConnectRPC split).
+
+How it runs code: the code-interpreter does **not** run Python itself. Like E2B, it launches
+a stateful Python kernel as a child and drives it over a **Jupyter Kernel Gateway**'s HTTP +
+WebSocket kernels API (`POST /api/kernels`, then the `channels` WebSocket), translating the
+kernel's iopub messages (stream / execute_result / error / status) into the stream of
+`OutputEvent`s. A long-lived kernel holds a Python namespace, so variables persist across
+`run_code` calls — exactly how E2B's code interpreter behaves. (envd's Filesystem / Process
+are plain Go: the daemon's own filesystem and `sh -c`.)
 
 **Two orthogonal axes.** It's worth separating them, because conflating them is
 confusing:
@@ -178,20 +186,24 @@ Firecracker microVM (TCP → vsock) → a Go control-plane split (the SDK became
 HTTP client) → a Go in-VM daemon (envd-equivalent, driving the kernel via a Jupyter
 gateway) → an api + orchestrator gRPC split (Stage 8, mirroring E2B's services) → a
 client-proxy + routing catalog (Stage 9, sinking the data plane off the api) → an async
-template builder (Stage 10, E2B's TemplateService). Every
-step followed one discipline: **add a new backend/transport implementation, keep the
-protocol byte-stable, and keep the changes out of the client as much as possible.** Once
-the microVM landed, the earlier backends were removed as scaffolding — the staged code
-lives on in the git history if you want to study the progression.
+template builder (Stage 10, E2B's TemplateService) → the in-VM daemon rewritten as ConnectRPC
+`envd` + a separate `code-interpreter` (Stage 11, E2B's real in-VM shape). Through Stage 10
+every step followed one discipline: **add a new backend/transport implementation, keep the
+protocol byte-stable, and keep the changes out of the client as much as possible** — proven
+each time by a byte-for-byte e2e oracle. **Stage 11 deliberately broke the byte-stable rule**
+(the wire became ConnectRPC), trading it for a *behavioral* e2e oracle to reach E2B's actual
+envd shape. Once the microVM landed, the earlier backends were removed as scaffolding — the
+staged code lives on in the git history if you want to study the progression.
 
 ## Mapping to E2B (read its source alongside, once you're done)
 
 | This project | E2B equivalent | Notes |
 |--------------|----------------|-------|
-| client.py | E2B SDK (python/js) | user interface; a thin pure-HTTP client |
-| protocol.py | envd's gRPC/HTTP protocol | communication contract |
-| daemon/ (Go) | `envd` | resident agent inside the sandbox (Stage 7; was server.py) |
-| Jupyter Kernel Gateway + kernel | the in-sandbox code interpreter | the stateful Python kernel the Go daemon drives over HTTP/WS |
+| client.py | E2B SDK (python/js) | user interface; pure-HTTP for lifecycle, ConnectRPC for the data path |
+| connect.py + daemon/proto | envd's ConnectRPC protocol | the client↔daemon wire (Stage 11; was protocol.py's SSE) |
+| daemon/ `envd` (Go) | `envd` | in-sandbox agent: ConnectRPC Filesystem + Process (Stage 11; was server.py) |
+| daemon/ `code-interpreter` (Go) | `code-interpreter` | ConnectRPC streaming Execute driving the kernel, on its own vsock port (Stage 11) |
+| Jupyter Kernel Gateway + kernel | the in-sandbox kernel | the stateful Python kernel the code-interpreter drives over HTTP/WS |
 | services/cmd/api (Go) | `api` | public REST front, lifecycle-only; owns the metadata store; picks a node, calls the orchestrator over gRPC, writes the catalog |
 | services/cmd/client-proxy (Go) | `client-proxy` | edge data proxy; routes the data path by `X-Sandbox-Id` via the catalog (Stage 9; E2B keys on `<port>-<id>` hostnames) |
 | services/cmd/orchestrator (Go) | `orchestrator` | per-machine VM fleet + warm pool + vsock data proxy + health + the template builder |

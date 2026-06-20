@@ -33,7 +33,7 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from .connect import server_stream
+from .connect import server_stream, unary
 from .protocol import EventType, Execution, OutputEvent
 
 # Where to reach the services; overridable per-Sandbox (base_url= / data_url=) or via env.
@@ -157,24 +157,18 @@ class Sandbox:
         path: str,
         body: dict | None = None,
         timeout: float | None = None,
-        base: str | None = None,
-        headers: dict | None = None,
     ) -> dict:
-        """Make one HTTP call to a service, returning the parsed JSON (or {}).
-
-        Lifecycle calls go to the api (base_url, the default); data calls pass
-        base=self._data_url and headers={"X-Sandbox-Id": ...} to reach client-proxy. A
-        non-2xx carrying {"error": ...} becomes a RuntimeError; an unreachable service
-        becomes a RuntimeError with a hint to start it. timeout=None blocks (a command may
-        legitimately run a while).
+        """Make one lifecycle HTTP call to the api (POST/DELETE/GET /sandboxes), returning
+        the parsed JSON (or {}). The data path no longer goes through here -- it speaks
+        ConnectRPC to client-proxy (see _stream / _envd). A non-2xx carrying {"error": ...}
+        becomes a RuntimeError; an unreachable api becomes a RuntimeError with a hint.
         """
-        base = base or self._base_url
         data = json.dumps(body).encode() if body is not None else None
-        req_headers = dict(headers or {})
-        if data is not None:
-            req_headers.setdefault("Content-Type", "application/json")
         request = urllib.request.Request(
-            base + path, data=data, method=method, headers=req_headers
+            self._base_url + path,
+            data=data,
+            method=method,
+            headers={"Content-Type": "application/json"} if data is not None else {},
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as resp:
@@ -186,10 +180,10 @@ class Sandbox:
                 detail = json.loads(detail).get("error", detail)
             except json.JSONDecodeError:
                 pass
-            raise RuntimeError(f"{method} {path} failed: {detail}") from exc
+            raise RuntimeError(f"control plane {method} {path} failed: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(
-                f"cannot reach {base} ({exc.reason}); "
+                f"cannot reach the api at {self._base_url} ({exc.reason}); "
                 "is it running? start the services with scripts/dev-up.sh"
             ) from exc
 
@@ -238,14 +232,13 @@ class Sandbox:
         for msg in server_stream(url, message, headers=self._data_headers()):
             yield _output_event(msg)
 
-    def _post_json(self, path: str, payload: dict) -> dict:
-        """POST JSON to one of the sandbox's daemon endpoints (via client-proxy).
-
-        The file/command endpoints go through here (run_code uses _stream's SSE instead).
-        A daemon error (non-200 carrying {"error": ...}) surfaces as a RuntimeError.
+    def _envd(self, method: str, message: dict) -> dict:
+        """Call an envd unary RPC (ConnectRPC) for this sandbox -- `method` is e.g.
+        "FilesystemService/Read" or "ProcessService/Run". client-proxy routes by the
+        X-Sandbox-Id header to this sandbox's envd; the reply message is returned as a dict.
         """
-        return self._control_plane(
-            "POST", path, payload, base=self._data_url, headers=self._data_headers()
+        return unary(
+            self._data_url + "/envd." + method, message, headers=self._data_headers()
         )
 
 
@@ -263,14 +256,18 @@ class _Files:
         self._sb = sandbox
 
     def write(self, path: str, content: str) -> None:
-        self._sb._post_json("/files/write", {"path": path, "content": content})
+        self._sb._envd("FilesystemService/Write", {"path": path, "content": content})
 
     def read(self, path: str) -> str:
-        return self._sb._post_json("/files/read", {"path": path})["content"]
+        return self._sb._envd("FilesystemService/Read", {"path": path}).get("content", "")
 
     def list(self, path: str) -> list[dict]:
         """List a directory, returning [{"name": str, "is_dir": bool}, ...]."""
-        return self._sb._post_json("/files/list", {"path": path})["entries"]
+        # protojson omits zero values: a directory's entries carry "isDir": true, but a
+        # plain file omits it (false), so default is_dir to False. Map back to the SDK's
+        # snake_case "is_dir" shape.
+        entries = self._sb._envd("FilesystemService/List", {"path": path}).get("entries", [])
+        return [{"name": e["name"], "is_dir": e.get("isDir", False)} for e in entries]
 
 
 class _Commands:
@@ -281,20 +278,17 @@ class _Commands:
 
     def run(self, command: str, timeout_seconds: float | None = None) -> Execution:
         """Run a shell command, returning the same Execution as run_code (stdout/stderr/exit_code)."""
-        payload = {
-            "command": command,
-            # Use `is None` rather than `or`: the latter would treat an explicitly passed 0 as "not passed" and fall back to the default.
-            "timeout_seconds": (
-                timeout_seconds
-                if timeout_seconds is not None
-                else self._sb.timeout_seconds
-            ),
-        }
-        data = self._sb._post_json("/commands", payload)
+        # `is None` not `or`: an explicitly passed 0 must not fall back to the default.
+        timeout = timeout_seconds if timeout_seconds is not None else self._sb.timeout_seconds
+        # protojson field names are camelCase (timeoutSeconds / exitCode), and zero values
+        # are omitted -- so a clean exit (0) comes back with exitCode absent; default it.
+        data = self._sb._envd(
+            "ProcessService/Run", {"command": command, "timeoutSeconds": timeout}
+        )
         return Execution(
-            stdout=data["stdout"],
-            stderr=data["stderr"],
-            exit_code=data["exit_code"],
+            stdout=data.get("stdout", ""),
+            stderr=data.get("stderr", ""),
+            exit_code=int(data.get("exitCode", 0)),
         )
 
 

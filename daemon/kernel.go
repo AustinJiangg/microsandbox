@@ -350,37 +350,3 @@ func secs(d time.Duration) string {
 	}
 	return strconv.FormatFloat(s, 'g', -1, 64)
 }
-
-// handleExecute: POST /execute -> SSE stream of OutputEvents. The byte format is
-// protocol.py's (OutputEvent.sse); the control plane proxies the stream straight back.
-func (k *kernelManager) handleExecute(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Code           string  `json:"code"`
-		Language       string  `json:"language"`
-		TimeoutSeconds float64 `json:"timeout_seconds"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad request: " + err.Error()})
-		return
-	}
-	if req.Language == "" {
-		req.Language = "python"
-	}
-	timeout := req.TimeoutSeconds
-	if timeout <= 0 {
-		timeout = 30
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
-
-	emit := func(ev OutputEvent) {
-		_, _ = w.Write([]byte(ev.sse()))
-		if flusher != nil {
-			flusher.Flush() // stream each event live, like the daemon's SSE always has
-		}
-	}
-	k.execute(r.Context(), req.Code, req.Language, time.Duration(timeout*float64(time.Second)), emit)
-}
