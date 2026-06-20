@@ -31,12 +31,15 @@ def test_restore_runs_and_is_stateful(snapshot_sandbox: Sandbox) -> None:
 
 
 def test_restore_is_fast(snapshot_ready) -> None:
-    """Restore-to-ready is far faster than cold start (cold start ~0.94s; restore measured ~30-40ms).
+    """Restore-to-ready skips the guest kernel boot that a cold start pays.
 
-    Time it ourselves: the elapsed time from constructing Sandbox(from_snapshot=True)
-    until ready. Use a generous upper bound (< 0.6s) to avoid flakiness from machine
-    jitter -- this one assertion alone suffices to prove the order-of-magnitude gap
-    from "skipping kernel boot."
+    Time it ourselves: elapsed from constructing Sandbox(from_snapshot=True) until ready.
+    Since Stage 12 every sandbox also gets its own network inline (netns + TAP + veth + DNAT,
+    services/pkg/network) -- ~0.5-1s of sequential `ip` calls on WSL2 -- so this *unpooled*
+    restore is no longer the ~30-40ms it once was; the bound below is deliberately loose. The
+    real ms-latency path is the warm pool, which pre-allocates the slot in the background (so
+    Get() pays neither the kernel boot nor the network setup). This case only proves restore
+    still avoids the guest kernel boot; see the Stage 12 perf note for the slot-setup cost.
     """
     t0 = time.time()
     sb = Sandbox(from_snapshot=True, base_url=snapshot_ready)
@@ -45,7 +48,7 @@ def test_restore_is_fast(snapshot_ready) -> None:
         assert sb.run_code("print(1)").stdout.strip() == "1"
     finally:
         sb.close()
-    assert ready < 0.6, f"restore-to-ready took {ready * 1000:.0f}ms, exceeding expectation (cold start is only ~940ms)"
+    assert ready < 1.5, f"restore-to-ready took {ready * 1000:.0f}ms (Stage 12 adds per-sandbox net setup; the warm pool is the ms-latency path)"
 
 
 def test_concurrent_restores_are_isolated(snapshot_ready) -> None:

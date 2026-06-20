@@ -24,7 +24,7 @@ import (
 type server struct {
 	vendorDir string
 	pools     map[string]*pool.Pool // template name -> its warm pool; empty when no --pool/--pool-size
-	net       *network.Manager      // Stage 12a: per-sandbox netns/TAP/veth/DNAT slots (cold-start path)
+	net       *network.Manager      // Stage 12: per-sandbox netns/TAP/veth/DNAT slots (cold-start + restore paths)
 
 	mu        sync.Mutex             // guards sandboxes
 	sandboxes map[string]*fc.MicroVM // sandbox id -> running VM
@@ -51,7 +51,7 @@ func newServer(vendorDir string, poolSpecs map[string]int) *server {
 		// fresh per-iteration variable, so each closure captures its own template.
 		tmpl, _ := template.Resolve(vendorDir, name)
 		p := pool.New(k, func() (pool.VM, error) {
-			vm, err := restoreHealthy(vendorDir, tmpl)
+			vm, err := restoreHealthy(vendorDir, tmpl, s.net)
 			if err != nil {
 				return nil, err
 			}
@@ -132,7 +132,7 @@ func (s *server) create(fromSnapshot bool, tmpl template.Template) (*fc.MicroVM,
 			vm = v.(*fc.MicroVM) // the pool only ever holds *fc.MicroVM (newServer's restore)
 		}
 	case fromSnapshot:
-		vm, err = restoreHealthy(s.vendorDir, tmpl)
+		vm, err = restoreHealthy(s.vendorDir, tmpl, s.net)
 	default:
 		vm, err = spawnHealthy(s.vendorDir, tmpl, s.net)
 	}
@@ -142,9 +142,10 @@ func (s *server) create(fromSnapshot bool, tmpl template.Template) (*fc.MicroVM,
 	s.mu.Lock()
 	s.sandboxes[vm.ID] = vm
 	s.mu.Unlock()
-	// Stage 12a: a cold-started VM has a network slot -- observe (non-fatally) that it is also
-	// reachable over its NIC via TCP, the path 12b moves the data plane to. Logged only; the
-	// vsock path stays authoritative this sub-step, so a probe failure does not fail create.
+	// Stage 12b: every VM (cold-started or restored) now has a network slot -- observe
+	// (non-fatally) that it is reachable over its NIC via TCP, the path the data plane is moving
+	// to. Logged only; the vsock path stays authoritative this sub-step, so a probe failure here
+	// does not fail create.
 	if vm.Slot != nil {
 		go func(id, addr string) {
 			if proxy.TCPHealthy(addr) {
@@ -211,8 +212,8 @@ func healthyOrDestroy(vm *fc.MicroVM, err error) (*fc.MicroVM, error) {
 
 // restoreHealthy / spawnHealthy mint an id, create a VM (restored from the snapshot /
 // cold-started), and block until it is healthy.
-func restoreHealthy(vendorDir string, tmpl template.Template) (*fc.MicroVM, error) {
-	return healthyOrDestroy(fc.Restore(fc.NewID(), vendorDir, tmpl))
+func restoreHealthy(vendorDir string, tmpl template.Template, netMgr *network.Manager) (*fc.MicroVM, error) {
+	return healthyOrDestroy(fc.Restore(fc.NewID(), vendorDir, tmpl, netMgr))
 }
 
 func spawnHealthy(vendorDir string, tmpl template.Template, netMgr *network.Manager) (*fc.MicroVM, error) {

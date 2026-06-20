@@ -174,9 +174,18 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 // time via Firecracker v1.16.0's vsock_override, so N VMs can be restored from the
 // one snapshot -- each listening on its own workdir/fc.vsock. This is the basis for
 // the warm pool (Stage 5). See docs/STAGE5_DESIGN.md.
-func Restore(id, vendorDir string, tmpl template.Template) (*MicroVM, error) {
+//
+// Stage 12b: the snapshot also bakes a fixed eth0 (IP + MAC), so for the same reason each
+// restored VM gets its own network slot (netns) from netMgr -- the network twin of
+// vsock_override. firecracker is launched inside that netns, whose tap0 the snapshot's NIC
+// reattaches to (the tap name is constant across slots; uniqueness is the netns).
+func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manager) (*MicroVM, error) {
 	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
+	}
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		return nil, fmt.Errorf("/dev/net/tun missing; it is needed for per-sandbox networking" +
+			" (Stage 12). See docs/MICROVM_DESIGN.md")
 	}
 	snap := tmpl.SnapshotDir
 	vmstate := filepath.Join(snap, "vmstate")
@@ -197,8 +206,17 @@ func Restore(id, vendorDir string, tmpl template.Template) (*MicroVM, error) {
 			" rebuild with scripts/build-template.sh %s", tmpl.Rootfs, tmpl.Name, tmpl.Name)
 	}
 
+	// Stage 12b: each restored VM gets its own network slot, just like Spawn -- the snapshot now
+	// bakes a configured eth0, and every VM restored from it comes up with the SAME guest IP/MAC,
+	// so each must live in its own netns to coexist (the network twin of the vsock_override below).
+	slot, err := netMgr.Allocate()
+	if err != nil {
+		return nil, fmt.Errorf("allocate network slot: %w", err)
+	}
+
 	workdir, err := os.MkdirTemp("", "microsandbox-vm-")
 	if err != nil {
+		netMgr.Free(slot)
 		return nil, err
 	}
 	apiSock := filepath.Join(workdir, "api.sock")
@@ -207,13 +225,18 @@ func Restore(id, vendorDir string, tmpl template.Template) (*MicroVM, error) {
 	// collide on a shared socket.
 	uds := filepath.Join(workdir, "fc.vsock")
 
-	// Restore stays vsock-only this sub-step (a snapshot can't gain a NIC it was not captured
-	// with), so it gets no netns -- pass "". 12b rebuilds the snapshot with eth0 and a slot.
-	vm, err := startFirecracker(id, vendorDir, workdir, uds, "", "--api-sock", apiSock)
+	// firecracker runs inside the slot's netns so the snapshot's NIC reattaches to that netns's
+	// tap0. The unix sockets (api.sock, fc.vsock) live in workdir on the host fs, so the netns
+	// doesn't isolate them -- the orchestrator still reaches them.
+	vm, err := startFirecracker(id, vendorDir, workdir, uds, slot.Netns, "--api-sock", apiSock)
 	if err != nil {
 		os.RemoveAll(workdir)
+		netMgr.Free(slot)
 		return nil, err
 	}
+	// Record the slot now (before the load) so a load failure's vm.Destroy() also frees it.
+	vm.Slot = slot
+	vm.netMgr = netMgr
 
 	// Snapshot load + resume can't go through --config-file, so use the REST API.
 	status, err := firecrackerAPI(apiSock, "PUT", "/snapshot/load", map[string]any{

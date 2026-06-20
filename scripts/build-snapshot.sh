@@ -31,18 +31,42 @@ done
 mkdir -p "$SNAP"; rm -f "$SNAP/vmstate" "$SNAP/memfile" "$UDS"
 BASE="$(mktemp -d)"
 
+# Stage 12b: the snapshot must capture a configured eth0, because the data path now rides the
+# VM's NIC (not vsock). So the base VM boots with a virtio-net backed by a host TAP, and the
+# guest kernel brings eth0 up from the ip= boot arg (the minimal rootfs has no `ip` binary).
+# Creating a TAP needs CAP_NET_ADMIN; on this single box that is the passwordless 'ip' granted in
+# /etc/sudoers.d/microsandbox (Stage 12 Decision 7). These constants MUST match services/pkg/network
+# (TapDevice / GuestMAC / vmIP / vmGateway / vmNetmask / BootIPArg) -- shell can't import the Go consts.
+TAP=tap0
+GUEST_MAC="06:00:AC:10:00:15"
+VM_IP=169.254.0.21; GW_IP=169.254.0.22; NETMASK=255.255.255.252
+IP_ARG="ip=${VM_IP}::${GW_IP}:${NETMASK}::eth0:off"
+[ -e /dev/net/tun ] || { echo "missing /dev/net/tun (needed for the snapshot's NIC; see docs/STAGE12_DESIGN.md)" >&2; exit 1; }
+
+# Tear the TAP (and the VM) down on any exit; set before creating the TAP so a mid-setup failure
+# still cleans up. The base VM runs as the normal user, so the TAP is created user-owned (firecracker
+# below opens it without CAP_NET_ADMIN); only the ip commands themselves need root.
+trap 'kill ${FCPID:-} 2>/dev/null || true; sudo -n ip link del "$TAP" 2>/dev/null || true; rm -rf "$BASE"' EXIT
+
+echo "[build-snapshot] setting up host TAP $TAP (needs passwordless 'sudo ip'; see docs/STAGE12_DESIGN.md) ..."
+sudo -n ip link del "$TAP" 2>/dev/null || true   # clear any leftover from a previous interrupted build
+sudo -n ip tuntap add "$TAP" mode tap user "$USER" \
+  || { echo "failed to create TAP $TAP -- add 'NOPASSWD: ip' to /etc/sudoers.d/microsandbox (Stage 12)" >&2; exit 1; }
+sudo -n ip addr add "$GW_IP/30" dev "$TAP"
+sudo -n ip link set "$TAP" up
+
 cat > "$BASE/config.json" <<EOF
 { "boot-source": { "kernel_image_path": "$KERNEL",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init" },
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init $IP_ARG" },
   "drives": [ { "drive_id": "rootfs", "path_on_host": "$ROOTFS", "is_root_device": true, "is_read_only": true } ],
   "machine-config": { "vcpu_count": 1, "mem_size_mib": 512 },
+  "network-interfaces": [ { "iface_id": "eth0", "host_dev_name": "$TAP", "guest_mac": "$GUEST_MAC" } ],
   "vsock": { "guest_cid": 3, "uds_path": "$UDS" } }
 EOF
 
 echo "[build-snapshot] starting base VM ..."
 "$FC" --api-sock "$BASE/api.sock" --config-file "$BASE/config.json" > "$BASE/console.log" 2>&1 &
 FCPID=$!
-trap 'kill $FCPID 2>/dev/null || true; rm -rf "$BASE"' EXIT
 
 echo "[build-snapshot] warming up the Jupyter kernel (health + running a 'pass' to force the kernel to start) ..."
 # A self-contained vsock client: connect to Firecracker's UDS, do the CONNECT

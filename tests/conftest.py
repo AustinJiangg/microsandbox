@@ -44,18 +44,23 @@ def go_available() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def networking_available() -> bool:
-    """Stage 12a: a cold-started VM now gets a per-sandbox netns/TAP/veth (services/pkg/network),
-    so the orchestrator must run as root. On this single-box model that is passwordless sudo (a
-    one-time /etc/sudoers.d entry -- see docs/STAGE12_DESIGN.md) plus /dev/net/tun. When either is
-    missing the microVM group skips, exactly like the /dev/kvm gate, so pytest still completes.
+    """Stage 12: a VM now gets a per-sandbox netns/TAP/veth (services/pkg/network), so the
+    orchestrator must run as root, and (Stage 12b) build-snapshot.sh creates the snapshot's TAP via
+    `sudo -n ip`. On this single-box model both are passwordless sudo (a one-time /etc/sudoers.d
+    entry -- see docs/STAGE12_DESIGN.md) plus /dev/net/tun. When any is missing the microVM group
+    skips, exactly like the /dev/kvm gate, so pytest still completes.
     """
     if not os.path.exists("/dev/net/tun"):
         return False
     if os.geteuid() == 0:
         return True
-    # /usr/bin/true is a harmless probe the same sudoers entry grants, so a successful
-    # passwordless run here means the orchestrator (same entry) will launch under sudo too.
-    return subprocess.run(["sudo", "-n", "/usr/bin/true"], capture_output=True).returncode == 0
+    # Two passwordless grants from the same drop-in: the orchestrator binary (runs as root for the
+    # netns/TAP setup) and `ip` (build-snapshot.sh makes the snapshot's TAP as the normal user).
+    # /usr/bin/true stands in for the orchestrator grant; `ip -V` is a harmless probe of the ip one.
+    def granted(*cmd: str) -> bool:
+        return subprocess.run(["sudo", "-n", *cmd], capture_output=True).returncode == 0
+
+    return granted("/usr/bin/true") and granted("ip", "-V")
 
 
 @functools.lru_cache(maxsize=1)
