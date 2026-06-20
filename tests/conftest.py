@@ -43,6 +43,22 @@ def go_available() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def networking_available() -> bool:
+    """Stage 12a: a cold-started VM now gets a per-sandbox netns/TAP/veth (services/pkg/network),
+    so the orchestrator must run as root. On this single-box model that is passwordless sudo (a
+    one-time /etc/sudoers.d entry -- see docs/STAGE12_DESIGN.md) plus /dev/net/tun. When either is
+    missing the microVM group skips, exactly like the /dev/kvm gate, so pytest still completes.
+    """
+    if not os.path.exists("/dev/net/tun"):
+        return False
+    if os.geteuid() == 0:
+        return True
+    # /usr/bin/true is a harmless probe the same sudoers entry grants, so a successful
+    # passwordless run here means the orchestrator (same entry) will launch under sudo too.
+    return subprocess.run(["sudo", "-n", "/usr/bin/true"], capture_output=True).returncode == 0
+
+
+@functools.lru_cache(maxsize=1)
 def ensure_agent_image() -> None:
     """docker build the agent image once if it isn't local (first build is slow: installs ipykernel).
 
@@ -138,6 +154,9 @@ def control_plane(tmp_path_factory):
         pytest.skip("firecracker/kernel/kvm incomplete, skipping microVM cases")
     if not go_available():
         pytest.skip("go toolchain not found, skipping services cases")
+    if not networking_available():
+        pytest.skip("orchestrator needs root for per-sandbox networking (Stage 12a): "
+                    "missing /dev/net/tun or passwordless sudo -- see docs/STAGE12_DESIGN.md")
 
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     ensure_rootfs()  # the orchestrator needs the rootfs for any cold start
@@ -152,11 +171,18 @@ def control_plane(tmp_path_factory):
     orch_log = open(logdir / "orchestrator.log", "wb")
     cp_log = open(logdir / "client-proxy.log", "wb")
     api_log = open(logdir / "api.log", "wb")
-    orch = subprocess.Popen(
-        [str(repo_root / "vendor" / "orchestrator"),
-         "--grpc-addr", grpc_addr, "--proxy-addr", proxy_addr, "--vendor-dir", vendor],
-        stdout=orch_log, stderr=subprocess.STDOUT,
-    )
+    # Stage 12a: the orchestrator allocates a per-sandbox netns/TAP/veth (pkg/network) on cold
+    # start, which needs root. On this single box that is passwordless sudo (the /etc/sudoers.d
+    # entry in docs/STAGE12_DESIGN.md); when already root the wrapper is skipped. sudo forwards
+    # SIGTERM to the child, so the teardown below still reaches the orchestrator's destroyAll.
+    # -E preserves the developer's environment (PATH/HOME/Go caches) so the orchestrator's
+    # template-build subprocess (go/docker/mkfs) works just as it did before it ran as root;
+    # the sudoers drop-in grants SETENV + !secure_path for exactly this command.
+    orch_cmd = [str(repo_root / "vendor" / "orchestrator"),
+                "--grpc-addr", grpc_addr, "--proxy-addr", proxy_addr, "--vendor-dir", vendor]
+    if os.geteuid() != 0:
+        orch_cmd = ["sudo", "-n", "-E"] + orch_cmd
+    orch = subprocess.Popen(orch_cmd, stdout=orch_log, stderr=subprocess.STDOUT)
     cp = api = None
     try:
         # Start order: orchestrator (the api dials it for lifecycle), then client-proxy

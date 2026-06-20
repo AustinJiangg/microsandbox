@@ -2,12 +2,14 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"microsandbox/services/pkg/fc"
+	"microsandbox/services/pkg/network"
 	"microsandbox/services/pkg/pool"
 	"microsandbox/services/pkg/proxy"
 	"microsandbox/services/pkg/template"
@@ -22,10 +24,15 @@ import (
 type server struct {
 	vendorDir string
 	pools     map[string]*pool.Pool // template name -> its warm pool; empty when no --pool/--pool-size
+	net       *network.Manager      // Stage 12a: per-sandbox netns/TAP/veth/DNAT slots (cold-start path)
 
 	mu        sync.Mutex             // guards sandboxes
 	sandboxes map[string]*fc.MicroVM // sandbox id -> running VM
 }
+
+// networkSlots caps concurrent per-sandbox network slots (Stage 12a). 256 is the third-octet
+// limit in pkg/network's 10.0.<i>.0/30 scheme -- ample for one machine.
+const networkSlots = 256
 
 // newServer builds the server and one warm pool per entry in poolSpecs (template name
 // -> K): each pre-restores K snapshot VMs in the background, already health-probed, so
@@ -33,7 +40,12 @@ type server struct {
 // the original behavior of restoring on the request path. The pool's "make one VM"
 // step is restoreHealthy -- the same one the unpooled from_snapshot path uses.
 func newServer(vendorDir string, poolSpecs map[string]int) *server {
-	s := &server{vendorDir: vendorDir, sandboxes: map[string]*fc.MicroVM{}, pools: map[string]*pool.Pool{}}
+	s := &server{
+		vendorDir: vendorDir,
+		sandboxes: map[string]*fc.MicroVM{},
+		pools:     map[string]*pool.Pool{},
+		net:       network.NewManager(networkSlots),
+	}
 	for name, k := range poolSpecs {
 		// name was validated by parsePoolSpecs, so resolve cannot fail. tmpl is a
 		// fresh per-iteration variable, so each closure captures its own template.
@@ -122,7 +134,7 @@ func (s *server) create(fromSnapshot bool, tmpl template.Template) (*fc.MicroVM,
 	case fromSnapshot:
 		vm, err = restoreHealthy(s.vendorDir, tmpl)
 	default:
-		vm, err = spawnHealthy(s.vendorDir, tmpl)
+		vm, err = spawnHealthy(s.vendorDir, tmpl, s.net)
 	}
 	if err != nil {
 		return nil, err
@@ -130,6 +142,18 @@ func (s *server) create(fromSnapshot bool, tmpl template.Template) (*fc.MicroVM,
 	s.mu.Lock()
 	s.sandboxes[vm.ID] = vm
 	s.mu.Unlock()
+	// Stage 12a: a cold-started VM has a network slot -- observe (non-fatally) that it is also
+	// reachable over its NIC via TCP, the path 12b moves the data plane to. Logged only; the
+	// vsock path stays authoritative this sub-step, so a probe failure does not fail create.
+	if vm.Slot != nil {
+		go func(id, addr string) {
+			if proxy.TCPHealthy(addr) {
+				log.Printf("sandbox %s: TCP health OK at %s (NIC path live)", id, addr)
+			} else {
+				log.Printf("sandbox %s: TCP health probe failed at %s (vsock authoritative)", id, addr)
+			}
+		}(vm.ID, vm.Slot.Addr(fc.EnvdTCPPort))
+	}
 	return vm, nil
 }
 
@@ -191,8 +215,8 @@ func restoreHealthy(vendorDir string, tmpl template.Template) (*fc.MicroVM, erro
 	return healthyOrDestroy(fc.Restore(fc.NewID(), vendorDir, tmpl))
 }
 
-func spawnHealthy(vendorDir string, tmpl template.Template) (*fc.MicroVM, error) {
-	return healthyOrDestroy(fc.Spawn(fc.NewID(), vendorDir, tmpl))
+func spawnHealthy(vendorDir string, tmpl template.Template, netMgr *network.Manager) (*fc.MicroVM, error) {
+	return healthyOrDestroy(fc.Spawn(fc.NewID(), vendorDir, tmpl, netMgr))
 }
 
 // destroyAll terminates every running VM -- the warm pools' idle VMs first, then the

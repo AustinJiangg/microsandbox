@@ -106,6 +106,28 @@ func WaitHealthy(udsPath string, vsockPort int, timeout time.Duration) error {
 	return fmt.Errorf("did not become healthy within %s", timeout)
 }
 
+// TCPHealthy does one /health GET over TCP at addr (host:port), returning whether it
+// answered 200. Stage 12a uses it to confirm a cold-started VM is reachable over its NIC
+// (the path 12b switches the data plane to), alongside the authoritative vsock probe.
+//
+// Transport.Proxy is nil on purpose: it bypasses any HTTP_PROXY in the environment. On WSL
+// the autoProxy would otherwise intercept the 10.x per-sandbox address (its no_proxy "10.*"
+// glob is not honored) and the probe would spuriously fail. See docs/STAGE12_DESIGN.md
+// (Decision 7) and the wsl2-proxy memory.
+func TCPHealthy(addr string) bool {
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	resp, err := client.Get("http://" + addr + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
 // VsockHealthy does one /health probe over vsock, returning whether it answered 200.
 func VsockHealthy(udsPath string, vsockPort int) bool {
 	conn, err := net.DialTimeout("unix", udsPath, time.Second)

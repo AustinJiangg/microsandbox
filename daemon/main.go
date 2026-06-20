@@ -2,9 +2,18 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+)
+
+// Stage 12a: the daemon also listens on these TCP ports (E2B's), reachable over the VM's
+// eth0 via the host's per-sandbox netns, alongside the vsock listeners. They must match
+// fc.EnvdTCPPort / fc.CodeInterpreterTCPPort on the host side.
+const (
+	envdTCPPort = 49983
+	ciTCPPort   = 49999
 )
 
 // The daemon runs inside the Firecracker microVM as PID 1's payload (/init execs it).
@@ -51,6 +60,7 @@ func main() {
 		log.Fatalf("code-interpreter vsock listen: %v", err)
 	}
 
+	envdMux := newMux()
 	ciMux := http.NewServeMux()
 	registerCodeInterpreterService(ciMux, km)
 	go func() {
@@ -59,8 +69,28 @@ func main() {
 		}
 	}()
 
-	log.Printf("microsandbox daemon: envd on %s, code-interpreter on %s", envdLn.Addr(), ciLn.Addr())
-	if err := http.Serve(envdLn, newMux()); err != nil {
+	// Stage 12a: also serve both services over TCP (E2B's ports), reachable via the VM's
+	// NIC, alongside vsock. Additive -- the orchestrator still routes the data path over
+	// vsock until 12b; these listeners let the host verify the NIC path now. The same
+	// handlers serve both transports; a bind failure is non-fatal (vsock still works).
+	serveTCP := func(port int, h http.Handler, name string) {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			log.Printf("warning: %s TCP listen on :%d failed: %v", name, port, err)
+			return
+		}
+		go func() {
+			if err := http.Serve(ln, h); err != nil {
+				log.Printf("%s TCP serve: %v", name, err)
+			}
+		}()
+	}
+	serveTCP(envdTCPPort, envdMux, "envd")
+	serveTCP(ciTCPPort, ciMux, "code-interpreter")
+
+	log.Printf("microsandbox daemon: envd on %s + tcp :%d, code-interpreter on %s + tcp :%d",
+		envdLn.Addr(), envdTCPPort, ciLn.Addr(), ciTCPPort)
+	if err := http.Serve(envdLn, envdMux); err != nil {
 		log.Fatal(err)
 	}
 }
