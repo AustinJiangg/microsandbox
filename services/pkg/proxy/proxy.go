@@ -92,6 +92,24 @@ func VsockProxy(udsPath string, vsockPort int, rest string) *httputil.ReversePro
 	}
 }
 
+// TCPProxy returns a reverse proxy that forwards a request to the in-VM daemon at addr
+// (the slot's RoutableIP:port) over plain TCP, preserving the request path. Stage 12b flips
+// the data path from vsock to the VM's NIC; this is the TCP twin of VsockProxy. FlushInterval
+// -1 flushes every write so code-interpreter's streamed Execute reaches the SDK live. The
+// Transport sets Proxy nil on purpose: it bypasses any HTTP_PROXY in the (root, -E) env, which
+// on WSL would otherwise intercept the 10.x slot address -- see TCPHealthy + the wsl2-proxy memory.
+func TCPProxy(addr string) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL.Scheme = "http"
+			pr.Out.URL.Host = addr // path + query carry over from the inbound request
+			pr.Out.Host = addr
+		},
+		Transport:     &http.Transport{Proxy: nil},
+		FlushInterval: -1,
+	}
+}
+
 // WaitHealthy polls the in-VM daemon's /health over vsock until it answers 200 or
 // the timeout elapses. Ported from client.py's _wait_until_healthy; the control
 // plane now does it, so a sandbox is healthy by the time POST /sandboxes returns.
@@ -126,6 +144,22 @@ func TCPHealthy(addr string) bool {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode == http.StatusOK
+}
+
+// TCPWaitHealthy polls the daemon's /health over TCP at addr until it answers 200 or the
+// timeout elapses -- the TCP twin of WaitHealthy. Polling (not one-shot TCPHealthy) matters
+// because the daemon's TCP listener can bind a beat after the VM is otherwise up (Stage 12a saw
+// a single probe race readiness ~10% of the time), so the control plane must wait it out before
+// it makes the TCP path authoritative and hands the sandbox over.
+func TCPWaitHealthy(addr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if TCPHealthy(addr) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("did not become healthy (TCP %s) within %s", addr, timeout)
 }
 
 // VsockHealthy does one /health probe over vsock, returning whether it answered 200.

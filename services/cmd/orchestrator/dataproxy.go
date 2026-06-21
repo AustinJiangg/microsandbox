@@ -3,18 +3,17 @@ package main
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
+	"strconv"
 
-	"microsandbox/services/pkg/fc"
 	"microsandbox/services/pkg/proxy"
 )
 
-// handleData is the orchestrator's per-node data proxy: it bridges an HTTP request to
-// the in-VM daemon (envd) over Firecracker's vsock. The sandbox is identified by the
-// X-Sandbox-Id header (set by the api in Stage 8, by client-proxy in Stage 9), and the
-// request path is the daemon endpoint (/execute, /files/*, /commands). This replaces
-// the Stage-8a path-based handleProxy: header routing is exactly the contract
-// client-proxy will speak, so Stage 9 just slots in front of it. See docs/STAGE8_DESIGN.md.
+// handleData is the orchestrator's per-node data proxy: it bridges an HTTP request to the
+// in-VM daemon over the VM's NIC (TCP). client-proxy identifies the sandbox + target port by
+// parsing the <port>-<id> hostname and hands them over as X-Sandbox-Id + X-Sandbox-Port (Stage
+// 12b); the request path is the daemon's ConnectRPC method. Through Stage 11 this bridged over
+// vsock and picked the code-interpreter by a /codeinterpreter. path prefix; Stage 12b moved the
+// data path onto TCP and let the port in the hostname select the service. See docs/STAGE12_DESIGN.md.
 func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 	id := r.Header.Get("X-Sandbox-Id")
 	if id == "" {
@@ -26,17 +25,20 @@ func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such sandbox: " + id})
 		return
 	}
-	// Two in-VM services on two vsock ports (Stage 11b): a ConnectRPC request to the
-	// code-interpreter (/codeinterpreter.*) goes to its port; everything else (envd:
-	// Filesystem / Process / health + the legacy HTTP endpoints) goes to envd's port.
-	port := fc.VsockPort
-	if strings.HasPrefix(r.URL.Path, "/codeinterpreter.") {
-		port = fc.CodeInterpreterVsockPort
+	// Stage 12b-2b: the data path is TCP over the VM's NIC now. client-proxy parsed the
+	// <port>-<id> hostname and handed us the port in X-Sandbox-Port; the port -- not a path
+	// prefix -- selects the in-VM service (49983 envd, 49999 code-interpreter, or any user port
+	// in 12c). Dial the slot's routable address at that port; TCPProxy preserves the request path.
+	port, err := strconv.Atoi(r.Header.Get("X-Sandbox-Port"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing or invalid X-Sandbox-Port header"})
+		return
 	}
-	// The daemon endpoint is the request path; VsockProxy re-adds the leading slash, so
-	// hand it the path without it.
-	rest := strings.TrimPrefix(r.URL.Path, "/")
-	proxy.VsockProxy(vm.UDSPath, port, rest).ServeHTTP(w, r)
+	if vm.Slot == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "sandbox has no network slot: " + id})
+		return
+	}
+	proxy.TCPProxy(vm.Slot.Addr(port)).ServeHTTP(w, r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

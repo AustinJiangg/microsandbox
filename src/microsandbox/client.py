@@ -43,6 +43,12 @@ from .protocol import EventType, Execution, OutputEvent
 _DEFAULT_CONTROL_PLANE_URL = "http://127.0.0.1:8080"  # the api (lifecycle): POST/DELETE/GET /sandboxes
 _DEFAULT_DATA_PLANE_URL = "http://127.0.0.1:8081"  # client-proxy (data): /execute, /files/*, /commands
 
+# The in-VM daemon's two TCP ports (Stage 12b), reached via the VM's NIC. The SDK names the
+# target port in the Host header (<port>-<id>); client-proxy parses that and the orchestrator
+# dials the slot at this port. MUST match services/pkg/fc (EnvdTCPPort / CodeInterpreterTCPPort).
+_ENVD_TCP_PORT = 49983
+_CODE_INTERPRETER_TCP_PORT = 49999
+
 
 class Sandbox:
     """A client handle for a sandbox session, backed by a Firecracker microVM.
@@ -141,15 +147,27 @@ class Sandbox:
 
     # ----- HTTP to the control plane -----
 
-    def _data_headers(self) -> dict:
-        """Headers that route a data request to this sandbox via client-proxy.
+    def _host_header(self, port: int) -> dict:
+        """The Host header that routes a data request to one of this sandbox's in-VM TCP ports.
 
-        client-proxy routes by the X-Sandbox-Id header (the daemon endpoint is just the
-        request path), so a data call carries the id here rather than in the URL.
+        Stage 12b: client-proxy routes by the <port>-<id> hostname (the port selects the in-VM
+        service -- envd, code-interpreter, or a user port), so a data call carries its route in
+        the Host header. The SDK still connects to client-proxy's address (data_url) and only
+        overrides the Host header, so no DNS is needed on a single machine.
         """
         if self._sandbox_id is None:
             raise RuntimeError("sandbox is closed")
-        return {"X-Sandbox-Id": self._sandbox_id}
+        return {"Host": f"{port}-{self._sandbox_id}"}
+
+    def get_host(self, port: int) -> str:
+        """Return the <port>-<id> hostname that reaches the given guest port through client-proxy.
+
+        A server the sandbox code starts on, say, :8000 is reachable at get_host(8000): point an
+        HTTP client at data_url and send this as the Host header (Stage 12c exercises user ports).
+        """
+        if self._sandbox_id is None:
+            raise RuntimeError("sandbox is closed")
+        return f"{port}-{self._sandbox_id}"
 
     def _control_plane(
         self,
@@ -222,23 +240,25 @@ class Sandbox:
     def _stream(self, code: str, language: str) -> Iterator[OutputEvent]:
         """Run code via the code-interpreter's server-streaming Execute (ConnectRPC).
 
-        client-proxy routes /codeinterpreter.* to the code-interpreter's vsock port; the
-        Connect stream's frames flush through live, so this yields each OutputEvent as the
+        client-proxy routes the <port>-<id> Host (port 49999) to the code-interpreter over TCP;
+        the Connect stream's frames flush through live, so this yields each OutputEvent as the
         cell runs -- the Connect-protocol successor to the daemon's old /execute SSE.
         """
         url = self._data_url + "/codeinterpreter.CodeInterpreterService/Execute"
         # protojson uses camelCase JSON names: timeoutSeconds maps to the proto's timeout_seconds.
         message = {"code": code, "language": language, "timeoutSeconds": self.timeout_seconds}
-        for msg in server_stream(url, message, headers=self._data_headers()):
+        for msg in server_stream(url, message, headers=self._host_header(_CODE_INTERPRETER_TCP_PORT)):
             yield _output_event(msg)
 
     def _envd(self, method: str, message: dict) -> dict:
         """Call an envd unary RPC (ConnectRPC) for this sandbox -- `method` is e.g.
         "FilesystemService/Read" or "ProcessService/Run". client-proxy routes by the
-        X-Sandbox-Id header to this sandbox's envd; the reply message is returned as a dict.
+        <port>-<id> Host (port 49983) to this sandbox's envd over TCP; the reply is a dict.
         """
         return unary(
-            self._data_url + "/envd." + method, message, headers=self._data_headers()
+            self._data_url + "/envd." + method,
+            message,
+            headers=self._host_header(_ENVD_TCP_PORT),
         )
 
 

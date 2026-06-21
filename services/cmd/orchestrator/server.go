@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -142,19 +141,6 @@ func (s *server) create(fromSnapshot bool, tmpl template.Template) (*fc.MicroVM,
 	s.mu.Lock()
 	s.sandboxes[vm.ID] = vm
 	s.mu.Unlock()
-	// Stage 12b: every VM (cold-started or restored) now has a network slot -- observe
-	// (non-fatally) that it is reachable over its NIC via TCP, the path the data plane is moving
-	// to. Logged only; the vsock path stays authoritative this sub-step, so a probe failure here
-	// does not fail create.
-	if vm.Slot != nil {
-		go func(id, addr string) {
-			if proxy.TCPHealthy(addr) {
-				log.Printf("sandbox %s: TCP health OK at %s (NIC path live)", id, addr)
-			} else {
-				log.Printf("sandbox %s: TCP health probe failed at %s (vsock authoritative)", id, addr)
-			}
-		}(vm.ID, vm.Slot.Addr(fc.EnvdTCPPort))
-	}
 	return vm, nil
 }
 
@@ -202,7 +188,14 @@ func healthyOrDestroy(vm *fc.MicroVM, err error) (*fc.MicroVM, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := proxy.WaitHealthy(vm.UDSPath, fc.VsockPort, 10*time.Second); err != nil {
+	// Stage 12b-2b: the data path is TCP now, so wait for the daemon's /health over the VM's NIC
+	// (the slot's routable addr), not vsock -- and poll rather than probe once, since 12a saw the
+	// TCP listener bind a beat after the VM is otherwise up, which a single shot would race.
+	if vm.Slot == nil {
+		vm.Destroy()
+		return nil, fmt.Errorf("sandbox has no network slot (cannot health-check over TCP)")
+	}
+	if err := proxy.TCPWaitHealthy(vm.Slot.Addr(fc.EnvdTCPPort), 10*time.Second); err != nil {
 		tail := vm.ConsoleTail()
 		vm.Destroy()
 		return nil, fmt.Errorf("sandbox %v; %s", err, tail)

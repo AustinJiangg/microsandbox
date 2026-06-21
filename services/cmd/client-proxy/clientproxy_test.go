@@ -1,8 +1,8 @@
 package main
 
 // Unit tests for the edge data proxy, KVM-free: a local httptest server impersonates the
-// orchestrator data proxy (which would otherwise bridge to a VM over vsock), so we cover
-// header routing, the 400/404 error paths, SSE streaming, and the internal route
+// orchestrator data proxy (which would otherwise bridge to a VM over TCP), so we cover
+// <port>-<id> hostname routing, the 400/404 error paths, streaming, and the internal route
 // register/deregister endpoints without booting a microVM.
 
 import (
@@ -21,17 +21,20 @@ func newTestProxy() *clientProxy {
 	return &clientProxy{catalog: catalog.NewInMemory(), proxy: newDataProxy()}
 }
 
-func TestHandleDataMissingHeader(t *testing.T) {
+func TestHandleDataMalformedHost(t *testing.T) {
+	// A Host that isn't <port>-<sandboxId> is a 400 (here: no dash, so no port/id to split out).
+	req := httptest.NewRequest("POST", "/execute", nil)
+	req.Host = "nodash"
 	rec := httptest.NewRecorder()
-	newTestProxy().handleData(rec, httptest.NewRequest("POST", "/execute", nil))
+	newTestProxy().handleData(rec, req)
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("missing X-Sandbox-Id: status = %d, want 400", rec.Code)
+		t.Fatalf("malformed host: status = %d, want 400", rec.Code)
 	}
 }
 
 func TestHandleDataUnknownSandbox(t *testing.T) {
 	req := httptest.NewRequest("POST", "/execute", nil)
-	req.Header.Set("X-Sandbox-Id", "sb_unknown")
+	req.Host = "49983-sb_unknown" // well-formed route, but the catalog has no such sandbox
 	rec := httptest.NewRecorder()
 	newTestProxy().handleData(rec, req)
 	if rec.Code != http.StatusNotFound {
@@ -39,14 +42,15 @@ func TestHandleDataUnknownSandbox(t *testing.T) {
 	}
 }
 
-// The happy path: a registered sandbox is reverse-proxied to its node with the path and
-// X-Sandbox-Id header preserved, and the request body / response body pass through.
+// The happy path: a <port>-<id> Host is reverse-proxied to the sandbox's node with the path
+// preserved and the id + port handed over as X-Sandbox-Id / X-Sandbox-Port, body passing through.
 func TestHandleDataRoutesToNode(t *testing.T) {
-	var gotPath, gotID string
+	var gotPath, gotID, gotPort string
 	var gotBody []byte
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotID = r.Header.Get("X-Sandbox-Id")
+		gotPort = r.Header.Get("X-Sandbox-Port")
 		gotBody, _ = io.ReadAll(r.Body)
 		io.WriteString(w, `{"ok":true}`)
 	}))
@@ -59,7 +63,7 @@ func TestHandleDataRoutesToNode(t *testing.T) {
 	defer front.Close()
 
 	req, _ := http.NewRequest("POST", front.URL+"/execute", strings.NewReader(`{"code":"x=1"}`))
-	req.Header.Set("X-Sandbox-Id", "sb_1")
+	req.Host = "49983-sb_1" // <port>-<id>: the envd port for sandbox sb_1
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request: %v", err)
@@ -72,6 +76,9 @@ func TestHandleDataRoutesToNode(t *testing.T) {
 	}
 	if gotID != "sb_1" {
 		t.Errorf("forwarded X-Sandbox-Id = %q, want sb_1", gotID)
+	}
+	if gotPort != "49983" {
+		t.Errorf("forwarded X-Sandbox-Port = %q, want 49983", gotPort)
 	}
 	if string(gotBody) != `{"code":"x=1"}` {
 		t.Errorf("forwarded body = %q", gotBody)
@@ -98,7 +105,7 @@ func TestHandleDataStreamsSSE(t *testing.T) {
 	defer front.Close()
 
 	req, _ := http.NewRequest("POST", front.URL+"/execute", nil)
-	req.Header.Set("X-Sandbox-Id", "sb_1")
+	req.Host = "49999-sb_1" // the code-interpreter port; any well-formed route streams the same
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request: %v", err)
