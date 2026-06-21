@@ -1,7 +1,7 @@
 """A tiny hand-rolled ConnectRPC client (Stage 11), JSON codec, over urllib.
 
 The ConnectRPC protocol (connectrpc.com) runs over plain HTTP/1.1 -- which is why it can
-ride the existing vsock bridge unchanged:
+ride the host->VM bridge unchanged (vsock at Stage 11, the VM's NIC/TCP since Stage 12):
 
   - unary: a normal POST of a JSON body, JSON response.
   - server-streaming: the request is one "enveloped" frame and the response is a stream of

@@ -1,118 +1,69 @@
 package proxy
 
-// Unit tests for the vsock bridge (the Go port of the old Python test_transport.py).
-// A local AF_UNIX server impersonates Firecracker's vsock UDS, feeding fixed bytes
-// and asserting the bridge's behaviour -- so this error-prone byte handling
-// (CONNECT handshake + HTTP/1.1 + SSE) is covered without booting a microVM. These
-// run anywhere Go is installed (no firecracker / KVM needed).
+// Unit tests for the host-side data proxy over TCP (Stage 12 replaced the vsock bridge). A local
+// httptest backend impersonates the in-VM daemon on its NIC, so TCPProxy's request/response
+// forwarding + live streaming and the /health probes are covered without booting a microVM.
+// These run anywhere Go is installed (no firecracker / KVM needed).
 
 import (
-	"bufio"
-	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-// fakeVsock starts an AF_UNIX server that runs handle(conn) for each connection,
-// simulating Firecracker's vsock UDS. Returns the socket path.
-func fakeVsock(t *testing.T, handle func(conn net.Conn)) string {
-	t.Helper()
-	uds := filepath.Join(t.TempDir(), "fc.vsock")
-	ln, err := net.Listen("unix", uds)
+// TCPProxy forwards the request (method, path, body) to the daemon and returns its response.
+func TestTCPProxyForwardsRequestAndResponse(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		io.WriteString(w, `{"content":"hi"}`)
+	}))
+	defer backend.Close()
+	addr := strings.TrimPrefix(backend.URL, "http://")
+
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		TCPProxy(addr).ServeHTTP(w, r)
+	}))
+	defer front.Close()
+
+	resp, err := http.Post(front.URL+"/files/read", "application/json", strings.NewReader(`{"path":"/tmp/x"}`))
 	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer conn.Close()
-				handle(conn)
-			}()
-		}
-	}()
-	return uds
-}
-
-type captured struct {
-	requestLine string
-	body        []byte
-}
-
-func TestVsockRoundTripDeliversRequestAndReadsJSON(t *testing.T) {
-	got := make(chan captured, 1)
-	uds := fakeVsock(t, func(conn net.Conn) {
-		br := bufio.NewReader(conn)
-		if line, _ := br.ReadString('\n'); line != "CONNECT 1024\n" {
-			t.Errorf("connect line = %q, want CONNECT 1024", line)
-		}
-		io.WriteString(conn, "OK 1024\n")
-		req, err := http.ReadRequest(br)
-		if err != nil {
-			t.Errorf("read request: %v", err)
-			return
-		}
-		body, _ := io.ReadAll(req.Body)
-		got <- captured{requestLine: req.Method + " " + req.URL.Path, body: body}
-		payload := `{"content":"hi"}`
-		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"+
-			"Content-Length: %d\r\nConnection: close\r\n\r\n%s", len(payload), payload)
-	})
-
-	rt := &vsockRoundTripper{udsPath: uds, vsockPort: 1024}
-	req, _ := http.NewRequest("POST", "http://sandbox/files/read", strings.NewReader(`{"path":"/tmp/x"}`))
-	resp, err := rt.RoundTrip(req)
-	if err != nil {
-		t.Fatalf("RoundTrip: %v", err)
+		t.Fatalf("post: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
 	body, _ := io.ReadAll(resp.Body)
+
+	if gotMethod != "POST" || gotPath != "/files/read" {
+		t.Errorf("forwarded %s %s, want POST /files/read", gotMethod, gotPath)
+	}
+	if string(gotBody) != `{"path":"/tmp/x"}` {
+		t.Errorf("forwarded body = %q", gotBody)
+	}
 	if string(body) != `{"content":"hi"}` {
-		t.Fatalf("response body = %q", body)
-	}
-	c := <-got
-	if c.requestLine != "POST /files/read" {
-		t.Errorf("forwarded request line = %q, want POST /files/read", c.requestLine)
-	}
-	if string(c.body) != `{"path":"/tmp/x"}` {
-		t.Errorf("forwarded body = %q", c.body)
+		t.Errorf("response body = %q", body)
 	}
 }
 
-func TestVsockProxyStreamsSSE(t *testing.T) {
-	uds := fakeVsock(t, func(conn net.Conn) {
-		br := bufio.NewReader(conn)
-		br.ReadString('\n') // consume CONNECT
-		io.WriteString(conn, "OK 1024\n")
-		req, _ := http.ReadRequest(br)
-		if req != nil {
-			// Drain the POST body before responding: closing the socket with unread
-			// inbound data sends an RST, which races the client's read of the SSE
-			// stream (-> "connection reset"/truncated response). Mirrors the body read
-			// the non-streaming round-trip test already does.
-			io.Copy(io.Discard, req.Body)
-		}
-		io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
-		io.WriteString(conn, "data: {\"type\":\"stdout\",\"data\":\"hello\\n\"}\n\n")
-		io.WriteString(conn, "data: {\"type\":\"end\",\"exit_code\":0}\n\n")
-		// returning closes conn -> the client reads EOF and ends the stream
-	})
+// Streaming: the backend flushes two events; the client sees both (proves FlushInterval -1 carries
+// the code-interpreter's Execute stream through the proxy live).
+func TestTCPProxyStreamsSSE(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"type\":\"stdout\",\"data\":\"hello\\n\"}\n\n")
+		w.(http.Flusher).Flush()
+		io.WriteString(w, "data: {\"type\":\"end\",\"exit_code\":0}\n\n")
+	}))
+	defer backend.Close()
+	addr := strings.TrimPrefix(backend.URL, "http://")
 
-	// Exercise the full proxy ServeHTTP path through a front HTTP server.
 	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		VsockProxy(uds, 1024, "execute").ServeHTTP(w, r)
+		TCPProxy(addr).ServeHTTP(w, r)
 	}))
 	defer front.Close()
 
@@ -123,37 +74,40 @@ func TestVsockProxyStreamsSSE(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), `"type":"stdout"`) || !strings.Contains(string(body), `"type":"end"`) {
-		t.Fatalf("proxied SSE missing events: %q", body)
+		t.Fatalf("proxied stream missing events: %q", body)
 	}
 }
 
-func TestVsockRoundTripConnectRejected(t *testing.T) {
-	uds := fakeVsock(t, func(conn net.Conn) {
-		bufio.NewReader(conn).ReadString('\n') // consume CONNECT
-		io.WriteString(conn, "FAILED\n")       // simulate nothing listening on the guest port
-	})
-	rt := &vsockRoundTripper{udsPath: uds, vsockPort: 1024}
-	req, _ := http.NewRequest("GET", "http://sandbox/health", nil)
-	if _, err := rt.RoundTrip(req); err == nil {
-		t.Fatal("expected an error when CONNECT is rejected")
+func TestTCPHealthy(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	if !TCPHealthy(strings.TrimPrefix(backend.URL, "http://")) {
+		t.Fatal("TCPHealthy = false, want true")
 	}
 }
 
-func TestVsockHealthy(t *testing.T) {
-	uds := fakeVsock(t, func(conn net.Conn) {
-		br := bufio.NewReader(conn)
-		br.ReadString('\n') // consume CONNECT
-		io.WriteString(conn, "OK 1024\n")
-		http.ReadRequest(br) // consume GET /health
-		io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-	})
-	if !VsockHealthy(uds, 1024) {
-		t.Fatal("VsockHealthy = false, want true")
+func TestTCPHealthyFalseWhenNothingListening(t *testing.T) {
+	// Nothing listens on 127.0.0.1:1, so the probe fails fast (connection refused).
+	if TCPHealthy("127.0.0.1:1") {
+		t.Fatal("TCPHealthy = true for a dead address, want false")
 	}
 }
 
-func TestVsockHealthyFalseWhenNoSocket(t *testing.T) {
-	if VsockHealthy(filepath.Join(t.TempDir(), "absent.sock"), 1024) {
-		t.Fatal("VsockHealthy = true for a missing socket, want false")
+func TestTCPWaitHealthy(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	if err := TCPWaitHealthy(strings.TrimPrefix(backend.URL, "http://"), 2*time.Second); err != nil {
+		t.Fatalf("TCPWaitHealthy = %v, want nil (backend is up)", err)
+	}
+	if err := TCPWaitHealthy("127.0.0.1:1", 300*time.Millisecond); err == nil {
+		t.Fatal("TCPWaitHealthy = nil for a dead address, want a timeout error")
 	}
 }

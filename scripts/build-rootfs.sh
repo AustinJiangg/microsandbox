@@ -5,7 +5,7 @@
 #   1. docker export reuses the entire filesystem of the microsandbox-agent image built in Stage 2
 #      (which already contains Python + ipykernel + jupyter_client);
 #   2. build the Go daemon (Stage 7, E2B's envd) as a static binary and inject it (the Python daemon is retired);
-#   3. write a minimal /init as PID 1: after mounting the pseudo-filesystems, exec our daemon (listening on vsock);
+#   3. write a minimal /init as PID 1: after mounting the pseudo-filesystems, exec our daemon (listening on TCP over eth0: envd :49983 + code-interpreter :49999, Stage 12 retired vsock);
 #   4. use `mkfs.ext4 -d <dir>` to pack the directory straight into an ext4 image -- no mount needed, hence without root.
 #
 # Why being without root matters: the current user on this host can run docker / mkfs.ext4, but sudo prompts for a password. `mkfs.ext4 -d`
@@ -68,7 +68,7 @@ mount -t tmpfs    tmp  /tmp  2>/dev/null    # the only writable area (the root i
 # need a real PATH; HOME=/tmp is the only writable home (the root is read-only).
 export PATH=/usr/local/bin:/usr/bin:/bin
 export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-echo "[init] microsandbox daemon (Go): vsock port 1024, kernel via jupyter gateway"
+echo "[init] microsandbox daemon (Go): TCP envd :49983 + code-interpreter :49999, kernel via jupyter gateway"
 exec /usr/local/bin/microsandbox-daemon
 INIT
 chmod +x "$STAGING/init"

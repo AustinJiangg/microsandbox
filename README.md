@@ -5,9 +5,13 @@ A **from-scratch, learning-oriented code sandbox** modeled on
 understand *how an AI code sandbox is actually built*.
 
 Every `Sandbox` is a **Firecracker microVM**: its own guest Linux kernel behind
-the KVM hardware-virtualization boundary (the strongest isolation), with the
-control channel carried over **vsock** and a stateful Jupyter kernel running
-inside the VM (variables persist across `run_code`, like E2B).
+the KVM hardware-virtualization boundary (the strongest isolation), with the data
+path carried over a **per-sandbox TAP/netns NIC** (TCP; Stage 12 retired the
+original vsock channel) and a stateful Jupyter kernel running inside the VM
+(variables persist across `run_code`, like E2B). The sandbox is **inbound-reachable
+but outbound-denied by default** (DNAT, no MASQUERADE) — so you can expose its ports,
+yet it can't phone home. It is a learning implementation, **not security-audited**,
+never safe to expose to untrusted input.
 
 > **History.** This project was built up in stages — host subprocess → Docker
 > container → resident in-container agent → microVM — as a way to understand each
@@ -25,7 +29,7 @@ pip install -e ".[dev]"
 # 1) Let your user open /dev/kvm without sudo, then restart WSL to apply the group.
 sudo usermod -aG kvm "$USER"        # then: wsl --shutdown (from Windows), reopen the terminal
 
-# 2) Put the firecracker binary + a vsock-capable guest kernel under vendor/
+# 2) Put the firecracker binary + a guest kernel with virtio-net under vendor/
 #    (vendor/firecracker, vendor/vmlinux — see the design doc for sources).
 
 # 3) Build the VM rootfs (docker is only a one-time build tool here) and a warm snapshot.
@@ -48,7 +52,7 @@ Usage feels like E2B:
 from microsandbox import Sandbox
 
 # (Start the services first: scripts/dev-up.sh -- orchestrator (VM lifecycle) + client-proxy (data path) + api (REST front).)
-# Cold start a microVM (~0.94s: firecracker + guest kernel boot + daemon on vsock).
+# Cold start a microVM (~0.94s: firecracker + guest kernel boot + daemon on TCP over its NIC).
 with Sandbox() as sandbox:
     ex = sandbox.run_code("print('hello from the microVM')")
     print(ex.stdout)        # hello from the microVM
@@ -97,7 +101,7 @@ microsandbox/
 ├── Dockerfile                 # the agent image (Jupyter kernel runtime) the rootfs is exported from
 ├── docs/
 │   ├── ARCHITECTURE.md        # the three-layer design (client / protocol / daemon+backend)
-│   ├── MICROVM_DESIGN.md      # the microVM design (Firecracker, vsock, snapshots)
+│   ├── MICROVM_DESIGN.md      # the microVM design (Firecracker, networking, snapshots)
 │   ├── STAGE4_DESIGN.md       # Stage 4: extracting the Go control plane
 │   ├── STAGE5_DESIGN.md       # Stage 5: the warm pool
 │   ├── STAGE6_DESIGN.md       # Stage 6: named templates (custom images)
@@ -106,6 +110,7 @@ microsandbox/
 │   ├── STAGE9_DESIGN.md       # Stage 9: client-proxy + routing catalog (data path off the api)
 │   ├── STAGE10_DESIGN.md      # Stage 10: TemplateService (async template builds) + pkg/storage
 │   ├── STAGE11_DESIGN.md      # Stage 11: envd -> ConnectRPC (Process/Filesystem) + a separate code-interpreter
+│   ├── STAGE12_DESIGN.md      # Stage 12: per-sandbox TAP/netns networking; data path vsock -> TCP; user ports; vsock retired
 │   └── E2B_ALIGNMENT_ROADMAP.md  # the post-Stage-7 roadmap toward E2B's component architecture
 ├── src/microsandbox/
 │   ├── connect.py             # hand-rolled ConnectRPC client (Stage 11): unary + server-streaming over urllib
@@ -113,12 +118,12 @@ microsandbox/
 │   ├── client.py              # SDK: Sandbox / run_code -- pure-HTTP lifecycle, ConnectRPC data path
 │   ├── server.py              # the retired Python in-VM daemon (Stage 7 replaced it; kept as reference)
 │   └── backend.py             # the retired Python kernel backend (reference)
-├── daemon/                    # the Go in-VM daemon (E2B's envd): ConnectRPC envd + code-interpreter on two vsock ports (Stage 11); proto/ + genpb/
-├── services/                  # the Go host control plane (Stages 8-10, E2B's "infra"), module microsandbox/services
+├── daemon/                    # the Go in-VM daemon (E2B's envd): ConnectRPC envd + code-interpreter on two TCP ports (:49983/:49999, Stage 12); proto/ + genpb/
+├── services/                  # the Go host control plane (Stages 8-12, E2B's "infra"), module microsandbox/services
 │   ├── cmd/api/               #   lifecycle-only REST front + SQLite store + the /templates build API; calls the orchestrator over gRPC
-│   ├── cmd/client-proxy/      #   edge data proxy (Stage 9): routes the data path by X-Sandbox-Id via the catalog
-│   ├── cmd/orchestrator/      #   microVM fleet + warm pool (SandboxService) + vsock data proxy + the template builder (TemplateService)
-│   ├── pkg/                   #   fc / pool / proxy / template / store / catalog / storage / build, + grpc/ (generated stubs)
+│   ├── cmd/client-proxy/      #   edge data proxy (Stage 9): routes the data path by the <port>-<id> Host header via the catalog
+│   ├── cmd/orchestrator/      #   microVM fleet + warm pool (SandboxService) + per-sandbox network slot + TCP data proxy + the template builder (TemplateService)
+│   ├── pkg/                   #   fc / pool / network / proxy / template / store / catalog / storage / build, + grpc/ (generated stubs)
 │   └── proto/                 #   the gRPC contracts (orchestrator.proto, template-manager.proto)
 ├── scripts/
 │   ├── build-rootfs.sh        # export an ext4 rootfs from the agent image (no root needed)
@@ -129,7 +134,7 @@ microsandbox/
 │   └── dev-up.sh              # build + run orchestrator + client-proxy + api locally (SDK base_url = http://127.0.0.1:8080)
 ├── templates/                 # template recipes (Stage 6): templates/<name>/Dockerfile (built artifacts -> vendor/templates/)
 ├── examples/quickstart.py
-└── tests/                     # end-to-end / stateful / snapshot / metadata tests on real VMs (host-side unit tests are in services/)
+└── tests/                     # end-to-end / stateful / snapshot / metadata / ports tests on real VMs (host-side unit tests are in services/)
 ```
 
 ## How it works (one paragraph)
@@ -139,27 +144,34 @@ HTTP; the api calls the **orchestrator** (`services/cmd/orchestrator`) over **gR
 which writes a declarative Firecracker config and starts the `firecracker` process — a
 microVM with its own guest kernel and an ext4 rootfs — and records the sandbox in the
 api's SQLite metadata store, and registers the sandbox's data route in **client-proxy**'s
-catalog. Inside the VM, PID 1 (`/init`) execs the **Go daemon** (`daemon/`, E2B's `envd`),
-which listens on **vsock** as two ConnectRPC services — `envd` (Filesystem + Process) and a
-separate `code-interpreter` (the kernel) — on two vsock ports. The SDK sends the data path to
-**client-proxy** (the data URL the api returned) with an `X-Sandbox-Id` header, speaking
+catalog. The orchestrator also gives the VM a **per-sandbox network slot** (`pkg/network`): a
+virtio-net NIC backed by a host TAP in its own netns, reachable at a routable host address via
+DNAT (inbound only — no MASQUERADE, so the sandbox can't phone home). Inside the VM, PID 1
+(`/init`) execs the **Go daemon** (`daemon/`, E2B's `envd`), which listens over the VM's NIC as
+two ConnectRPC services on **two TCP ports** — `envd` (Filesystem + Process) on `:49983` and a
+separate `code-interpreter` (the kernel) on `:49999`. The SDK sends the data path to
+**client-proxy** (the data URL the api returned) with a `<port>-<id>` `Host` header, speaking
 **ConnectRPC**: `run_code` is the code-interpreter's server-streaming `Execute`; files/commands
-are envd's unary RPCs. client-proxy looks the sandbox up in its routing **catalog** and
-reverse-proxies to the orchestrator's data proxy, which routes by the ConnectRPC path to the
-right vsock port and bridges into the VM (a `CONNECT <port>` handshake, then the Connect
-protocol over HTTP/1.1), streaming the response straight back; the code-interpreter drives a
-long-lived **Python Jupyter kernel** via a Jupyter Kernel Gateway. Through Stage 10 the
+are envd's unary RPCs. client-proxy parses the `Host` header, looks the sandbox up in its routing
+**catalog**, and reverse-proxies to the orchestrator's data proxy, which dials `<slot-ip>:<port>`
+over TCP (the port in the hostname picks the service, or any user port — `sandbox.get_host(port)`),
+streaming the response straight back; the code-interpreter drives a long-lived **Python Jupyter
+kernel** via a Jupyter Kernel Gateway. Through Stage 10 the
 client↔daemon wire (`protocol.py`) was byte-stable as the isolation evolved (subprocess →
 microVM → control-plane split → Go daemon → api/orchestrator gRPC → client-proxy/catalog);
 **Stage 11 deliberately moved it to ConnectRPC**, so the e2e suite is now a *behavioral* parity
-oracle. See `docs/ARCHITECTURE.md`, `docs/E2B_ALIGNMENT_ROADMAP.md` and the stage design docs
-(`docs/STAGE4`–`STAGE11_DESIGN.md`).
+oracle, and **Stage 12 flipped the transport from vsock to TCP over each sandbox's NIC** (real
+`<port>-<id>` hostnames + user-port exposure). See `docs/ARCHITECTURE.md`,
+`docs/E2B_ALIGNMENT_ROADMAP.md` and the stage design docs (`docs/STAGE4`–`STAGE12_DESIGN.md`).
 
 ## ⚠️ Safety note
 
 The microVM gives each sandbox **its own guest kernel behind a KVM boundary** —
 the first isolation in the project strong enough to *seriously discuss* untrusted
-code — but this is a **learning implementation, not security-audited**. Real
+code — but this is a **learning implementation, not security-audited**. Since Stage 12
+each sandbox also has a **NIC**: it is **inbound-reachable** (ports can be exposed) and
+**outbound-denied by default** (DNAT, no MASQUERADE). This *narrows* the isolation the
+earlier "fully offline" design had, so the warning matters more, not less. Real
 defense-in-depth (jailer, seccomp-bpf, network policy, rate limiting, escape
 monitoring) is out of scope. **This project is for local learning only**; do not
 expose it as a service or feed it arbitrary external input.

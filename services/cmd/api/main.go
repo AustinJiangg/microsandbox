@@ -4,8 +4,8 @@
 // durable record of which sandboxes exist is kept in a metadata store (SQLite, Stage 8c
 // -- E2B uses Postgres), and on create the api registers the sandbox's data route in
 // client-proxy's catalog (returning the data_url the SDK posts the data path to). The
-// data plane goes SDK -> client-proxy -> orchestrator -> vsock -> envd, never through
-// here. See docs/STAGE9_DESIGN.md.
+// data plane goes SDK -> client-proxy -> orchestrator -> the VM's NIC (TCP) -> envd,
+// never through here. See docs/STAGE9_DESIGN.md.
 package main
 
 import (

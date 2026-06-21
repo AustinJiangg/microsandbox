@@ -1,7 +1,7 @@
-"""Stage 3b tests: the Firecracker microVM backend (end-to-end over vsock).
+"""Stage 3b tests: the Firecracker microVM backend (end-to-end over the VM's NIC).
 
-Runs inside a real microVM: a separate guest kernel + KVM boundary, control
-channel over vsock, with not a single line changed in the daemon or protocol.
+Runs inside a real microVM: a separate guest kernel + KVM boundary, data
+channel over the VM's NIC (TCP -- Stage 12 retired the original vsock path).
 Requires firecracker + vmlinux + rootfs.ext4 under vendor/ (see docs/MICROVM_DESIGN.md
 §7) and an accessible /dev/kvm; if any is missing the whole group is skipped,
 staying green as usual on other machines / CI.
@@ -17,7 +17,7 @@ from microsandbox import Sandbox
 
 
 def test_runs_in_microvm(sandbox: Sandbox) -> None:
-    """Minimal end-to-end: run_code inside a real VM and pull the result back over vsock."""
+    """Minimal end-to-end: run_code inside a real VM and pull the result back over the VM's NIC (TCP)."""
     ex = sandbox.run_code("print(1 + 1)")
     assert ex.success
     assert ex.stdout.strip() == "2"

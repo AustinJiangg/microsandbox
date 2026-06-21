@@ -12,8 +12,8 @@ Every Sandbox is a **Firecracker microVM** managed by the Go host services (Stag
 an `api` REST front for lifecycle, a per-machine `orchestrator` over gRPC, and a
 `client-proxy` edge that owns the routing catalog). The SDK is a thin **pure-HTTP**
 client: it asks the api for a sandbox (POST /sandboxes) and runs code by POSTing to
-client-proxy (POST /execute with an X-Sandbox-Id header, ...); the services bridge to
-the in-VM daemon over vsock. Start them first (scripts/dev-up.sh); they need the vendor/
+client-proxy with a `<port>-<id>` Host header; the services bridge to the in-VM daemon
+over the VM's NIC (TCP -- Stage 12 retired vsock). Start them first (scripts/dev-up.sh); they need the vendor/
 artifacts -- see docs/MICROVM_DESIGN.md §7, docs/STAGE9_DESIGN.md and docs/STAGE8_DESIGN.md.
 
 History: this project grew stage by stage (host subprocess -> Docker container ->
@@ -37,7 +37,7 @@ from .connect import server_stream, unary
 from .protocol import EventType, Execution, OutputEvent
 
 # Where to reach the services; overridable per-Sandbox (base_url= / data_url=) or via env.
-# The SDK speaks only plain HTTP -- the vsock handshake + bridge live in the services
+# The SDK speaks only plain HTTP -- the host->VM TCP bridge lives in the services
 # (services/pkg/proxy), not here. Stage 9 split the two faces: lifecycle goes to the api
 # (base_url), the data path to client-proxy (data_url, learned from the create response).
 _DEFAULT_CONTROL_PLANE_URL = "http://127.0.0.1:8080"  # the api (lifecycle): POST/DELETE/GET /sandboxes
@@ -59,7 +59,8 @@ class Sandbox:
             snapshot in milliseconds (skipping kernel boot + Jupyter kernel cold start,
             ~30ms to ready vs ~0.94s cold start). Run scripts/build-snapshot.sh first.
             Several sandboxes can be restored from the one snapshot concurrently -- the
-            control plane gives each VM its own vsock socket (Stage 5a).
+            control plane gives each VM its own network slot (netns/TAP, Stage 12;
+            this superseded Stage 5a's per-VM vsock socket).
         template: name of a custom image to boot, built with scripts/build-template.sh
             (see docs/STAGE6_DESIGN.md). Defaults to the stock image. The name must be a
             template built under vendor/templates/<name>/; an unknown name is rejected.
@@ -72,8 +73,8 @@ class Sandbox:
     The SDK is a thin pure-HTTP client. On construction it asks the api to spawn or
     restore a microVM (POST /sandboxes), which returns only once the VM is healthy
     ("ready on delivery") along with the data_url to reach it. run_code / files /
-    commands then POST to client-proxy (data_url) with an X-Sandbox-Id header, which
-    routes to the in-VM daemon over vsock. close() (or leaving the `with` block) destroys
+    commands then POST to client-proxy (data_url) with a `<port>-<id>` Host header, which
+    routes to the in-VM daemon over the VM's NIC (TCP). close() (or leaving the `with` block) destroys
     it (DELETE /sandboxes/{id} on the api).
     """
 
@@ -113,7 +114,7 @@ class Sandbox:
         """Ask the control plane to spawn (or restore) a microVM (POST /sandboxes).
 
         The control plane returns only once the VM is healthy, so there is nothing to
-        wait for here. It owns the vsock bridge; the SDK never speaks vsock itself.
+        wait for here. It owns the host->VM TCP bridge; the SDK only speaks plain HTTP.
         """
         body: dict = {"from_snapshot": self._from_snapshot}
         # Only send `template` when set, so the default case stays byte-identical to

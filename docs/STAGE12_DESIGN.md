@@ -1,14 +1,17 @@
 # Stage 12 design: TAP/netns networking (give every sandbox a real network identity)
 
-> Status: **agreed direction.** The second of the roadmap's *deferred* stages, and the one
-> that **reverses Decision D1** (vsock-first). Every sandbox stops being "fully offline,
-> reachable only over vsock" and gains a real virtio-net NIC, a private IP inside its own
+> Status: **done (12a + 12b + 12c).** The second of the roadmap's *deferred* stages, and the
+> one that **reversed Decision D1** (vsock-first). Every sandbox stopped being "fully offline,
+> reachable only over vsock" and gained a real virtio-net NIC, a private IP inside its own
 > network namespace, and an in-VM daemon that listens on **TCP** — reached by real
-> `<port>-<sandboxID>` hostnames through the existing two-hop proxy. This also unlocks
-> **user-port exposure** (a server the sandbox code starts on `:8000` becomes reachable at
-> `8000-<id>`). Read `docs/MICROVM_DESIGN.md` (§3 vsock, §6 "no NIC"), `docs/STAGE9_DESIGN.md`
-> (the proxy/catalog topology), `docs/STAGE11_DESIGN.md` (the ConnectRPC daemon), and
-> `docs/E2B_ALIGNMENT_ROADMAP.md` (§4 D1) first. Three sub-steps (12a → 12b → 12c).
+> `<port>-<sandboxID>` hostnames through the existing two-hop proxy. This also unlocked
+> **user-port exposure** (a server the sandbox code starts on `:8000` is reachable at
+> `8000-<id>`; `sandbox.get_host(port)`, `tests/test_ports.py`). vsock is fully retired
+> (daemon TCP-only, `mdlayher/vsock` + `vsock_override` removed). e2e **37/37** (behavioral,
+> pure TCP). Read `docs/MICROVM_DESIGN.md` (§3 vsock history, §6 the netns model),
+> `docs/STAGE9_DESIGN.md` (the proxy/catalog topology), `docs/STAGE11_DESIGN.md` (the
+> ConnectRPC daemon), and `docs/E2B_ALIGNMENT_ROADMAP.md` (§4 D1) first. Three sub-steps
+> (12a → 12b → 12c) — described below as the plan that was executed.
 >
 > **Scope (chosen with the user): networking only.** UFFD lazy snapshot restore and the
 > storage swaps (SQLite→Postgres, in-mem→Redis, Local→object storage) the roadmap grouped

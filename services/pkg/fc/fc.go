@@ -1,7 +1,7 @@
 // Package fc is the Firecracker microVM lifecycle: cold start from a rootfs, restore
 // from a snapshot, and destroy. Ported verbatim from control-plane/microvm.go (Stage
-// 8a: relocated; MicroVM.ID / MicroVM.UDSPath and the Spawn/Restore/Destroy entry
-// points are exported now that the orchestrator drives them from cmd/orchestrator).
+// 8a: relocated; MicroVM.ID and the Spawn/Restore/Destroy entry points are exported now
+// that the orchestrator drives them from cmd/orchestrator).
 // The host side shells out to the `firecracker` binary -- there is no Go VM library.
 package fc
 
@@ -28,16 +28,11 @@ import (
 // Firecracker microVM topology -- must match the rootfs's /init and the snapshot.
 // Ported from client.py's _MICROVM_* constants.
 const (
-	VsockPort = 1024 // envd's vsock port inside the VM (exported: callers probe/proxy it)
-	// CodeInterpreterVsockPort is the second in-VM service (Stage 11): the code-interpreter
-	// (the stateful Python kernel). Firecracker multiplexes both ports onto the one vsock
-	// UDS via CONNECT <port>; the orchestrator routes /codeinterpreter.* here.
-	CodeInterpreterVsockPort = 1025
-	// Stage 12a: the daemon ALSO listens on these TCP ports (E2B's), reachable over the VM's
-	// NIC at Slot.RoutableIP, alongside vsock. Must match daemon/main.go's TCP listeners.
+	// The daemon's two in-VM TCP ports (E2B's), reached over the VM's NIC at Slot.RoutableIP
+	// through the per-sandbox netns DNAT. Must match daemon/main.go's TCP listeners. Stage 12c
+	// retired the vsock transport, so these are the daemon's only ports now.
 	EnvdTCPPort            = 49983
 	CodeInterpreterTCPPort = 49999
-	guestCID               = 3 // guest's vsock CID (host is fixed at 2)
 	vcpus                  = 1
 	memMiB                 = 512 // a Jupyter kernel runs inside the VM; 256 is tight, so give 512
 
@@ -45,17 +40,16 @@ const (
 	accessW = 0x2 // W_OK
 )
 
-// MicroVM is a handle to one running Firecracker process and its per-VM working
-// directory (config.json / api.sock / console.log / -- for cold start -- the
-// vsock UDS). Ported from client.py's _spawn_microvm / _restore_microvm / close.
+// MicroVM is a handle to one running Firecracker process and its per-VM working directory
+// (config.json / api.sock / console.log). Ported from client.py's _spawn_microvm /
+// _restore_microvm / close.
 type MicroVM struct {
 	ID      string
 	proc    *exec.Cmd
 	workdir string
-	UDSPath string // Firecracker multiplexes the guest vsock onto this UDS; the data proxy connects to it
 
-	// Stage 12a: this VM's network slot (its own netns + TAP + veth + DNAT), set on the
-	// cold-start (Spawn) path. nil on the vsock-only restore path. Destroy frees it.
+	// This VM's network slot (its own netns + TAP + veth + DNAT) -- the data path reaches the
+	// daemon at Slot.RoutableIP over TCP. Set on every VM (cold-start + restore); Destroy frees it.
 	Slot   *network.Slot
 	netMgr *network.Manager
 }
@@ -92,8 +86,8 @@ func CheckHostArtifacts(vendorDir string) error {
 	return nil
 }
 
-// Spawn cold-starts a Firecracker microVM (from the template's rootfs) with the daemon
-// running inside, exposed via vsock. Ported from client.py's _spawn_microvm.
+// Spawn cold-starts a Firecracker microVM (from the template's rootfs) with the daemon running
+// inside, reachable over the VM's NIC (TCP). Ported from client.py's _spawn_microvm.
 func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager) (*MicroVM, error) {
 	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
@@ -107,9 +101,9 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 			" (or scripts/build-template.sh %s) first", tmpl.Rootfs, tmpl.Name, tmpl.Name)
 	}
 
-	// Stage 12a: allocate this VM's network slot -- its own netns with a TAP (the VM's NIC),
-	// a veth pair to the host, and a DNAT mapping slot.RoutableIP to the VM's fixed guest IP.
-	// firecracker is launched inside that netns below; vsock is kept alongside (additive).
+	// Allocate this VM's network slot -- its own netns with a TAP (the VM's NIC), a veth pair to
+	// the host, and a DNAT mapping slot.RoutableIP to the VM's fixed guest IP. firecracker is
+	// launched inside that netns below; the daemon is reached at slot.RoutableIP over TCP.
 	slot, err := netMgr.Allocate()
 	if err != nil {
 		return nil, fmt.Errorf("allocate network slot: %w", err)
@@ -120,7 +114,6 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 		netMgr.Free(slot)
 		return nil, err
 	}
-	uds := filepath.Join(workdir, "fc.vsock")
 	configPath := filepath.Join(workdir, "config.json")
 
 	// A single JSON declares the whole VM (--config-file, easy to read at a glance).
@@ -138,14 +131,13 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 			"is_read_only":   true, // all writes go to the in-VM tmpfs /tmp
 		}},
 		"machine-config": map[string]any{"vcpu_count": vcpus, "mem_size_mib": memMiB},
-		// Stage 12a: a virtio-net NIC backed by the netns's TAP, so the host can reach the VM
-		// over TCP. vsock stays too (additive) -- the data path doesn't move until 12b.
+		// A virtio-net NIC backed by the netns's TAP -- the daemon's only transport now (Stage 12c
+		// retired vsock); the host reaches it at Slot.RoutableIP over TCP.
 		"network-interfaces": []any{map[string]any{
 			"iface_id":      "eth0",
 			"host_dev_name": network.TapDevice,
 			"guest_mac":     network.GuestMAC,
 		}},
-		"vsock": map[string]any{"guest_cid": guestCID, "uds_path": uds},
 	}
 	data, _ := json.Marshal(config)
 	if err := os.WriteFile(configPath, data, 0o644); err != nil {
@@ -154,7 +146,7 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 		return nil, err
 	}
 
-	vm, err := startFirecracker(id, vendorDir, workdir, uds, slot.Netns,
+	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns,
 		"--api-sock", filepath.Join(workdir, "api.sock"), "--config-file", configPath)
 	if err != nil {
 		os.RemoveAll(workdir)
@@ -169,16 +161,13 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 // Restore restores a microVM from a pre-generated snapshot (~30ms to ready vs ~0.94s
 // cold start). Ported from client.py's _restore_microvm.
 //
-// The snapshot bakes in a fixed vsock uds path (vendor/snapshot/fc.vsock), which
-// alone would limit us to one restore at a time. We override it per-VM at load
-// time via Firecracker v1.16.0's vsock_override, so N VMs can be restored from the
-// one snapshot -- each listening on its own workdir/fc.vsock. This is the basis for
-// the warm pool (Stage 5). See docs/STAGE5_DESIGN.md.
-//
-// Stage 12b: the snapshot also bakes a fixed eth0 (IP + MAC), so for the same reason each
-// restored VM gets its own network slot (netns) from netMgr -- the network twin of
-// vsock_override. firecracker is launched inside that netns, whose tap0 the snapshot's NIC
-// reattaches to (the tap name is constant across slots; uniqueness is the netns).
+// The snapshot bakes a fixed eth0 (IP + MAC), so every VM restored from the one snapshot comes
+// up identical. To run N of them at once (the warm pool, Stage 5) without an address collision,
+// each gets its own network slot (netns) from netMgr and firecracker is launched inside it,
+// whose tap0 the snapshot's NIC reattaches to (the tap name is constant across slots; uniqueness
+// is the netns). Through Stage 11 this same per-VM isolation was done for the vsock UDS via
+// vsock_override; Stage 12 replaced vsock with the netns. See docs/STAGE5_DESIGN.md +
+// docs/STAGE12_DESIGN.md.
 func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manager) (*MicroVM, error) {
 	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
@@ -206,9 +195,9 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 			" rebuild with scripts/build-template.sh %s", tmpl.Rootfs, tmpl.Name, tmpl.Name)
 	}
 
-	// Stage 12b: each restored VM gets its own network slot, just like Spawn -- the snapshot now
-	// bakes a configured eth0, and every VM restored from it comes up with the SAME guest IP/MAC,
-	// so each must live in its own netns to coexist (the network twin of the vsock_override below).
+	// Each restored VM gets its own network slot, just like Spawn -- the snapshot bakes a
+	// configured eth0, and every VM restored from it comes up with the SAME guest IP/MAC, so each
+	// must live in its own netns to coexist (Stage 5 did the same per-VM trick for the vsock UDS).
 	slot, err := netMgr.Allocate()
 	if err != nil {
 		return nil, fmt.Errorf("allocate network slot: %w", err)
@@ -220,15 +209,11 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 		return nil, err
 	}
 	apiSock := filepath.Join(workdir, "api.sock")
-	// This VM's own vsock socket, inside its private workdir. We override the path
-	// baked into the snapshot at load time (below), so concurrent restores never
-	// collide on a shared socket.
-	uds := filepath.Join(workdir, "fc.vsock")
 
 	// firecracker runs inside the slot's netns so the snapshot's NIC reattaches to that netns's
-	// tap0. The unix sockets (api.sock, fc.vsock) live in workdir on the host fs, so the netns
-	// doesn't isolate them -- the orchestrator still reaches them.
-	vm, err := startFirecracker(id, vendorDir, workdir, uds, slot.Netns, "--api-sock", apiSock)
+	// tap0. The api.sock lives in workdir on the host fs, so the netns doesn't isolate it -- the
+	// orchestrator still reaches it.
+	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns, "--api-sock", apiSock)
 	if err != nil {
 		os.RemoveAll(workdir)
 		netMgr.Free(slot)
@@ -240,10 +225,9 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 
 	// Snapshot load + resume can't go through --config-file, so use the REST API.
 	status, err := firecrackerAPI(apiSock, "PUT", "/snapshot/load", map[string]any{
-		"snapshot_path":  vmstate,
-		"mem_backend":    map[string]any{"backend_type": "File", "backend_path": memfile},
-		"vsock_override": map[string]any{"uds_path": uds}, // v1.16.0: per-VM uds, overriding the snapshot's baked path
-		"resume_vm":      true,
+		"snapshot_path": vmstate,
+		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": memfile},
+		"resume_vm":     true,
 	}, 15*time.Second)
 	if err != nil || (status != 200 && status != 204) {
 		tail := vm.ConsoleTail()
@@ -257,7 +241,7 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 // its stdout/stderr (the guest serial console) to workdir/console.log. We can't
 // use a pipe: the guest console writes continuously and a full pipe buffer would
 // stall the VM, so it lands in a file we can tail for diagnostics.
-func startFirecracker(id, vendorDir, workdir, uds, netns string, args ...string) (*MicroVM, error) {
+func startFirecracker(id, vendorDir, workdir, netns string, args ...string) (*MicroVM, error) {
 	console, err := os.Create(filepath.Join(workdir, "console.log"))
 	if err != nil {
 		return nil, err
@@ -265,10 +249,10 @@ func startFirecracker(id, vendorDir, workdir, uds, netns string, args ...string)
 	fcPath := filepath.Join(vendorDir, "firecracker")
 	var cmd *exec.Cmd
 	if netns != "" {
-		// Stage 12a: launch firecracker inside the sandbox's netns, so the TAP it opens is the
-		// one in that namespace. `ip netns exec` needs CAP_NET_ADMIN -- the orchestrator runs as
-		// root (Decision 7). It execs (no fork) into firecracker, so cmd.Process is the VM and
-		// SIGTERM/Wait below still target it. Restore passes "" (vsock-only this sub-step).
+		// Launch firecracker inside the sandbox's netns, so the TAP it opens is the one in that
+		// namespace. `ip netns exec` needs CAP_NET_ADMIN -- the orchestrator runs as root (Decision
+		// 7). It execs (no fork) into firecracker, so cmd.Process is the VM and SIGTERM/Wait below
+		// still target it. Both Spawn and Restore pass a netns (every VM has a network slot).
 		cmd = exec.Command("ip", append([]string{"netns", "exec", netns, fcPath}, args...)...)
 	} else {
 		cmd = exec.Command(fcPath, args...)
@@ -280,7 +264,7 @@ func startFirecracker(id, vendorDir, workdir, uds, netns string, args ...string)
 	if err != nil {
 		return nil, err
 	}
-	return &MicroVM{ID: id, proc: cmd, workdir: workdir, UDSPath: uds}, nil
+	return &MicroVM{ID: id, proc: cmd, workdir: workdir}, nil
 }
 
 // Destroy kills the firecracker process (which destroys the whole VM -- memory
@@ -301,8 +285,8 @@ func (vm *MicroVM) Destroy() {
 	if vm.workdir != "" {
 		os.RemoveAll(vm.workdir)
 	}
-	// Stage 12a: tear down the network slot (netns/veth/TAP/DNAT) after the VM is gone. nil on
-	// the vsock-only restore path. Done last, so firecracker has released the netns's TAP.
+	// Tear down the network slot (netns/veth/TAP/DNAT) after the VM is gone -- done last, so
+	// firecracker has already released the netns's TAP. Every VM has a slot since Stage 12.
 	if vm.Slot != nil && vm.netMgr != nil {
 		vm.netMgr.Free(vm.Slot)
 	}

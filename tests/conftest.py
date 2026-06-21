@@ -3,9 +3,9 @@
 Every Sandbox is created via the Go control plane, so the tests need the go
 toolchain plus firecracker + a guest kernel + rootfs under vendor/ and an
 accessible /dev/kvm. When any of those is missing the microVM fixtures skip as a
-group, so `pytest` still completes on machines without them. The vsock bridge's
-own unit tests now live in Go (services/pkg/proxy/proxy_test.go, run with
-`go test ./services/...`) and need none of this.
+group, so `pytest` still completes on machines without them. The data proxy's
+own unit tests now live in Go (services/pkg/proxy/proxy_test.go -- TCP since Stage
+12, run with `go test ./services/...`) and need none of this.
 """
 
 import functools
@@ -147,8 +147,8 @@ def _wait_healthy(url: str, proc: subprocess.Popen, log_path: pathlib.Path) -> N
 def control_plane(tmp_path_factory):
     """Build and run the Go services (orchestrator + client-proxy + api) once per session.
 
-    Stage 8b split the control plane into orchestrator (gRPC SandboxService + the vsock
-    data proxy) and api (public REST). Stage 9 adds client-proxy (the edge data proxy that
+    Stage 8b split the control plane into orchestrator (gRPC SandboxService + the data
+    proxy, TCP over the VM's NIC since Stage 12) and api (public REST). Stage 9 adds client-proxy (the edge data proxy that
     owns the routing catalog): the api registers each sandbox's route in client-proxy on
     create, and -- once Stage 9b lands -- the SDK sends the data path through client-proxy.
     Registration is load-bearing (a create rolls back if it fails), so the trio must all be

@@ -7,9 +7,11 @@ demand if absent) + an accessible /dev/kvm; if firecracker/kernel are missing th
 whole group is skipped.
 
 As of Stage 5a several sandboxes can be restored from the one snapshot at once: the
-control plane overrides the snapshot's baked-in vsock uds per VM (vsock_override), so
-each gets its own socket. test_concurrent_restores_are_isolated exercises that -- the
-prerequisite for the warm pool (Stage 5b). See docs/STAGE5_DESIGN.md.
+control plane gives each restored VM its own data channel. Stage 5a did this with a
+per-VM vsock uds (vsock_override); Stage 12 retired vsock and instead gives each VM its
+own network slot (netns/TAP/veth/DNAT, services/pkg/network), so they reach distinct
+host addresses. test_concurrent_restores_are_isolated exercises that -- the prerequisite
+for the warm pool (Stage 5b). See docs/STAGE5_DESIGN.md + docs/STAGE12_DESIGN.md.
 """
 
 import time
@@ -54,8 +56,8 @@ def test_restore_is_fast(snapshot_ready) -> None:
 def test_concurrent_restores_are_isolated(snapshot_ready) -> None:
     """Restore several sandboxes from the one snapshot *concurrently*, give each a
     distinct variable, then read them all back -- proving the restores coexist as
-    independent VMs (own kernel, own vsock socket) with no cross-talk. Before Stage 5a
-    the snapshot's baked-in socket path was shared, so this raced and could not be done.
+    independent VMs (own kernel, own network slot) with no cross-talk. Before Stage 5a
+    the snapshot's baked-in data channel was shared, so this raced and could not be done.
     """
     n = 3
     base_url = snapshot_ready

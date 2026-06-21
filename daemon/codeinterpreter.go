@@ -3,9 +3,10 @@ package main
 // Stage 11b: the ConnectRPC code-interpreter service, matching E2B's separate
 // code-interpreter. It serves a server-streaming Execute -- the Connect-over-HTTP/1.1
 // equivalent of the daemon's /execute SSE -- by driving the shared kernelManager and
-// forwarding each OutputEvent as a stream frame. It runs on its own vsock port (the
-// orchestrator routes /codeinterpreter.* there); the kernel is the same one the legacy
-// HTTP /execute still drives (removed in 11c). See docs/STAGE11_DESIGN.md.
+// forwarding each OutputEvent as a stream frame. It runs on its own TCP port :49999 (the
+// orchestrator routes the <port>-<id> hostname there; Stage 11 used a vsock port + a
+// /codeinterpreter. path prefix, retired with vsock in Stage 12); the kernel is the same
+// one the legacy HTTP /execute drove (removed in 11c). See docs/STAGE11_DESIGN.md.
 
 import (
 	"context"

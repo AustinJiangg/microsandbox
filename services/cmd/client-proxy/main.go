@@ -2,8 +2,9 @@
 // (pkg/catalog, in-memory) and runs two listeners:
 //
 //   - a public data port (--addr): every request is routed into a sandbox by its
-//     X-Sandbox-Id header -- look the id up in the catalog, reverse-proxy to that node's
-//     orchestrator data proxy (-> vsock -> envd). GET /health is its own liveness.
+//     `<port>-<id>` Host header (Stage 12) -- look the id up in the catalog, then
+//     reverse-proxy to that node's orchestrator data proxy (handing it the id + target
+//     port, which dials the VM's NIC over TCP -> envd). GET /health is its own liveness.
 //   - an internal control port (--internal-addr): the api writes the catalog here
 //     (PUT/DELETE /routes/{id}) when sandboxes are created/destroyed. Kept off the public
 //     port so the routing table is not writable by data-plane clients.

@@ -12,8 +12,8 @@ principles**, not to ship a product. The code aims to be clear, well-commented,
 and easy to evolve.
 
 Every sandbox is a **Firecracker microVM**: its own guest kernel behind the KVM
-boundary, control channel over **vsock**, and a stateful Jupyter kernel inside the
-VM. The project was originally built up in stages (host subprocess → Docker
+boundary, a per-sandbox **TAP/netns NIC** carrying the data path over **TCP** (Stage 12
+retired the original vsock channel), and a stateful Jupyter kernel inside the VM. The project was originally built up in stages (host subprocess → Docker
 container → resident container → microVM) to learn each isolation technique; those
 earlier backends were scaffolding and have since been removed, leaving only the
 Firecracker path. **The staged journey is preserved in the git history** — see the
@@ -34,20 +34,21 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    `daemon/proto/*.proto`), so the e2e suite is now a **behavioral** parity oracle, not
    byte-for-byte. `protocol.py` stays as the SDK's result types
    (Execution/OutputEvent/EventType) + reference for the old SSE wire.
-3. **in-VM daemon** — `daemon/` (Go), E2B's `envd`. Runs **inside the VM** on **two vsock
-   ports** (Stage 11): `envd` (ConnectRPC `FilesystemService` + `ProcessService` + a plain
-   `/health`) and a separate `code-interpreter` (ConnectRPC streaming `Execute`, driving a
-   stateful Python kernel via a Jupyter Kernel Gateway). It replaced the Python `server.py`
-   / `backend.py` (kept in `src/` as reference).
+3. **in-VM daemon** — `daemon/` (Go), E2B's `envd`. Runs **inside the VM** on **two TCP
+   ports** over the VM's NIC (Stage 12 flipped these from vsock): `envd` (ConnectRPC
+   `FilesystemService` + `ProcessService` + a plain `/health`) on `:49983` and a separate
+   `code-interpreter` (ConnectRPC streaming `Execute`, driving a stateful Python kernel via a
+   Jupyter Kernel Gateway) on `:49999`. It replaced the Python `server.py` / `backend.py`
+   (kept in `src/` as reference).
 4. **control plane** — `services/` (Go module `microsandbox/services`), split into
    E2B-shaped services (Stages 8–9). **`cmd/api`** is the **lifecycle-only** public REST
    front (owns a SQLite metadata store, `pkg/store`); it calls **`cmd/orchestrator`** over
    **gRPC** (`SandboxService`). The orchestrator owns the microVM fleet + warm pool
-   (`pkg/{fc,pool,template}`) and a header-routed vsock **data proxy** (`pkg/proxy`) that
-   bridges the data path to the daemon. **`cmd/client-proxy`** (Stage 9) is the edge data
-   proxy: it owns a routing **catalog** (`pkg/catalog`, sandbox→node, written by the api on
-   create) and routes each data request by its `X-Sandbox-Id` header to the orchestrator's
-   proxy. So the SDK talks to **two** endpoints — the api (lifecycle) and client-proxy
+   (`pkg/{fc,pool,network,template}`) and a header-routed **data proxy** (`pkg/proxy`) that
+   bridges the data path to the daemon over the VM's NIC (TCP; Stage 12). **`cmd/client-proxy`**
+   (Stage 9) is the edge data proxy: it owns a routing **catalog** (`pkg/catalog`, sandbox→node,
+   written by the api on create) and routes each data request by its `<port>-<id>` `Host` header
+   (Stage 12; the port selects the in-VM service or a user port) to the orchestrator's proxy. So the SDK talks to **two** endpoints — the api (lifecycle) and client-proxy
    (data, learned from the create response). The orchestrator also hosts a
    **`TemplateService`** (Stage 10): the api's `POST /templates` kicks an async template
    build there (`pkg/build` wrapping the build scripts, `pkg/storage` placing the artifacts).
@@ -63,9 +64,10 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 
 ## Current state & possible next steps
 
-- **Done**: the Firecracker microVM works end to end — cold start ~0.94s, vsock
-  control channel, machine-config resource limits, no guest NIC (the sandbox code
-  is fully offline while still manageable), and snapshot restore (~30ms to ready).
+- **Done**: the Firecracker microVM works end to end — cold start ~0.94s, the data path
+  over a per-sandbox TAP/netns NIC (TCP; **inbound-reachable, outbound-denied by default** —
+  DNAT, no MASQUERADE), machine-config resource limits, and snapshot restore (~30ms to ready,
+  unpooled ~0.7-0.9s on WSL2 from per-sandbox net setup; the warm pool is the ms path).
   See `docs/MICROVM_DESIGN.md` for the design + measured records.
 - **Done (Stage 4 — Go control plane)**: the VM lifecycle lives in a standalone Go
   service (`control-plane/`). 4a moved spawn/restore/destroy there; 4b moved the
@@ -136,9 +138,23 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   Connect-JSON client, **no new Python dep**); 11c flipped files/commands to envd Connect unary,
   removed the daemon's HTTP endpoints, and retired `protocol.py`'s SSE wire. e2e 36/36
   (behavioral). See `docs/STAGE11_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): deferred — Stage 12 TAP/netns
-  networking + real `<port>-<id>` hostnames (then SQLite→Postgres, in-mem→Redis, Local→object
-  storage go live); then auth, multi-host scheduling, a TypeScript SDK.
+- **Done (Stage 12 — per-sandbox TAP/netns networking; data path flipped to TCP; vsock retired)**:
+  every sandbox now has a real network identity — a virtio-net NIC backed by a host **TAP** in
+  its **own netns**, a fixed guest IP, and a per-slot routable host address via veth + **DNAT
+  (no MASQUERADE)**, so it is **inbound-reachable but outbound-denied by default** (`pkg/network`).
+  12a gave cold-start + restored/pooled VMs a slot and baked `eth0` into the snapshot; 12b flipped
+  the data path from vsock to **TCP routed by `<port>-<id>` hostnames** (`client-proxy` parses the
+  `Host` header → orchestrator dials `<slot-ip>:<port>`; the port selects envd `:49983` /
+  code-interpreter `:49999`); 12c added **user-port exposure** (`sandbox.get_host(port)` reaches any
+  guest port, e.g. a server on `:8000` at `8000-<id>`; `tests/test_ports.py`) and **retired vsock
+  entirely** (daemon TCP-only, `mdlayher/vsock` + `vsock_override` removed). This **reverses
+  roadmap Decision D1** and is the single most security-relevant change in the project's history;
+  the "fully offline" claim is reworded to "inbound-reachable, outbound-denied by default" — still
+  a learning implementation, **not security-audited**, never safe to expose to untrusted input. e2e
+  37/37 (behavioral, pure TCP). See `docs/STAGE12_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): UFFD lazy snapshot restore; the storage
+  swaps go live (SQLite→Postgres, in-mem→Redis, Local→object storage); then auth, multi-host
+  scheduling, a TypeScript SDK.
 
 ## Development conventions
 
@@ -152,22 +168,25 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 - **Language: English only.** All docs, code comments, docstrings, and commit
   messages are in English. Comments explain **why**, not what.
 - Keep `tests/` all green. The host-side unit tests now live in Go
-  (`go test ./services/...` — vsock bridge, pool, templates, the metadata store, the
-  catalog + client-proxy routing, no VM/KVM needed); the Python end-to-end / stateful /
-  snapshot / metadata tests run on real VMs (driven through the api + client-proxy +
-  orchestrator) and auto-skip when go / firecracker / `/dev/kvm` / the vendor artifacts
-  are missing.
+  (`go test ./services/...` — TCP data proxy, network slot derivation, pool, templates, the
+  metadata store, the catalog + client-proxy routing, no VM/KVM needed); the Python
+  end-to-end / stateful / snapshot / metadata / ports tests run on real VMs (driven through
+  the api + client-proxy + orchestrator) and auto-skip when go / firecracker / `/dev/kvm` /
+  the per-sandbox-network privilege / the vendor artifacts are missing.
 - **Safety rule**: the microVM is the first isolation strong enough to *discuss*
   untrusted code, but it is a learning implementation, **not security-audited** —
   never imply in docs or code that it is safe to expose as a service or feed
-  arbitrary external input.
+  arbitrary external input. Since Stage 12 the sandbox is no longer "fully offline":
+  it is **inbound-reachable** (so its ports can be exposed) and **outbound-denied by
+  default** (DNAT only, no MASQUERADE) — this *narrows* the isolation, so the
+  not-safe-for-untrusted-input rule matters more, not less.
 
 ## Common commands
 
 ```bash
 pip install -e ".[dev]"                          # install (dev mode)
 pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs api + client-proxy + orchestrator)
-go test ./services/...                           # host-side unit tests: vsock bridge, pool, templates, metadata store, catalog + client-proxy (no VM/KVM)
+go test ./services/...                           # host-side unit tests: TCP data proxy, network slot derivation, pool, templates, metadata store, catalog + client-proxy (no VM/KVM)
 go test ./daemon                                 # in-VM daemon unit tests: handlers + kernel-message translation (no VM/KVM)
 pytest tests/test_microvm.py::test_runs_in_microvm -v   # one real-VM end-to-end case
 

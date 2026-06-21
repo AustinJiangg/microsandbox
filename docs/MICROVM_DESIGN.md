@@ -5,6 +5,15 @@ this alongside `docs/ARCHITECTURE.md` (the three-layer client / protocol /
 daemon+backend design). The point of the project is to understand the mechanics by
 hand, so this walks through each piece with real code anchors.
 
+> **Reading note — this doc is layered design history.** It was written at the
+> microVM/control-plane era (Stages 3–4) and §2–§5 still use those names
+> (`control-plane/`, `microvm.go`, `proxy.go`, the Python `server.py`); the code has since
+> moved to `services/` + a Go `daemon/`. Most importantly, **the host↔VM transport changed**:
+> Stages 3–11 used **vsock** (described in §3 as history), and **Stage 12 replaced it with
+> TCP over a per-sandbox TAP/netns NIC** — see **§6** for the current network model and
+> `docs/STAGE12_DESIGN.md`. Where §2–§5 say "vsock", read "the host↔VM channel" and follow
+> §6 for how it works today.
+
 ---
 
 ## 1. What the microVM gives you: a real isolation boundary
@@ -81,6 +90,12 @@ inside which the daemon runs the kernel backend.
 ---
 
 ## 3. vsock: how the host and the VM talk
+
+> **Retired in Stage 12 — kept as design history.** Stages 3–11 carried the host↔VM
+> channel over vsock, described below; it is the most instructive part of the original
+> microVM design. **Stage 12 replaced it with TCP over a per-sandbox TAP/netns NIC** (see
+> §6 and `docs/STAGE12_DESIGN.md`) and removed the vsock device entirely. Read this section
+> for *how vsock worked*, not for the current transport.
 
 vsock (virtio-vsock) is a socket designed for "host↔VM"; its address is `(CID,
 port)` rather than `(IP, port)`: the guest's CID is 3, the host is fixed at 2.
@@ -198,28 +213,46 @@ see §8.
 
 ---
 
-## 6. Isolation actually gets stronger (vsock vs a management port)
+## 6. The network model: inbound-reachable, outbound-denied (Stage 12)
 
-A TCP-port-mapped container has a dilemma: to let the host reach the in-container
-daemon you **must open a management port**, which incidentally opens the guest's
-outbound network too. vsock dissolves this: it carries the management channel
-**orthogonally to whether the guest has a NIC**. So the microVM can:
+> **History.** Stages 3–11 ran the management/data channel over **vsock**, with **no
+> virtio-net at all** — the sandbox code was *completely offline* (`/sys/class/net` had
+> only `lo`; connecting to `1.1.1.1` raised `OSError`) while still manageable, a
+> combination a port-mapped container can't have. **Stage 12 reversed that** (roadmap
+> Decision D1) to match E2B's real shape: every sandbox now has a NIC and the data path
+> rides TCP. The vsock path is retired. This section describes the current model.
 
-- have **no virtio-net at all** → the sandbox code is completely offline
-  (`/sys/class/net` has only `lo`; connecting to `1.1.1.1` raises `OSError`), while
-  the management channel still flows over vsock. "Manageable *and* network-cut-off"
-  — a combination a port-mapped container can't have.
-- stack the guest's own kernel on top → the strongest isolation in the project.
+Each sandbox gets a **per-sandbox network slot** (`services/pkg/network`):
 
-(Outbound network for the sandbox, when wanted, would be a deliberate opt-in via
-virtio-net — a future enhancement, not the default.)
+- a virtio-net NIC backed by a host **TAP** device, created inside the sandbox's **own
+  network namespace** (`msb-ns-<i>`), with a fixed private guest IP (`169.254.0.21`) the
+  guest kernel configures from the `ip=` boot arg (the minimal rootfs has no `ip` binary);
+- a **veth pair** bridging that netns to the host root namespace, giving the slot a
+  per-slot routable host address (`10.0.<i>.1` host end, the VM reachable at `10.0.<i>.2`);
+- host-side **iptables DNAT** so the orchestrator reaches the VM's daemon ports
+  (`:49983` envd, `:49999` code-interpreter, and any user port) at the routable address.
+
+**The deliberate safety choice: DNAT only, no MASQUERADE.** Inbound packets are
+forwarded to the VM, but there is **no source-NAT for outbound traffic**, so the sandbox
+**cannot phone home** — it is **inbound-reachable but outbound-denied by default**. This
+keeps most of the old "offline" isolation (the guest still has no route to the internet)
+while gaining the thing networking unlocks: **user-port exposure**, where a server the
+sandbox starts on `:8000` is reachable through the proxy at `8000-<id>`.
+
+This is the **single most security-relevant change in the project's history** — the
+sandbox stopped being fully offline. Outbound egress (adding MASQUERADE) would be a
+deliberate, documented opt-in, not the default. As always: this is a learning
+implementation, **not security-audited**, never safe to expose to untrusted input.
 
 ---
 
 ## 7. One-time setup (kvm group + artifacts)
 
-The microVM needs `firecracker` + a vsock-capable guest kernel under `vendor/`, and
-access to `/dev/kvm`.
+The microVM needs `firecracker` + a guest kernel with **virtio-net** (and virtio-blk)
+under `vendor/`, and access to `/dev/kvm`. Since Stage 12 the orchestrator also needs the
+**CAP_NET_ADMIN privilege** to set up each sandbox's TAP/netns/veth/DNAT slot (on this box,
+the passwordless `sudo ip` granted in `/etc/sudoers.d/microsandbox` + `/dev/net/tun`); the
+VM cases skip as a group when that privilege is missing, like they do for `/dev/kvm`.
 
 ```bash
 # 1) Join the kvm group so firecracker can open /dev/kvm without sudo (one-time),
@@ -228,9 +261,10 @@ sudo usermod -aG kvm "$USER"
 
 # 2) Put the artifacts under vendor/:
 #    - vendor/firecracker : the static binary (a GitHub release; this repo used v1.16.0)
-#    - vendor/vmlinux     : a guest kernel with virtio-vsock / virtio-blk / ext4 / devtmpfs
+#    - vendor/vmlinux     : a guest kernel with virtio-net / virtio-blk / ext4 / devtmpfs
 #                           built in (=y) -- e.g. a Firecracker CI kernel (this repo used 6.1.155);
-#                           verify against its .config before downloading.
+#                           verify against its .config before downloading. (virtio-vsock is no
+#                           longer required -- Stage 12 retired the vsock path.)
 
 # 3) Build the VM rootfs (and optionally a warm snapshot):
 docker build -t microsandbox-agent .   # the agent image the rootfs is exported from
@@ -240,10 +274,10 @@ scripts/build-snapshot.sh              # optional: a warm snapshot for milliseco
 
 `tests/conftest.py` builds + runs the control plane for the VM cases and guards them
 on "go toolchain + firecracker binary + vmlinux present and `/dev/kvm`
-readable/writable"; if any is missing, the VM cases skip as a group. The vsock-bridge
-unit tests now live in Go (`control-plane/proxy_test.go`, run with
-`go test ./control-plane`) and need none of this. On machines without KVM, `pytest`
-therefore still completes.
+readable/writable + the CAP_NET_ADMIN privilege for the per-sandbox network"; if any is
+missing, the VM cases skip as a group. The data-proxy unit tests now live in Go
+(`services/pkg/proxy/proxy_test.go` — TCP since Stage 12, run with `go test ./services/...`)
+and need none of this. On machines without KVM, `pytest` therefore still completes.
 
 ---
 

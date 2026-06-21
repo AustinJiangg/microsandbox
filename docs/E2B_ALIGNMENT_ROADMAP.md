@@ -10,11 +10,13 @@
 > each stage is picked up; this file is the map that ties them together.
 >
 > **Progress:** Stages 8 (api + orchestrator gRPC split), 9 (client-proxy + routing catalog),
-> 10 (TemplateService + `pkg/storage`), and 11 (`envd` → ConnectRPC + a separate
+> 10 (TemplateService + `pkg/storage`), 11 (`envd` → ConnectRPC + a separate
 > `code-interpreter` — which **ended the byte-stable-protocol discipline**; the e2e oracle is
-> now behavioral) are **done** — see their design docs and the "Done" list in `CLAUDE.md`. The
-> remainder (Stage 12 TAP/netns networking, then auth / multi-host / a TS SDK) is the
-> **deferred** forward plan.
+> now behavioral), and **12 (per-sandbox TAP/netns networking; the data path flipped vsock →
+> TCP routed by real `<port>-<id>` hostnames; user-port exposure; vsock retired — reversing
+> Decision D1)** are **done** — see their design docs and the "Done" list in `CLAUDE.md`. The
+> remainder (UFFD lazy restore + the storage swaps going live, then auth / multi-host / a TS
+> SDK) is the **deferred** forward plan.
 
 ## 1. Why this document
 
@@ -59,8 +61,10 @@ routes into the VM.
 
 ## 3. Target architecture in this repo
 
-One repo, one machine, **vsock-first** (no guest NIC yet). We reproduce E2B's *seams*
-with single-machine-appropriate implementations behind E2B-shaped interfaces:
+One repo, one machine. The decomposition was done **vsock-first** (Decision D1) and then
+**Stage 12 gave every sandbox a real NIC and flipped the data path to TCP** (see below). We
+reproduce E2B's *seams* with single-machine-appropriate implementations behind E2B-shaped
+interfaces:
 
 ```
                        REST  (lifecycle + templates)
@@ -68,12 +72,13 @@ with single-machine-appropriate implementations behind E2B-shaped interfaces:
    (src/microsandbox)                              (REST; trivial  │ gRPC
         │                                            placement;    │ SandboxService / TemplateService
         │ data plane (execute / files / commands,    persists      ▼
-        │  HTTP + X-Sandbox-Id header)               SQLite)   orchestrator  (one per machine)
+        │  ConnectRPC, Host: <port>-<id>)            SQLite)   orchestrator  (one per machine)
         └───────────────────►  client-proxy ──(catalog)──►        • Firecracker lifecycle  (pkg/fc)
-                               (edge; routes by             ──┐    • warm pool             (pkg/pool)
-                                sandbox id)                   │    • TemplateService        (build pipeline)
-                                                              │    • per-node data proxy ──HTTP→vsock──► envd
-                                                              │                                       (daemon/, UNCHANGED)
+                               (edge; parses             ──┐       • warm pool             (pkg/pool)
+                                Host <port>-<id>)           │       • per-sandbox net slot  (pkg/network)
+                                                            │       • TemplateService        (build pipeline)
+                                                            │       • per-node data proxy ──TCP→VM NIC──► envd :49983
+                                                            │                                       (daemon/, Stage 12)
    store: SQLite (pkg/store)  ·  catalog: in-mem (pkg/catalog)  ·  artifacts: local dir (pkg/storage)
         all three behind E2B-shaped interfaces → swappable to Postgres / Redis / object storage later
 ```
@@ -96,11 +101,12 @@ Component → where it lives in this repo:
 
 Three forks were put to the user; all three took the lower-risk, staged option:
 
-- **D1 — Networking: vsock first, TAP later.** Do the whole decomposition over the
-  existing vsock transport (everything keeps working, every step verifiable), and make
-  per-sandbox TAP/netns networking + real `<port>-<sandboxID>` port exposure its own
-  later stage. The proxy *topology* (two hops, a catalog) is E2B-faithful now; the
-  *transport* it rides (vsock) is swapped for TCP-over-TAP later.
+- **D1 — Networking: vsock first, TAP later.** ✅ **Done in Stage 12.** The whole
+  decomposition was done over the existing vsock transport (everything kept working, every
+  step verifiable), and per-sandbox TAP/netns networking + real `<port>-<sandboxID>` port
+  exposure became its own later stage. The proxy *topology* (two hops, a catalog) was
+  E2B-faithful from Stage 9; **Stage 12 swapped the *transport* it rides (vsock → TCP over a
+  per-sandbox TAP/netns NIC) and retired vsock.**
 - **D2 — `envd` untouched this round.** E2B's `envd` is `Process`+`Filesystem` ConnectRPC
   with `run_code()` split into a separate `code-interpreter`. We keep the Stage-7 merged
   HTTP daemon for now and focus the refactor on the control-plane seams the user named;
@@ -159,14 +165,20 @@ returns immediately; the api polls `TemplateBuildStatus` — E2B's exact "accept
 build async, poll status" model. The SDK gains a template-build API. (Single-recipe
 build now; E2B's layered-step cache is a noted later enhancement.)
 
-### Deferred (chosen by the user to come after the decomposition)
-- **Stage 11 — `envd` → E2B form.** Rewrite the daemon as ConnectRPC `Process` +
-  `Filesystem`; move Jupyter/`run_code()` into a separate `code-interpreter` service on
-  its own port; SDK gains Connect clients. (Reverses D2.)
-- **Stage 12 — TAP/netns networking.** Per-sandbox TAP + network namespace; `envd` on
-  TCP `:49983`; `client-proxy` routes by real `<port>-<sandboxID>` hostnames; user-port
-  exposure; optional UFFD lazy snapshot restore. Then the storage swaps become live:
-  SQLite→Postgres, in-mem→Redis, Local→object storage. (Reverses D1.)
+### Done after the decomposition (were deferred)
+- **Stage 11 — `envd` → E2B form.** ✅ Rewrote the daemon as ConnectRPC `Process` +
+  `Filesystem`; moved Jupyter/`run_code()` into a separate `code-interpreter` service on
+  its own port; SDK gained Connect clients. (Reversed D2.)
+- **Stage 12 — TAP/netns networking.** ✅ Per-sandbox TAP + network namespace; `envd` on
+  TCP `:49983` + code-interpreter on `:49999`; `client-proxy` routes by real
+  `<port>-<sandboxID>` hostnames; user-port exposure (`sandbox.get_host(port)`); vsock
+  retired. (Reversed D1.) **Scope note:** UFFD lazy restore and the storage swaps the
+  roadmap had grouped here were *deferred to their own later stages* — Stage 12 was
+  networking-only (see `docs/STAGE12_DESIGN.md`).
+
+### Still deferred
+- **UFFD lazy snapshot restore**, then the storage swaps become live:
+  SQLite→Postgres, in-mem→Redis, Local→object storage.
 - **Later — production fidelity.** Auth (`X-API-Key`→team), multi-host scheduling (real
   node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource limits
   and start/ready commands.
@@ -223,5 +235,7 @@ a templates API change across the stages.
   commit only on the user's explicit go-ahead (one single-line Conventional Commit per
   stage), and push to `origin/main` immediately after.
 - **Safety note carried forward:** this remains a learning implementation, not
-  security-audited. Adding networking (Stage 12) narrows the current "fully offline"
-  property; docs must keep saying it is not safe to expose to untrusted input.
+  security-audited. Stage 12 added networking and so **narrowed the old "fully offline"
+  property** — each sandbox is now **inbound-reachable, outbound-denied by default** (DNAT,
+  no MASQUERADE). The docs no longer say "fully offline" and must keep saying it is not safe
+  to expose to untrusted input.

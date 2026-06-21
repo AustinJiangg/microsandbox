@@ -17,7 +17,7 @@ import (
 // server owns the microVM fleet: it creates VMs (cold start or snapshot restore,
 // optionally handed out from a warm pool), tracks them in a registry, and destroys
 // them. In Stage 8b it is fronted by two listeners -- a gRPC SandboxService (grpc.go)
-// for the lifecycle and an HTTP data proxy (dataproxy.go) for the vsock data path --
+// for the lifecycle and an HTTP data proxy (dataproxy.go) for the TCP data path over the VM's NIC --
 // but the fleet logic here is unchanged from the Stage 8a HTTP control plane: the
 // handlers got thinner, the VM management did not move. See docs/STAGE8_DESIGN.md.
 type server struct {
@@ -171,7 +171,7 @@ func (s *server) list() []string {
 	return ids
 }
 
-// lookup returns the VM for an id, if known (used by the data proxy to find the vsock).
+// lookup returns the VM for an id, if known (used by the data proxy to find the VM's network slot).
 func (s *server) lookup(id string) (*fc.MicroVM, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

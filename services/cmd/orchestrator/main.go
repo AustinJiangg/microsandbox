@@ -2,9 +2,10 @@
 //
 //   - a gRPC SandboxService (grpc.go) -- the lifecycle seam the api calls (Create /
 //     Delete / List); this is E2B's api -> orchestrator boundary.
-//   - an HTTP data proxy (dataproxy.go) -- the vsock bridge to the in-VM daemon, routed
-//     by the X-Sandbox-Id header. GET /health on this port is the orchestrator's own
-//     liveness (no sandbox id); every other request is proxied into a VM.
+//   - an HTTP data proxy (dataproxy.go) -- the TCP bridge to the in-VM daemon over the
+//     VM's NIC (Stage 12 retired vsock), routed by the X-Sandbox-Id + X-Sandbox-Port
+//     headers. GET /health on this port is the orchestrator's own liveness (no sandbox
+//     id); every other request is proxied into a VM.
 //
 // It still owns the microVM fleet + warm pool (server.go). This file wires flags, starts
 // both listeners, and tears everything down (destroying all VMs) on a signal.
@@ -32,7 +33,7 @@ import (
 
 func main() {
 	grpcAddr := flag.String("grpc-addr", "127.0.0.1:9090", "host:port for the gRPC SandboxService (the api calls this)")
-	proxyAddr := flag.String("proxy-addr", "127.0.0.1:5007", "host:port for the HTTP data proxy (vsock bridge to envd)")
+	proxyAddr := flag.String("proxy-addr", "127.0.0.1:5007", "host:port for the HTTP data proxy (TCP bridge to envd over the VM's NIC)")
 	vendorDir := flag.String("vendor-dir", "vendor",
 		"directory holding firecracker / vmlinux / rootfs.ext4 / snapshot")
 	poolSize := flag.Int("pool-size", 0,
@@ -67,7 +68,7 @@ func main() {
 	pb.RegisterSandboxServiceServer(grpcServer, &sandboxService{srv: srv})
 	pbtmpl.RegisterTemplateServiceServer(grpcServer, newTemplateService(tmplBuilder))
 
-	// 2) HTTP data proxy -- the vsock bridge, routed by X-Sandbox-Id. The "GET /health"
+	// 2) HTTP data proxy -- the TCP bridge to the VM's NIC, routed by X-Sandbox-Id + Port. The "GET /health"
 	// pattern is more specific than "/", so the orchestrator's own liveness never gets
 	// proxied into a VM (and nothing proxies GET /health to a sandbox anyway).
 	proxyMux := http.NewServeMux()
