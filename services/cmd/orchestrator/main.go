@@ -42,13 +42,15 @@ func main() {
 	flag.Var(&poolFlags, "pool", "pre-warm K VMs of a named template (repeatable): --pool name=K")
 	scriptsDir := flag.String("scripts-dir", "",
 		"dir with build-rootfs.sh / build-snapshot.sh for template builds (default: sibling of --vendor-dir)")
+	useUffd := flag.Bool("uffd", false,
+		"restore snapshots over a userfaultfd page-fault handler (pkg/uffd) instead of the File backend (Stage 13; default off until proven on this box)")
 	flag.Parse()
 
 	poolSpecs, err := parsePoolSpecs(poolFlags, *poolSize)
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := newServer(*vendorDir, poolSpecs)
+	srv := newServer(*vendorDir, poolSpecs, *useUffd)
 
 	// Template builder (Stage 10): the scripts dir defaults to the sibling of vendor (their
 	// repo layout), overridable by flag. The builder writes artifacts in place under
@@ -88,8 +90,8 @@ func main() {
 			log.Fatalf("data proxy serve: %v", err)
 		}
 	}()
-	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, scripts=%s, pools=%v)",
-		*grpcAddr, *proxyAddr, *vendorDir, sd, poolSpecs)
+	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, scripts=%s, pools=%v, uffd=%v)",
+		*grpcAddr, *proxyAddr, *vendorDir, sd, poolSpecs, *useUffd)
 
 	// Graceful shutdown: stop accepting, then destroy every VM so we never leak
 	// firecracker processes (killing the process destroys the whole VM).

@@ -23,6 +23,7 @@ import (
 
 	"microsandbox/services/pkg/network"
 	"microsandbox/services/pkg/template"
+	"microsandbox/services/pkg/uffd"
 )
 
 // Firecracker microVM topology -- must match the rootfs's /init and the snapshot.
@@ -52,6 +53,11 @@ type MicroVM struct {
 	// daemon at Slot.RoutableIP over TCP. Set on every VM (cold-start + restore); Destroy frees it.
 	Slot   *network.Slot
 	netMgr *network.Manager
+
+	// uffd is the userfaultfd page-fault handler, set only when this VM was restored over the
+	// Uffd memory backend (--uffd, Stage 13b); nil for the File backend and for cold starts.
+	// Destroy stops it after firecracker dies, so the memfile mmap + fds don't leak.
+	uffd *uffd.Handler
 }
 
 // NewID mints a unique sandbox id (no external uuid dependency).
@@ -168,7 +174,12 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 // is the netns). Through Stage 11 this same per-VM isolation was done for the vsock UDS via
 // vsock_override; Stage 12 replaced vsock with the netns. See docs/STAGE5_DESIGN.md +
 // docs/STAGE12_DESIGN.md.
-func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manager) (*MicroVM, error) {
+//
+// useUffd selects the snapshot memory backend (Stage 13b): false = File (firecracker mmaps
+// the memfile and the kernel demand-pages it); true = Uffd (a pkg/uffd handler we start
+// becomes the VM's memory supplier, serving each guest page fault from the memfile). The
+// File path is unchanged, so the default behavior is identical. See docs/STAGE13_DESIGN.md.
+func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manager, useUffd bool) (*MicroVM, error) {
 	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
 	}
@@ -223,16 +234,46 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 	vm.Slot = slot
 	vm.netMgr = netMgr
 
+	// Choose the snapshot memory backend. Default File: firecracker mmaps the memfile and the
+	// kernel demand-pages it, with us on the outside. With --uffd we instead start our own
+	// userfaultfd handler (pkg/uffd) and point firecracker at its socket, so the first touch of
+	// each guest page faults out to us and we copy it in from the memfile -- we become the VM's
+	// memory supplier (Stage 13b). See docs/STAGE13_DESIGN.md.
+	memBackend := map[string]any{"backend_type": "File", "backend_path": memfile}
+	if useUffd {
+		// The handler must be listening BEFORE /snapshot/load: firecracker connects to its socket
+		// during the load to hand over the uffd fd + guest layout. Record it on the VM right away
+		// so a later failure (or Destroy) stops it and unmaps the memfile.
+		udsPath := filepath.Join(workdir, "uffd.sock")
+		h, herr := uffd.Serve(udsPath, memfile)
+		if herr != nil {
+			vm.Destroy()
+			return nil, fmt.Errorf("start uffd handler: %w", herr)
+		}
+		vm.uffd = h
+		memBackend = map[string]any{"backend_type": "Uffd", "backend_path": udsPath}
+	}
+
 	// Snapshot load + resume can't go through --config-file, so use the REST API.
 	status, err := firecrackerAPI(apiSock, "PUT", "/snapshot/load", map[string]any{
 		"snapshot_path": vmstate,
-		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": memfile},
+		"mem_backend":   memBackend,
 		"resume_vm":     true,
 	}, 15*time.Second)
 	if err != nil || (status != 200 && status != 204) {
 		tail := vm.ConsoleTail()
 		vm.Destroy()
 		return nil, fmt.Errorf("snapshot/load failed: status=%d err=%v; %s", status, err, tail)
+	}
+	// With UFFD the handshake (fd + layout) completes during the load above. If the handler hit a
+	// fatal error receiving it, the guest would hang on its first page fault, so surface it now
+	// rather than waiting for the health probe to time out (Decision 3).
+	if vm.uffd != nil {
+		if herr := vm.uffd.Err(); herr != nil {
+			tail := vm.ConsoleTail()
+			vm.Destroy()
+			return nil, fmt.Errorf("uffd handler failed during snapshot load: %w; %s", herr, tail)
+		}
 	}
 	return vm, nil
 }
@@ -281,6 +322,13 @@ func (vm *MicroVM) Destroy() {
 			_ = vm.proc.Process.Kill()
 			<-done
 		}
+	}
+	// Stop the UFFD handler if this VM was restored over the Uffd backend (Stage 13b). firecracker
+	// is dead now, so its uffd has already hit EOF; Stop also wakes the loop deterministically,
+	// waits for it to munmap the memfile, and removes the socket -- no fd/mapping leaks across the
+	// warm pool's churn (Decision 5). nil (the File backend / cold start) makes this a no-op.
+	if vm.uffd != nil {
+		vm.uffd.Stop()
 	}
 	if vm.workdir != "" {
 		os.RemoveAll(vm.workdir)

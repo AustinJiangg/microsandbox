@@ -11,6 +11,7 @@ own unit tests now live in Go (services/pkg/proxy/proxy_test.go -- TCP since Sta
 import functools
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import time
@@ -185,6 +186,11 @@ def control_plane(tmp_path_factory):
     # the sudoers drop-in grants SETENV + !secure_path for exactly this command.
     orch_cmd = [str(repo_root / "vendor" / "orchestrator"),
                 "--grpc-addr", grpc_addr, "--proxy-addr", proxy_addr, "--vendor-dir", vendor]
+    # Stage 13b: MSB_ORCH_FLAGS passes extra orchestrator flags through to the binary -- set it
+    # to "--uffd" to exercise the UFFD snapshot-restore backend with this same e2e suite. Default
+    # empty keeps the File backend, so ordinary runs are unchanged. Appended before the sudo wrap
+    # so the flags reach the orchestrator, not sudo.
+    orch_cmd += shlex.split(os.environ.get("MSB_ORCH_FLAGS", ""))
     if os.geteuid() != 0:
         orch_cmd = ["sudo", "-n", "-E"] + orch_cmd
     orch = subprocess.Popen(orch_cmd, stdout=orch_log, stderr=subprocess.STDOUT)

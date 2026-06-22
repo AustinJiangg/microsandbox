@@ -24,6 +24,7 @@ type server struct {
 	vendorDir string
 	pools     map[string]*pool.Pool // template name -> its warm pool; empty when no --pool/--pool-size
 	net       *network.Manager      // Stage 12: per-sandbox netns/TAP/veth/DNAT slots (cold-start + restore paths)
+	useUffd   bool                  // Stage 13b: restore snapshots over the Uffd backend (--uffd) instead of File
 
 	mu        sync.Mutex             // guards sandboxes
 	sandboxes map[string]*fc.MicroVM // sandbox id -> running VM
@@ -38,19 +39,20 @@ const networkSlots = 256
 // a from_snapshot create for that template is served in ~ms. An empty poolSpecs keeps
 // the original behavior of restoring on the request path. The pool's "make one VM"
 // step is restoreHealthy -- the same one the unpooled from_snapshot path uses.
-func newServer(vendorDir string, poolSpecs map[string]int) *server {
+func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool) *server {
 	s := &server{
 		vendorDir: vendorDir,
 		sandboxes: map[string]*fc.MicroVM{},
 		pools:     map[string]*pool.Pool{},
 		net:       network.NewManager(networkSlots),
+		useUffd:   useUffd,
 	}
 	for name, k := range poolSpecs {
 		// name was validated by parsePoolSpecs, so resolve cannot fail. tmpl is a
 		// fresh per-iteration variable, so each closure captures its own template.
 		tmpl, _ := template.Resolve(vendorDir, name)
 		p := pool.New(k, func() (pool.VM, error) {
-			vm, err := restoreHealthy(vendorDir, tmpl, s.net)
+			vm, err := restoreHealthy(vendorDir, tmpl, s.net, s.useUffd)
 			if err != nil {
 				return nil, err
 			}
@@ -131,7 +133,7 @@ func (s *server) create(fromSnapshot bool, tmpl template.Template) (*fc.MicroVM,
 			vm = v.(*fc.MicroVM) // the pool only ever holds *fc.MicroVM (newServer's restore)
 		}
 	case fromSnapshot:
-		vm, err = restoreHealthy(s.vendorDir, tmpl, s.net)
+		vm, err = restoreHealthy(s.vendorDir, tmpl, s.net, s.useUffd)
 	default:
 		vm, err = spawnHealthy(s.vendorDir, tmpl, s.net)
 	}
@@ -205,8 +207,8 @@ func healthyOrDestroy(vm *fc.MicroVM, err error) (*fc.MicroVM, error) {
 
 // restoreHealthy / spawnHealthy mint an id, create a VM (restored from the snapshot /
 // cold-started), and block until it is healthy.
-func restoreHealthy(vendorDir string, tmpl template.Template, netMgr *network.Manager) (*fc.MicroVM, error) {
-	return healthyOrDestroy(fc.Restore(fc.NewID(), vendorDir, tmpl, netMgr))
+func restoreHealthy(vendorDir string, tmpl template.Template, netMgr *network.Manager, useUffd bool) (*fc.MicroVM, error) {
+	return healthyOrDestroy(fc.Restore(fc.NewID(), vendorDir, tmpl, netMgr, useUffd))
 }
 
 func spawnHealthy(vendorDir string, tmpl template.Template, netMgr *network.Manager) (*fc.MicroVM, error) {
