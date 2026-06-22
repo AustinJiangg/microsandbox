@@ -1,6 +1,6 @@
 # Stage 13 design: UFFD lazy snapshot restore (become the VM's memory supplier)
 
-> Status: **planned (13a → 13b → 13c).** The first of the roadmap's remaining *deferred*
+> Status: **done (13a + 13b + 13c).** The first of the roadmap's remaining *deferred*
 > items (`docs/E2B_ALIGNMENT_ROADMAP.md` §5 "Still deferred"). Today a restored VM gets its
 > memory from a `File` backend — firecracker `mmap`s the whole `memfile` and the kernel
 > demand-pages it, with **us on the outside**. This stage flips the snapshot-load memory
@@ -17,7 +17,15 @@
 > the source no longer has to be a local file — it can be object storage, a remote node, or a
 > page cache shared across the fleet. That is exactly why E2B uses UFFD, and it is the
 > precondition for the roadmap's "storage swaps go live" work. This doc does **not** claim a
-> speedup; 13b measures the real number and we report it as-is.
+> speedup; 13b measured the real number and reports it as-is.
+>
+> **Outcome (measured, this WSL2 box).** Unpooled restore-to-ready is **~0.54s with `--uffd` vs
+> ~0.57s with `File` — identical within run-to-run noise** (the ~0.5s of per-sandbox `ip` setup
+> from Stage 12 dominates both); the warm pool hands out in **~11–25ms either way** (it pre-warms
+> off the request path, so its latency is backend-independent); and the Python e2e passes
+> **37/37 on both backends**. As predicted, no single-box speedup — so **`File` stays the default
+> and `--uffd` is opt-in** (Decision 3). What's banked is the `userfaultfd` mechanism and the
+> now-pluggable page source, not latency.
 
 ## 1. Goal & non-goals
 

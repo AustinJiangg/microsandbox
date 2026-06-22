@@ -152,9 +152,21 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   the "fully offline" claim is reworded to "inbound-reachable, outbound-denied by default" — still
   a learning implementation, **not security-audited**, never safe to expose to untrusted input. e2e
   37/37 (behavioral, pure TCP). See `docs/STAGE12_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): UFFD lazy snapshot restore; the storage
-  swaps go live (SQLite→Postgres, in-mem→Redis, Local→object storage); then auth, multi-host
-  scheduling, a TypeScript SDK.
+- **Done (Stage 13 — UFFD lazy snapshot restore)**: restore can now serve guest RAM over a
+  **`userfaultfd`** handler we own instead of firecracker's `File` backend. 13a added
+  `services/pkg/uffd` (a pure-Go page-fault handler — the kernel ABI derived via `_IOWR`,
+  `SCM_RIGHTS` fd reception, the fault→memfile-offset math, an epoll `UFFDIO_COPY`/`UFFDIO_ZEROPAGE`
+  serve loop; the tree's only `ioctl`/`unsafe`/`mmap` code, `//go:build linux`, KVM-free unit
+  tests); 13b wired it into `fc.Restore` behind an orchestrator **`--uffd`** flag (handler started
+  before `/snapshot/load`, held on `MicroVM`, stopped in `Destroy`); 13c confirmed the warm pool
+  under UFFD + finalized docs. **Honest result: not a single-box speedup** — unpooled restore
+  ~0.54s (UFFD) vs ~0.57s (File), within noise (per-sandbox `ip` setup dominates); warm-pool
+  hand-out ~11–25ms either way; **e2e 37/37 on both backends**. So **`File` stays the default,
+  `--uffd` is opt-in** — the win banked is the `userfaultfd` mechanism and a now-pluggable page
+  source (the precondition for the storage swaps). See `docs/STAGE13_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): the storage swaps go live
+  (SQLite→Postgres, in-mem→Redis, Local→object storage — UFFD makes the memfile source
+  pluggable); then auth, multi-host scheduling, a TypeScript SDK.
 
 ## Development conventions
 

@@ -330,3 +330,43 @@ and on restore skip the kernel boot for millisecond-scale readiness.
   fixed, so only one VM can be restored at a time. Concurrent restore + a warm pool
   (one base snapshot forked into N second-scale sandboxes) needs a per-VM uds
   override — a future enhancement.
+  *(Resolved since: Stage 5's `vsock_override`, then Stage 12's per-VM netns/TAP, let
+  N restore from one snapshot at once; the warm pool is the ms-latency path.)*
+
+### Lazy restore over userfaultfd (Stage 13, `--uffd`)
+
+The restore above uses the **`File`** memory backend: firecracker `mmap`s the 512MB
+`memfile` and the guest kernel demand-pages it, with the host kernel doing the work. Stage
+13 added an alternative **`Uffd`** backend behind an orchestrator `--uffd` flag: guest RAM
+starts empty, every first touch of a page faults out to a **handler we own**
+(`services/pkg/uffd`, a goroutine in the orchestrator), and the handler copies that page in
+from the `memfile` with `UFFDIO_COPY`. *We* become the VM's memory supplier.
+
+- **Mechanism**: firecracker creates the `userfaultfd`, registers guest RAM as MISSING, and
+  during `PUT /snapshot/load` hands the handler — over a Unix socket — the uffd fd (via
+  `SCM_RIGHTS`) plus the guest memory layout (JSON). The handler then `epoll`s the uffd fd and
+  serves each `UFFD_EVENT_PAGEFAULT` by aligning the address down, finding its region, and
+  copying one page from the right `memfile` offset. The ioctl request numbers / structs / event
+  tags aren't in Go's stdlib, so `pkg/uffd` derives them from the kernel ABI (the `_IOWR` macro);
+  it is the only package in the tree with raw `ioctl`/`unsafe`/`mmap` code. `Destroy` stops the
+  handler after firecracker exits (clean `munmap`, no fd leak across the warm pool's churn).
+- **Measured (this machine, WSL2)** — unpooled restore-to-ready, median of 6:
+
+  | Backend | Restore-to-ready (unpooled) | Warm-pool hand-out |
+  |---------|-----------------------------|--------------------|
+  | `File` (default) | ~0.57s | ~11–25ms |
+  | `Uffd` (`--uffd`) | ~0.54s | ~11–25ms |
+
+  **No meaningful difference** — the two are within run-to-run noise, because the ~0.5s of
+  sequential per-sandbox `ip` setup (Stage 12) dominates both, and the warm pool pays neither
+  on the request path (so its hand-out is backend-independent). On one box UFFD is **not** a
+  speedup — a per-fault user-space round-trip can even be marginally slower; we measured it and
+  report it as-is.
+- **Why it's in anyway** (the learning charter): (1) `userfaultfd` is the page-fault-interception
+  primitive behind Firecracker, gVisor, CRIU and QEMU post-copy migration; and (2) once *we*
+  supply the pages, the source no longer has to be a local file — it can be object storage, a
+  peer node, or a shared cache. That is the precondition for the roadmap's "storage swaps go
+  live" work, and exactly why E2B uses UFFD.
+- **Default**: `File` stays the default; `--uffd` is opt-in. The data gives no latency reason to
+  flip it on a single machine. The whole Python e2e passes identically on both backends (37/37),
+  so the choice is invisible to the wire. See `docs/STAGE13_DESIGN.md`.

@@ -14,9 +14,10 @@
 > `code-interpreter` — which **ended the byte-stable-protocol discipline**; the e2e oracle is
 > now behavioral), and **12 (per-sandbox TAP/netns networking; the data path flipped vsock →
 > TCP routed by real `<port>-<id>` hostnames; user-port exposure; vsock retired — reversing
-> Decision D1)** are **done** — see their design docs and the "Done" list in `CLAUDE.md`. The
-> remainder (UFFD lazy restore + the storage swaps going live, then auth / multi-host / a TS
-> SDK) is the **deferred** forward plan.
+> Decision D1)**, and **13 (UFFD lazy snapshot restore behind `--uffd`; `File` stays the
+> default)** are **done** — see their design docs and the "Done" list in `CLAUDE.md`. The
+> remainder (the storage swaps going live, then auth / multi-host / a TS SDK) is the
+> **deferred** forward plan.
 
 ## 1. Why this document
 
@@ -175,10 +176,16 @@ build now; E2B's layered-step cache is a noted later enhancement.)
   retired. (Reversed D1.) **Scope note:** UFFD lazy restore and the storage swaps the
   roadmap had grouped here were *deferred to their own later stages* — Stage 12 was
   networking-only (see `docs/STAGE12_DESIGN.md`).
+- **Stage 13 — UFFD lazy snapshot restore.** ✅ `services/pkg/uffd` page-fault handler serves
+  guest RAM from the memfile over `userfaultfd`; wired into `fc.Restore` behind `--uffd`
+  (default off). Measured no single-box speedup (restore ~0.54s UFFD vs ~0.57s File, within
+  noise; warm pool ~11–25ms either way; e2e 37/37 on both backends), so `File` stays the
+  default — the win is the mechanism + a now-pluggable page source. See `docs/STAGE13_DESIGN.md`.
 
 ### Still deferred
-- **UFFD lazy snapshot restore**, then the storage swaps become live:
-  SQLite→Postgres, in-mem→Redis, Local→object storage.
+- **The storage swaps go live:** SQLite→Postgres, in-mem→Redis, Local→object storage. UFFD
+  (Stage 13) already made the memfile page source pluggable — the precondition for sourcing
+  snapshot memory from object storage / a peer node rather than a local file.
 - **Later — production fidelity.** Auth (`X-API-Key`→team), multi-host scheduling (real
   node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource limits
   and start/ready commands.
