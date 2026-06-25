@@ -42,7 +42,14 @@ func (s *clientProxy) handleData(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed host, want <port>-<sandboxId>"})
 		return
 	}
-	node, found := s.catalog.Get(id)
+	node, found, err := s.catalog.Get(id)
+	if err != nil {
+		// The catalog (Redis) is unreachable: a dependency failure, not a missing sandbox.
+		// 502 (not 404) so a transient Redis outage isn't mistaken for "no such sandbox" --
+		// the same status the api uses for catalog trouble on the write path.
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "catalog lookup failed: " + err.Error()})
+		return
+	}
 	if !found {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no route for sandbox: " + id})
 		return

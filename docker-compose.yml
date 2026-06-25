@@ -1,0 +1,18 @@
+# Provisioning for the control plane's shared state (Stage 14). Redis backs the sandbox
+# routing catalog (services/pkg/catalog) that the api writes and client-proxy reads;
+# Postgres for the metadata store lands in Stage 14b. The e2e fixture (tests/conftest.py)
+# and scripts/dev-up.sh bring these up, reusing them if already running.
+#
+# Dev/test only: no auth, bound to loopback. This is a learning setup -- NOT security-audited
+# and NOT safe to expose. See docs/STAGE14_DESIGN.md.
+services:
+  redis:
+    image: redis:7-alpine
+    # Loopback-only publish: the catalog must never be reachable off-box.
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

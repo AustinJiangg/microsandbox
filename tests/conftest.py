@@ -13,6 +13,7 @@ import os
 import pathlib
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 import urllib.request
@@ -144,17 +145,60 @@ def _wait_healthy(url: str, proc: subprocess.Popen, log_path: pathlib.Path) -> N
     raise RuntimeError(f"{url} did not become healthy; see {log_path}")
 
 
+def _port_open(host: str, port: int) -> bool:
+    """True if a TCP connect to host:port succeeds (used to detect / wait for Redis)."""
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def ensure_redis() -> str:
+    """Bring up the Redis that backs the sandbox routing catalog (Stage 14a), and return its
+    address. Reuses one already listening on :6379 (a dev instance or a prior session).
+
+    docker is already required (the microVM rootfs is exported from a docker image), so this
+    adds no new *class* of dependency; a failure here is loud, not a skip -- that is the
+    meaning of "flip the default" (docs/STAGE14_DESIGN.md, Decision 5). docker-compose.yml is
+    the canonical spec, so we prefer `docker compose`; on engines whose docker has no compose
+    plugin we fall back to a plain `docker run` of the same image, so the suite still runs.
+    """
+    host, port = "127.0.0.1", 6379
+    addr = f"{host}:{port}"
+    if _port_open(host, port):
+        return addr  # reuse a Redis already up
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    compose = ["docker", "compose", "-f", str(repo_root / "docker-compose.yml"),
+               "up", "-d", "--wait", "redis"]
+    if subprocess.run(compose, capture_output=True).returncode != 0:
+        # No compose plugin: provision the same image directly via the engine.
+        subprocess.run(["docker", "rm", "-f", "microsandbox-redis"], capture_output=True)
+        subprocess.run(
+            ["docker", "run", "-d", "--name", "microsandbox-redis",
+             "-p", f"{host}:{port}:6379", "redis:7-alpine"],
+            check=True,
+        )
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if _port_open(host, port):
+            return addr
+        time.sleep(0.1)
+    raise RuntimeError(f"redis at {addr} did not come up within 30s")
+
+
 @pytest.fixture(scope="session")
 def control_plane(tmp_path_factory):
     """Build and run the Go services (orchestrator + client-proxy + api) once per session.
 
     Stage 8b split the control plane into orchestrator (gRPC SandboxService + the data
-    proxy, TCP over the VM's NIC since Stage 12) and api (public REST). Stage 9 adds client-proxy (the edge data proxy that
-    owns the routing catalog): the api registers each sandbox's route in client-proxy on
-    create, and -- once Stage 9b lands -- the SDK sends the data path through client-proxy.
-    Registration is load-bearing (a create rolls back if it fails), so the trio must all be
-    up here. The SDK talks to the api (lifecycle) so this fixture yields the api base URL.
-    Skips the whole microVM group when go / firecracker / kvm are unavailable.
+    proxy, TCP over the VM's NIC since Stage 12) and api (public REST). Stage 9 added
+    client-proxy (the edge data proxy); Stage 14a moved the routing catalog into a shared
+    Redis the api writes on create and client-proxy reads to route. Registration is
+    load-bearing (a create rolls back if the Redis write fails), so the trio plus Redis must
+    all be up here. The SDK talks to the api (lifecycle) so this fixture yields the api base
+    URL. Skips the whole microVM group when go / firecracker / kvm are unavailable.
     """
     if not firecracker_available():
         pytest.skip("firecracker/kernel/kvm incomplete, skipping microVM cases")
@@ -170,8 +214,9 @@ def control_plane(tmp_path_factory):
 
     vendor = str(repo_root / "vendor")
     api_addr, grpc_addr, proxy_addr = "127.0.0.1:8099", "127.0.0.1:9099", "127.0.0.1:5099"
-    cp_data_addr, cp_internal_addr = "127.0.0.1:8098", "127.0.0.1:5098"
+    cp_data_addr = "127.0.0.1:8098"
     base_url = f"http://{api_addr}"
+    redis_addr = ensure_redis()  # the shared routing catalog the api writes + client-proxy reads
 
     logdir = tmp_path_factory.mktemp("services")
     orch_log = open(logdir / "orchestrator.log", "wb")
@@ -197,18 +242,18 @@ def control_plane(tmp_path_factory):
     cp = api = None
     try:
         # Start order: orchestrator (the api dials it for lifecycle), then client-proxy
-        # (the api writes routes to it), then the api; wait on each one's /health.
+        # (reads the shared Redis catalog), then the api (writes it); wait on each /health.
         _wait_healthy(f"http://{proxy_addr}/health", orch, logdir / "orchestrator.log")
         cp = subprocess.Popen(
             [str(repo_root / "vendor" / "client-proxy"),
-             "--addr", cp_data_addr, "--internal-addr", cp_internal_addr],
+             "--addr", cp_data_addr, "--redis-addr", redis_addr],
             stdout=cp_log, stderr=subprocess.STDOUT,
         )
         _wait_healthy(f"http://{cp_data_addr}/health", cp, logdir / "client-proxy.log")
         api = subprocess.Popen(
             [str(repo_root / "vendor" / "api"), "--addr", api_addr,
              "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr,
-             "--client-proxy-internal", cp_internal_addr,
+             "--redis-addr", redis_addr,
              "--data-url", f"http://{cp_data_addr}",
              "--db", str(logdir / "microsandbox.db")],
             stdout=api_log, stderr=subprocess.STDOUT,

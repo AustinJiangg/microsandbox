@@ -39,11 +39,12 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register the sandbox's data-path route in the catalog (client-proxy reads it to
-	// route data requests). This is load-bearing -- a sandbox with no route is unreachable
-	// -- so on failure we roll the just-built VM back (gRPC Delete) rather than return a
-	// booted-but-unroutable zombie. (E2B's api writes the Redis catalog here.)
-	if err := a.catalog.Register(resp.GetSandboxId(), a.nodeAddr); err != nil {
+	// Register the sandbox's data-path route in the catalog (a Redis SET; client-proxy reads
+	// it to route data requests). This is load-bearing -- a sandbox with no route is
+	// unreachable -- so on failure (e.g. Redis down) we roll the just-built VM back (gRPC
+	// Delete) rather than return a booted-but-unroutable zombie. This is a direct Redis write
+	// now (Stage 14a), exactly like E2B's api; before 14a it went over an RPC to client-proxy.
+	if err := a.catalog.Set(resp.GetSandboxId(), a.nodeAddr); err != nil {
 		rb, cancelRB := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelRB()
 		if _, derr := a.client.Delete(rb, &pb.SandboxDeleteRequest{SandboxId: resp.GetSandboxId()}); derr != nil {
@@ -82,7 +83,9 @@ func (a *api) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	}
 	// Drop the catalog route (best-effort: a stale route only yields a self-healing 404)
 	// and the durable metadata row.
-	a.catalog.Deregister(id)
+	if err := a.catalog.Delete(id); err != nil {
+		log.Printf("catalog: delete route %s: %v", id, err)
+	}
 	if err := a.store.DeleteSandbox(id); err != nil {
 		log.Printf("store: delete %s: %v", id, err)
 	}

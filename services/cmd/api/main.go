@@ -2,10 +2,11 @@
 // Stage 9c it is lifecycle-only: it owns no VMs and never touches the data path. Sandbox
 // lifecycle (POST/DELETE/GET /sandboxes) is delegated to the orchestrator over gRPC, the
 // durable record of which sandboxes exist is kept in a metadata store (SQLite, Stage 8c
-// -- E2B uses Postgres), and on create the api registers the sandbox's data route in
-// client-proxy's catalog (returning the data_url the SDK posts the data path to). The
-// data plane goes SDK -> client-proxy -> orchestrator -> the VM's NIC (TCP) -> envd,
-// never through here. See docs/STAGE9_DESIGN.md.
+// -- E2B uses Postgres), and on create the api registers the sandbox's data route in the
+// catalog (a shared Redis since Stage 14a, which client-proxy reads to route data; before
+// 14a the api wrote it over an internal RPC to client-proxy). It returns the data_url the
+// SDK posts the data path to. The data plane goes SDK -> client-proxy -> orchestrator ->
+// the VM's NIC (TCP) -> envd, never through here. See docs/STAGE14_DESIGN.md / STAGE9_DESIGN.md.
 package main
 
 import (
@@ -21,20 +22,21 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"microsandbox/services/pkg/catalog"
 	pb "microsandbox/services/pkg/grpc/orchestrator"
 	pbt "microsandbox/services/pkg/grpc/templatemanager"
 	"microsandbox/services/pkg/store"
 )
 
 // api holds the gRPC client to the orchestrator (lifecycle), the metadata store (durable
-// record), the catalog client (registers each sandbox's data-path route in client-proxy),
-// and the node value it registers. As of Stage 9c the api is lifecycle-only -- it no
-// longer proxies the data path.
+// record), the catalog (writes each sandbox's data-path route to the shared Redis that
+// client-proxy reads), and the node value it registers. As of Stage 9c the api is
+// lifecycle-only -- it no longer proxies the data path.
 type api struct {
 	client    pb.SandboxServiceClient
 	templates pbt.TemplateServiceClient
 	store     *store.Store
-	catalog   *catalogClient
+	catalog   catalog.Catalog
 	nodeAddr  string // the node (orchestrator data-proxy addr) registered for each sandbox
 	dataURL   string // the public client-proxy data URL handed back to the SDK (where to send data)
 }
@@ -43,7 +45,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "host:port for the public REST API (the SDK's base URL)")
 	orchGRPC := flag.String("orchestrator-grpc", "127.0.0.1:9090", "orchestrator gRPC address (SandboxService)")
 	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address: the node value registered in the catalog for each sandbox")
-	clientProxyInternal := flag.String("client-proxy-internal", "127.0.0.1:5008", "client-proxy internal control address (the api writes sandbox routes here)")
+	redisAddr := flag.String("redis-addr", "127.0.0.1:6379", "Redis address holding the sandbox routing catalog (the api writes routes here on create/destroy)")
 	dataURL := flag.String("data-url", "http://127.0.0.1:8081", "public client-proxy data URL returned to the SDK as where to send the data path")
 	db := flag.String("db", "vendor/microsandbox.db", "path to the SQLite metadata database")
 	flag.Parse()
@@ -63,11 +65,15 @@ func main() {
 	}
 	defer st.Close()
 
+	// The routing catalog: a shared Redis the api writes (here) and client-proxy reads.
+	cat := catalog.NewRedis(*redisAddr)
+	defer cat.Close()
+
 	a := &api{
 		client:    pb.NewSandboxServiceClient(conn),
 		templates: pbt.NewTemplateServiceClient(conn),
 		store:     st,
-		catalog:   newCatalogClient(*clientProxyInternal),
+		catalog:   cat,
 		nodeAddr:  *orchProxy,
 		dataURL:   *dataURL,
 	}
@@ -97,8 +103,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, client-proxy-internal=%s, data-url=%s, db=%s)",
-		*addr, *orchGRPC, *orchProxy, *clientProxyInternal, *dataURL, *db)
+	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, redis=%s, data-url=%s, db=%s)",
+		*addr, *orchGRPC, *orchProxy, *redisAddr, *dataURL, *db)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

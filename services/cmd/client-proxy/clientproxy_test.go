@@ -2,8 +2,9 @@ package main
 
 // Unit tests for the edge data proxy, KVM-free: a local httptest server impersonates the
 // orchestrator data proxy (which would otherwise bridge to a VM over TCP), so we cover
-// <port>-<id> hostname routing, the 400/404 error paths, streaming, and the internal route
-// register/deregister endpoints without booting a microVM.
+// <port>-<id> hostname routing, the 400/404 error paths, and streaming without booting a
+// microVM. The catalog here is an InMemory test double; the live Redis backend is covered
+// in services/pkg/catalog/redis_test.go.
 
 import (
 	"bufio"
@@ -125,55 +126,4 @@ func TestHandleDataStreamsSSE(t *testing.T) {
 	if !sawStdout || !sawEnd {
 		t.Fatalf("streamed SSE missing events (stdout=%v end=%v)", sawStdout, sawEnd)
 	}
-}
-
-// The internal control endpoints register and deregister a route, observable via the
-// data path (404 before register, routed after, 404 again after deregister).
-func TestInternalRouteSetAndDelete(t *testing.T) {
-	cp := newTestProxy()
-	internal := httptest.NewServer(routesMux(cp))
-	defer internal.Close()
-
-	// PUT /routes/sb_1 {"node": "..."} -> 204, and the catalog now resolves it.
-	put, _ := http.NewRequest("PUT", internal.URL+"/routes/sb_1",
-		strings.NewReader(`{"node":"127.0.0.1:5007"}`))
-	resp, err := http.DefaultClient.Do(put)
-	if err != nil {
-		t.Fatalf("PUT: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("PUT status = %d, want 204", resp.StatusCode)
-	}
-	if node, ok := cp.catalog.Get("sb_1"); !ok || node != "127.0.0.1:5007" {
-		t.Fatalf("after PUT, catalog = (%q, %v), want (127.0.0.1:5007, true)", node, ok)
-	}
-
-	// A node-less body is rejected.
-	bad, _ := http.NewRequest("PUT", internal.URL+"/routes/sb_2", strings.NewReader(`{}`))
-	if resp, _ := http.DefaultClient.Do(bad); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("PUT with empty node: status = %d, want 400", resp.StatusCode)
-	}
-
-	// DELETE /routes/sb_1 -> 204, and the catalog no longer resolves it.
-	del, _ := http.NewRequest("DELETE", internal.URL+"/routes/sb_1", nil)
-	resp, err = http.DefaultClient.Do(del)
-	if err != nil {
-		t.Fatalf("DELETE: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("DELETE status = %d, want 204", resp.StatusCode)
-	}
-	if _, ok := cp.catalog.Get("sb_1"); ok {
-		t.Fatal("after DELETE, catalog still resolves sb_1")
-	}
-}
-
-// routesMux wires the internal control routes the same way main() does, for the test.
-func routesMux(cp *clientProxy) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /routes/{id}", cp.handleRouteSet)
-	mux.HandleFunc("DELETE /routes/{id}", cp.handleRouteDelete)
-	return mux
 }
