@@ -14,9 +14,10 @@
 > `code-interpreter` — which **ended the byte-stable-protocol discipline**; the e2e oracle is
 > now behavioral), and **12 (per-sandbox TAP/netns networking; the data path flipped vsock →
 > TCP routed by real `<port>-<id>` hostnames; user-port exposure; vsock retired — reversing
-> Decision D1)**, and **13 (UFFD lazy snapshot restore behind `--uffd`; `File` stays the
-> default)** are **done** — see their design docs and the "Done" list in `CLAUDE.md`. The
-> remainder (the storage swaps going live, then auth / multi-host / a TS SDK) is the
+> Decision D1)**, **13 (UFFD lazy snapshot restore behind `--uffd`; `File` stays the
+> default)**, and **14 (the storage swaps go live: catalog → Redis, store → Postgres)** are
+> **done** — see their design docs and the "Done" list in `CLAUDE.md`. The remainder (the last
+> storage swap — `Local → object storage`, Stage 15 — then auth / multi-host / a TS SDK) is the
 > **deferred** forward plan.
 
 ## 1. Why this document
@@ -80,8 +81,8 @@ interfaces:
                                                             │       • TemplateService        (build pipeline)
                                                             │       • per-node data proxy ──TCP→VM NIC──► envd :49983
                                                             │                                       (daemon/, Stage 12)
-   store: SQLite (pkg/store)  ·  catalog: in-mem (pkg/catalog)  ·  artifacts: local dir (pkg/storage)
-        all three behind E2B-shaped interfaces → swappable to Postgres / Redis / object storage later
+   store: Postgres (pkg/store; SQLite selectable)  ·  catalog: Redis (pkg/catalog)  ·  artifacts: local dir (pkg/storage)
+        store + catalog swapped to Postgres / Redis in Stage 14; artifacts → object storage is Stage 15
 ```
 
 Component → where it lives in this repo:
@@ -93,8 +94,8 @@ Component → where it lives in this repo:
 | template builder | inside orchestrator (`pkg/build` + `TemplateService`) | wraps today's `scripts/build-*.sh`; async build + status polling, exactly like E2B |
 | `client-proxy` | `services/cmd/client-proxy` | edge data proxy; **header-mode** routing (no `<port>-<id>` DNS/TLS on one box) |
 | `envd` | `daemon/` | **unchanged this round** — still the Stage-7 Go daemon (HTTP `/health /execute /files/* /commands` over vsock) |
-| Postgres+sqlc | `pkg/store` (SQLite via `modernc.org/sqlite` + `sqlc`) | pure-Go driver keeps the static-binary story; interface mirrors E2B |
-| Redis catalog | `pkg/catalog` (in-memory) | interface mirrors E2B's `sandbox-catalog` |
+| Postgres | `pkg/store` (Postgres via `jackc/pgx`, default; SQLite via `modernc.org/sqlite` selectable; Stage 14b) | both drivers pure Go (static binary); a `Store` interface, not `sqlc` — plain database/sql |
+| Redis catalog | `pkg/catalog` (Redis via `go-redis`; Stage 14a) | mirrors E2B's `sandbox-catalog`; the api writes, client-proxy reads |
 | object storage | `pkg/storage` (`Local`) | `StorageProvider` interface; `{buildID}/…` layout |
 | Nomad/Consul | — | deferred (single machine); api holds one orchestrator address by flag |
 
@@ -181,11 +182,22 @@ build now; E2B's layered-step cache is a noted later enhancement.)
   (default off). Measured no single-box speedup (restore ~0.54s UFFD vs ~0.57s File, within
   noise; warm pool ~11–25ms either way; e2e 37/37 on both backends), so `File` stays the
   default — the win is the mechanism + a now-pluggable page source. See `docs/STAGE13_DESIGN.md`.
+- **Stage 14 — the storage swaps go live (catalog → Redis, store → Postgres).** ✅ `pkg/catalog`
+  gained a `Redis` impl (the api `SET`s the route on create, client-proxy `GET`s it on each data
+  request), which let the api→client-proxy internal control RPC be **deleted**; `pkg/store` became
+  an interface with `sqlite` + `postgres` (pure-Go `jackc/pgx`) impls, `Open(dsn)` dispatching by
+  scheme, defaulting to Postgres. A repo-root `docker-compose.yml` provisions both. On one box this
+  is fidelity (a cross-process catalog, a concurrent restart-surviving store, the multi-host
+  precondition), **not** speed; e2e 37/37 on Postgres + Redis. Object storage was split out to
+  Stage 15. See `docs/STAGE14_DESIGN.md`.
 
 ### Still deferred
-- **The storage swaps go live:** SQLite→Postgres, in-mem→Redis, Local→object storage. UFFD
-  (Stage 13) already made the memfile page source pluggable — the precondition for sourcing
-  snapshot memory from object storage / a peer node rather than a local file.
+- **Stage 15 — `Local → object storage` (the last storage swap).** The non-isomorphic seam Stage
+  14 deliberately left out: the Firecracker snapshot bakes in its rootfs's absolute path, so a
+  template's `rootfs.ext4`/`snapfile` must be materialized to a local path before boot, while the
+  `memfile` can stream page-by-page from the bucket via the Stage-13 UFFD handler. UFFD already made
+  the memfile page source pluggable — the precondition for sourcing snapshot memory from object
+  storage / a peer node rather than a local file.
 - **Later — production fidelity.** Auth (`X-API-Key`→team), multi-host scheduling (real
   node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource limits
   and start/ready commands.

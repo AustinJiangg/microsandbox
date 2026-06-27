@@ -1,11 +1,13 @@
 # Stage 14 design: the storage swaps go live — catalog → Redis, store → Postgres
 
-> Status: **proposed (not started).** The first half of the roadmap's last remaining
-> *deferred* item (`docs/E2B_ALIGNMENT_ROADMAP.md` §5 "Still deferred": *"the storage swaps
-> go live: SQLite→Postgres, in-mem→Redis, Local→object storage"*). Decision D3 built all
-> three state seams behind **E2B-shaped interfaces** precisely so the swap would be a
-> one-implementation change, not a redesign. This stage cashes in two of the three:
-> **`pkg/catalog` in-mem → Redis** and **`pkg/store` SQLite → Postgres**.
+> Status: **done** (14a + 14b landed; 14c is this doc sweep). The first half of the roadmap's
+> last remaining *deferred* item (`docs/E2B_ALIGNMENT_ROADMAP.md` §5 "Still deferred": *"the
+> storage swaps go live: SQLite→Postgres, in-mem→Redis, Local→object storage"*). Decision D3
+> built all three state seams behind **E2B-shaped interfaces** precisely so the swap would be a
+> one-implementation change, not a redesign. This stage cashed in two of the three:
+> **`pkg/catalog` in-mem → Redis** (14a) and **`pkg/store` SQLite → Postgres** (14b). The third
+> (`Local → object storage`) is split out to **Stage 15** (see §10). Real-machine e2e stayed
+> **37/37** on Postgres + Redis.
 >
 > **Scope split (decided with the user).** The three seams are *not* equally hard. Catalog
 > and store are near-isomorphic — the catalog is already an interface, and the store rides
@@ -258,7 +260,7 @@ tests/conftest.py          # control_plane fixture brings compose up, points bin
 
 ## 7. Three independently verifiable sub-steps
 
-### Stage 14a — catalog → Redis; delete the control RPC
+### Stage 14a — catalog → Redis; delete the control RPC ✅
 Add `docker-compose.yml` (redis service) + the `go-redis` dep. Implement `catalog.Redis`
 (`Set`/`Get`/`Delete` over `sandbox:<id>`). Wire the api to `SET`/`DEL` Redis directly and
 client-proxy to `GET` it directly; **delete** the api `catalogClient`, the
@@ -268,7 +270,7 @@ binaries at it. Go units: `InMemory` test unchanged, `Redis` test skips unless `
 **Verify:** `go test ./services/...` green; Python e2e green against Redis (routing still
 works, create rollback still rolls back if Redis is stopped).
 
-### Stage 14b — store → Postgres behind an interface
+### Stage 14b — store → Postgres behind an interface ✅
 Add postgres to `docker-compose.yml` + the `pgx` dep. Extract the `store.Store` interface;
 rename today's body to `sqlite.go`; add `postgres.go` (the §3.2 dialect ports); make
 `Open(dsn)` dispatch by scheme. Replace the api's `--db` with `--store-dsn` (default a
@@ -277,7 +279,7 @@ points the api at the compose Postgres. Go units: sqlite test hermetic, postgres
 unless `MSB_TEST_PG_DSN`. **Verify:** `go test ./services/...` green (both store impls where
 available); Python e2e green against Postgres (sandboxes + template builds persist and list).
 
-### Stage 14c — docs, defaults, dev-up, honest review
+### Stage 14c — docs, defaults, dev-up, honest review ✅
 Finalize this doc's status; update `CLAUDE.md` (the "Done" list + the store/catalog
 descriptions + common-commands `docker compose up`), `docs/ARCHITECTURE.md` (the state-seam
 lines), and the roadmap (move the catalog+store half of "the storage swaps go live" to done;

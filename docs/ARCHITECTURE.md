@@ -12,10 +12,10 @@ it evolvable.
    POST/DELETE/GET /sandboxes                 (Host: <port>-<id> header)
         ▼                                          ▼
    api (services/cmd/api)                     client-proxy (services/cmd/client-proxy)
-   • REST front, lifecycle-only               • edge data proxy; owns the routing
-   • SQLite metadata store (pkg/store)          catalog (pkg/catalog)
-   • on create: gRPC Create, then registers   • parse Host <port>-<id> → catalog →
-     the sandbox's route in the catalog         that node's data proxy (id + port)
+   • REST front, lifecycle-only               • edge data proxy; reads the routing
+   • Postgres metadata store (pkg/store)        catalog (Redis; pkg/catalog)
+   • on create: gRPC Create, then writes      • parse Host <port>-<id> → catalog →
+     the sandbox's route into the catalog       that node's data proxy (id + port)
         │                                          │
         │ gRPC SandboxService                      │ HTTP (X-Sandbox-Id + X-Sandbox-Port)
         └──────────────▶ orchestrator ◀────────────┘
@@ -31,12 +31,12 @@ it evolvable.
 The SDK is a thin **pure-HTTP** client. It sends **lifecycle** to the **api** and the
 **data path** to **client-proxy** (it learns that URL from the create response). Stage 8
 split the old single control plane into the **api** (`services/cmd/api`, public REST +
-SQLite metadata store) calling the per-machine **orchestrator**
+Postgres metadata store) calling the per-machine **orchestrator**
 (`services/cmd/orchestrator`) over **gRPC** for the VM lifecycle. **Stage 9** added the
-**client-proxy** (`services/cmd/client-proxy`), E2B's edge data proxy: it owns a routing
-**catalog** (`pkg/catalog`, sandbox → node) that the api writes on create, and routes each
-data request by parsing its `<port>-<id>` `Host` header (Stage 12) to the right
-orchestrator's data proxy, which dials the VM's NIC over TCP. The api is now
+**client-proxy** (`services/cmd/client-proxy`), E2B's edge data proxy: it reads a routing
+**catalog** (`pkg/catalog`, sandbox → node in a shared **Redis** since Stage 14a) that the api
+writes on create, and routes each data request by parsing its `<port>-<id>` `Host` header
+(Stage 12) to the right orchestrator's data proxy, which dials the VM's NIC over TCP. The api is now
 **lifecycle-only** — the data bytes never pass through it. As of **Stage 11** the in-VM
 daemon is **two ConnectRPC services** (E2B's `envd` + a separate `code-interpreter`), and
 **Stage 12** put them on **two TCP ports** over the VM's NIC (`:49983` / `:49999`) reached by
@@ -122,16 +122,17 @@ the template builder:
 
 - **`cmd/api`** — the public REST front, now **lifecycle-only** for sandboxes
   (`POST` / `DELETE` / `GET /sandboxes`) plus the template build API (`POST /templates`,
-  `GET /templates/builds/{id}`). It owns a SQLite **metadata store** (`pkg/store`:
-  sandboxes + builds) and calls the orchestrator over **gRPC**. On create it registers the
-  sandbox's data-path route in client-proxy's catalog (and rolls the VM back if that
-  fails), then hands the SDK the `data_url`. The data bytes never pass through it.
-- **`cmd/client-proxy`** — E2B's **edge data proxy** (Stage 9). It owns the routing
-  **catalog** (`pkg/catalog`, sandbox → node; in-memory now, Redis-shaped for later), runs
-  a public data port and an internal control port (the api writes routes there), and
-  reverse-proxies each data request — routed by its `<port>-<id>` `Host` header (Stage 12;
-  the port selects the in-VM service or a user port) — to that node's orchestrator data
-  proxy. Flushing every write keeps the code-interpreter's streamed `Execute` live.
+  `GET /templates/builds/{id}`). It owns a **metadata store** (`pkg/store`: sandboxes +
+  builds; **Postgres** by default since Stage 14b, SQLite still selectable via a `sqlite://`
+  DSN) and calls the orchestrator over **gRPC**. On create it writes the sandbox's data-path
+  route directly to the shared **Redis** catalog (and rolls the VM back if that fails), then
+  hands the SDK the `data_url`. The data bytes never pass through it.
+- **`cmd/client-proxy`** — E2B's **edge data proxy** (Stage 9). It reads the routing
+  **catalog** (`pkg/catalog`, sandbox → node; a shared **Redis** since Stage 14a — the api
+  writes routes there directly, which retired the old internal control port), runs a public
+  data port, and reverse-proxies each data request — routed by its `<port>-<id>` `Host` header
+  (Stage 12; the port selects the in-VM service or a user port) — to that node's orchestrator
+  data proxy. Flushing every write keeps the code-interpreter's streamed `Execute` live.
 - **`cmd/orchestrator`** — the per-machine VM service. A gRPC `SandboxService`
   (Create / Delete / List) over `pkg/fc` (spawn / restore / destroy firecracker) and
   `pkg/pool` (the warm pool) + `pkg/network` (the per-sandbox TAP/netns slot), plus a
@@ -201,7 +202,9 @@ client-proxy + routing catalog (Stage 9, sinking the data plane off the api) →
 template builder (Stage 10, E2B's TemplateService) → the in-VM daemon rewritten as ConnectRPC
 `envd` + a separate `code-interpreter` (Stage 11, E2B's real in-VM shape) → per-sandbox
 TAP/netns networking, the data path flipped vsock → TCP routed by `<port>-<id>` hostnames,
-user-port exposure, and vsock retired (Stage 12, reversing the vsock-first decision). Through Stage 10
+user-port exposure, and vsock retired (Stage 12, reversing the vsock-first decision) → UFFD
+lazy snapshot restore behind `--uffd` (Stage 13) → the routing catalog and metadata store
+swapped onto Redis + Postgres (Stage 14). Through Stage 10
 every step followed one discipline: **add a new backend/transport implementation, keep the
 protocol byte-stable, and keep the changes out of the client as much as possible** — proven
 each time by a byte-for-byte e2e oracle. **Stage 11 deliberately broke the byte-stable rule**
@@ -222,8 +225,8 @@ staged code lives on in the git history if you want to study the progression.
 | services/cmd/client-proxy (Go) | `client-proxy` | edge data proxy; routes the data path by parsing the `<port>-<id>` `Host` header via the catalog (Stage 12; matches E2B's hostname keying) |
 | services/cmd/orchestrator (Go) | `orchestrator` | per-machine VM fleet + warm pool + per-sandbox network slot (`pkg/network`) + TCP data proxy + health + the template builder |
 | services/pkg/build + TemplateService | `template-manager` (in E2B's orchestrator) | async template builds, polled for status (Stage 10) |
-| services/pkg/store (SQLite) | the api's Postgres | durable sandbox + build metadata (E2B uses Postgres + sqlc) |
-| services/pkg/catalog (in-memory) | the `sandbox-catalog` (Redis) | sandbox → node routing the client-proxy reads (E2B uses Redis) |
+| services/pkg/store (Postgres; SQLite selectable) | the api's Postgres | durable sandbox + build metadata (E2B uses Postgres + sqlc; Stage 14b) |
+| services/pkg/catalog (Redis) | the `sandbox-catalog` (Redis) | sandbox → node routing the client-proxy reads (E2B uses Redis; Stage 14a) |
 | services/pkg/storage (Local dir) | object storage (GCS/S3) | where template artifacts live (E2B keys by build id; we publish in place) |
 | (firecracker config in services/pkg/fc) | Firecracker orchestration / jailer | microVM creation and isolation |
 | services/pkg/network | E2B's per-sandbox TAP/netns + DNAT | the per-sandbox network slot: TAP in its own netns, veth, DNAT (inbound only, no MASQUERADE) (Stage 12) |

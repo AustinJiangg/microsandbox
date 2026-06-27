@@ -42,12 +42,14 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    (kept in `src/` as reference).
 4. **control plane** — `services/` (Go module `microsandbox/services`), split into
    E2B-shaped services (Stages 8–9). **`cmd/api`** is the **lifecycle-only** public REST
-   front (owns a SQLite metadata store, `pkg/store`); it calls **`cmd/orchestrator`** over
+   front (owns a Postgres metadata store, `pkg/store` — SQLite still selectable; Stage 14b);
+   it calls **`cmd/orchestrator`** over
    **gRPC** (`SandboxService`). The orchestrator owns the microVM fleet + warm pool
    (`pkg/{fc,pool,network,template}`) and a header-routed **data proxy** (`pkg/proxy`) that
    bridges the data path to the daemon over the VM's NIC (TCP; Stage 12). **`cmd/client-proxy`**
-   (Stage 9) is the edge data proxy: it owns a routing **catalog** (`pkg/catalog`, sandbox→node,
-   written by the api on create) and routes each data request by its `<port>-<id>` `Host` header
+   (Stage 9) is the edge data proxy: it reads a shared routing **catalog** (`pkg/catalog`,
+   sandbox→node in **Redis** since Stage 14a, written by the api on create) and routes each data
+   request by its `<port>-<id>` `Host` header
    (Stage 12; the port selects the in-VM service or a user port) to the orchestrator's proxy. So the SDK talks to **two** endpoints — the api (lifecycle) and client-proxy
    (data, learned from the create response). The orchestrator also hosts a
    **`TemplateService`** (Stage 10): the api's `POST /templates` kicks an async template
@@ -164,9 +166,26 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   hand-out ~11–25ms either way; **e2e 37/37 on both backends**. So **`File` stays the default,
   `--uffd` is opt-in** — the win banked is the `userfaultfd` mechanism and a now-pluggable page
   source (the precondition for the storage swaps). See `docs/STAGE13_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): the storage swaps go live
-  (SQLite→Postgres, in-mem→Redis, Local→object storage — UFFD makes the memfile source
-  pluggable); then auth, multi-host scheduling, a TypeScript SDK.
+- **Done (Stage 14 — the storage swaps go live: catalog → Redis, store → Postgres)**: two of
+  the three state seams Decision D3 built behind E2B-shaped interfaces now use the same *kind*
+  of backend E2B does. 14a backed the routing **catalog** with a shared **Redis** (`pkg/catalog`
+  gained `redis.go`; the api `SET`s `sandbox:<id>→node` on create and client-proxy `GET`s it on
+  each data request) and **deleted the api→client-proxy internal control RPC** — a shim that only
+  existed because the map lived in one process; `InMemory` survives as a unit-test double. 14b made
+  **`pkg/store` an interface** with two impls (`sqlite.go` + a new `postgres.go` over pure-Go
+  `jackc/pgx/v5`), `Open(dsn)` dispatching by URL scheme; the api now **defaults to Postgres**
+  (`--store-dsn`, SQLite still selectable via `sqlite://`). A repo-root `docker-compose.yml` plus
+  the conftest/dev-up fixtures provision `postgres:16-alpine` + `redis:7-alpine`. **Honest: on one
+  box this is fidelity, not speed** (each adds a socket hop the in-process map / local file didn't
+  pay) — the payoff is a genuinely cross-process catalog, a store with real concurrency that
+  survives restarts, and the precondition for multi-host. Go units stay hermetic (the Redis /
+  Postgres variants skip without `REDIS_ADDR` / `MSB_TEST_PG_DSN`); real-machine e2e **37/37** on
+  Postgres + Redis (behavioral parity — the swap moved state location, not semantics). The third
+  seam (`Local → object storage`) is split to **Stage 15**. See `docs/STAGE14_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): the last storage swap (Stage 15 —
+  `Local → object storage`, materializing the rootfs/snapfile locally and streaming the memfile
+  page-by-page from the bucket via the Stage-13 UFFD handler); then auth, multi-host scheduling,
+  a TypeScript SDK.
 
 ## Development conventions
 
@@ -181,10 +200,14 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   messages are in English. Comments explain **why**, not what.
 - Keep `tests/` all green. The host-side unit tests now live in Go
   (`go test ./services/...` — TCP data proxy, network slot derivation, pool, templates, the
-  metadata store, the catalog + client-proxy routing, no VM/KVM needed); the Python
-  end-to-end / stateful / snapshot / metadata / ports tests run on real VMs (driven through
-  the api + client-proxy + orchestrator) and auto-skip when go / firecracker / `/dev/kvm` /
-  the per-sandbox-network privilege / the vendor artifacts are missing.
+  metadata store, the catalog + client-proxy routing, no VM/KVM needed; the Redis / Postgres
+  catalog + store variants self-skip unless `REDIS_ADDR` / `MSB_TEST_PG_DSN` point at a live
+  server, so a bare `go test` stays hermetic). The Python end-to-end / stateful / snapshot /
+  metadata / ports tests run on real VMs (driven through the api + client-proxy + orchestrator)
+  and auto-skip when go / firecracker / `/dev/kvm` / the per-sandbox-network privilege / the
+  vendor artifacts are missing; since Stage 14 the fixture also brings up Postgres + Redis
+  (`docker compose`, with a `docker run` fallback), so on a box with **no docker** the VM group
+  now fails loudly rather than silently running on in-process state.
 - **Safety rule**: the microVM is the first isolation strong enough to *discuss*
   untrusted code, but it is a learning implementation, **not security-audited** —
   never imply in docs or code that it is safe to expose as a service or feed
@@ -197,8 +220,9 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 
 ```bash
 pip install -e ".[dev]"                          # install (dev mode)
-pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs api + client-proxy + orchestrator)
-go test ./services/...                           # host-side unit tests: TCP data proxy, network slot derivation, pool, templates, metadata store, catalog + client-proxy (no VM/KVM)
+docker compose up -d                             # Stage 14: bring up the shared state (postgres + redis) the api/client-proxy use; conftest + dev-up also start it on demand (with a `docker run` fallback for engines without the compose plugin)
+pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs api + client-proxy + orchestrator and provisions postgres + redis)
+go test ./services/...                           # host-side unit tests: TCP data proxy, network slot derivation, pool, templates, metadata store, catalog + client-proxy (no VM/KVM; the redis/postgres variants skip unless REDIS_ADDR / MSB_TEST_PG_DSN are set)
 go test ./daemon                                 # in-VM daemon unit tests: handlers + kernel-message translation (no VM/KVM)
 pytest tests/test_microvm.py::test_runs_in_microvm -v   # one real-VM end-to-end case
 
