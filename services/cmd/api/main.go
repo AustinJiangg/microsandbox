@@ -1,8 +1,9 @@
 // Command api is the public REST front of the control plane (E2B's `api`), and as of
 // Stage 9c it is lifecycle-only: it owns no VMs and never touches the data path. Sandbox
 // lifecycle (POST/DELETE/GET /sandboxes) is delegated to the orchestrator over gRPC, the
-// durable record of which sandboxes exist is kept in a metadata store (SQLite, Stage 8c
-// -- E2B uses Postgres), and on create the api registers the sandbox's data route in the
+// durable record of which sandboxes exist is kept in a metadata store (Postgres by default
+// since Stage 14b, matching E2B; SQLite still selectable via a sqlite:// DSN), and on create
+// the api registers the sandbox's data route in the
 // catalog (a shared Redis since Stage 14a, which client-proxy reads to route data; before
 // 14a the api wrote it over an internal RPC to client-proxy). It returns the data_url the
 // SDK posts the data path to. The data plane goes SDK -> client-proxy -> orchestrator ->
@@ -35,7 +36,7 @@ import (
 type api struct {
 	client    pb.SandboxServiceClient
 	templates pbt.TemplateServiceClient
-	store     *store.Store
+	store     store.Store
 	catalog   catalog.Catalog
 	nodeAddr  string // the node (orchestrator data-proxy addr) registered for each sandbox
 	dataURL   string // the public client-proxy data URL handed back to the SDK (where to send data)
@@ -47,7 +48,8 @@ func main() {
 	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address: the node value registered in the catalog for each sandbox")
 	redisAddr := flag.String("redis-addr", "127.0.0.1:6379", "Redis address holding the sandbox routing catalog (the api writes routes here on create/destroy)")
 	dataURL := flag.String("data-url", "http://127.0.0.1:8081", "public client-proxy data URL returned to the SDK as where to send the data path")
-	db := flag.String("db", "vendor/microsandbox.db", "path to the SQLite metadata database")
+	storeDSN := flag.String("store-dsn", "postgres://postgres@127.0.0.1:5432/microsandbox?sslmode=disable",
+		"metadata store DSN: postgres://… (default, Stage 14b) or sqlite://<path> (or a bare path) for the single-file backend")
 	flag.Parse()
 
 	// gRPC client to the orchestrator. NewClient is lazy (it connects on the first RPC,
@@ -59,9 +61,9 @@ func main() {
 	}
 	defer conn.Close()
 
-	st, err := store.Open(*db)
+	st, err := store.Open(*storeDSN)
 	if err != nil {
-		log.Fatalf("open metadata db %s: %v", *db, err)
+		log.Fatalf("open metadata store %s: %v", *storeDSN, err)
 	}
 	defer st.Close()
 
@@ -103,8 +105,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, redis=%s, data-url=%s, db=%s)",
-		*addr, *orchGRPC, *orchProxy, *redisAddr, *dataURL, *db)
+	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, redis=%s, data-url=%s, store=%s)",
+		*addr, *orchGRPC, *orchProxy, *redisAddr, *dataURL, *storeDSN)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

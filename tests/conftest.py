@@ -188,6 +188,47 @@ def ensure_redis() -> str:
     raise RuntimeError(f"redis at {addr} did not come up within 30s")
 
 
+@functools.lru_cache(maxsize=1)
+def ensure_postgres() -> str:
+    """Bring up the Postgres that backs the api metadata store (Stage 14b), and return its DSN.
+    Reuses one already listening on :5432 (a dev instance or a prior session).
+
+    Same rationale as ensure_redis: docker is already required, so this adds no new *class* of
+    dependency, and a failure is loud, not a skip -- that is "flip the default" (Decision 5).
+    Unlike Redis, Postgres opens its port mid-init and then restarts, so the docker-run
+    fallback waits on `pg_isready` (not just an open port) before returning, so the api never
+    connects before the database is accepting queries. docker-compose's --wait does the same
+    via the healthcheck.
+    """
+    host, port = "127.0.0.1", 5432
+    dsn = f"postgres://postgres@{host}:{port}/microsandbox?sslmode=disable"
+    if _port_open(host, port):
+        return dsn  # reuse a Postgres already up (assumed initialized)
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    compose = ["docker", "compose", "-f", str(repo_root / "docker-compose.yml"),
+               "up", "-d", "--wait", "postgres"]
+    if subprocess.run(compose, capture_output=True).returncode == 0:
+        return dsn  # compose --wait blocks until the healthcheck (pg_isready) passes
+    # No compose plugin: provision the same image directly, then poll pg_isready for readiness.
+    name = "microsandbox-postgres"
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    subprocess.run(
+        ["docker", "run", "-d", "--name", name,
+         "-e", "POSTGRES_DB=microsandbox", "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
+         "-p", f"{host}:{port}:5432", "postgres:16-alpine"],
+        check=True,
+    )
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        ready = subprocess.run(
+            ["docker", "exec", name, "pg_isready", "-U", "postgres", "-d", "microsandbox"],
+            capture_output=True)
+        if ready.returncode == 0 and _port_open(host, port):
+            return dsn
+        time.sleep(0.2)
+    raise RuntimeError(f"postgres at {dsn} did not come up within 60s")
+
+
 @pytest.fixture(scope="session")
 def control_plane(tmp_path_factory):
     """Build and run the Go services (orchestrator + client-proxy + api) once per session.
@@ -195,10 +236,11 @@ def control_plane(tmp_path_factory):
     Stage 8b split the control plane into orchestrator (gRPC SandboxService + the data
     proxy, TCP over the VM's NIC since Stage 12) and api (public REST). Stage 9 added
     client-proxy (the edge data proxy); Stage 14a moved the routing catalog into a shared
-    Redis the api writes on create and client-proxy reads to route. Registration is
-    load-bearing (a create rolls back if the Redis write fails), so the trio plus Redis must
-    all be up here. The SDK talks to the api (lifecycle) so this fixture yields the api base
-    URL. Skips the whole microVM group when go / firecracker / kvm are unavailable.
+    Redis the api writes on create and client-proxy reads to route; Stage 14b moved the api's
+    metadata store onto Postgres. Registration is load-bearing (a create rolls back if the
+    Redis write fails), so the trio plus Redis and Postgres must all be up here. The SDK talks
+    to the api (lifecycle) so this fixture yields the api base URL. Skips the whole microVM
+    group when go / firecracker / kvm are unavailable.
     """
     if not firecracker_available():
         pytest.skip("firecracker/kernel/kvm incomplete, skipping microVM cases")
@@ -217,6 +259,7 @@ def control_plane(tmp_path_factory):
     cp_data_addr = "127.0.0.1:8098"
     base_url = f"http://{api_addr}"
     redis_addr = ensure_redis()  # the shared routing catalog the api writes + client-proxy reads
+    pg_dsn = ensure_postgres()   # the api's durable metadata store (Stage 14b)
 
     logdir = tmp_path_factory.mktemp("services")
     orch_log = open(logdir / "orchestrator.log", "wb")
@@ -255,7 +298,7 @@ def control_plane(tmp_path_factory):
              "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr,
              "--redis-addr", redis_addr,
              "--data-url", f"http://{cp_data_addr}",
-             "--db", str(logdir / "microsandbox.db")],
+             "--store-dsn", pg_dsn],
             stdout=api_log, stderr=subprocess.STDOUT,
         )
         _wait_healthy(base_url + "/health", api, logdir / "api.log")

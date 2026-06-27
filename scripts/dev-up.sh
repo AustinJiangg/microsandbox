@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Build and run the host services (orchestrator + client-proxy + api) for local use.
 # The SDK talks to the api at http://127.0.0.1:8080 (lifecycle); the api writes each sandbox's
-# data route to a shared Redis catalog (Stage 14a) that client-proxy reads to route. Ctrl-C
-# stops all three (Redis is left running for reuse). Any extra args (e.g. --pool-size 2,
-# --pool name=K, --uffd) are forwarded to the orchestrator. See docs/STAGE14_DESIGN.md.
+# data route to a shared Redis catalog (Stage 14a) that client-proxy reads to route, and keeps
+# its metadata in Postgres (Stage 14b). Ctrl-C stops the three services (Redis + Postgres are
+# left running for reuse). Any extra args (e.g. --pool-size 2, --pool name=K, --uffd) are
+# forwarded to the orchestrator. See docs/STAGE14_DESIGN.md.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,6 +20,23 @@ if ! (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null; then
 	fi
 fi
 
+# Bring up the Postgres backing the api metadata store (Stage 14b), same reuse/compose/docker-run
+# strategy. Postgres opens its port mid-init then restarts, so the docker-run fallback waits on
+# pg_isready before continuing (docker compose --wait does this via the healthcheck).
+if ! (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null; then
+	if ! docker compose -f "$repo_root/docker-compose.yml" up -d --wait postgres 2>/dev/null; then
+		docker rm -f microsandbox-postgres >/dev/null 2>&1 || true
+		docker run -d --name microsandbox-postgres \
+			-e POSTGRES_DB=microsandbox -e POSTGRES_HOST_AUTH_METHOD=trust \
+			-p 127.0.0.1:5432:5432 postgres:16-alpine >/dev/null
+		echo "waiting for postgres to be ready..."
+		for _ in $(seq 1 60); do
+			docker exec microsandbox-postgres pg_isready -U postgres -d microsandbox >/dev/null 2>&1 && break
+			sleep 0.5
+		done
+	fi
+fi
+
 "$repo_root/vendor/orchestrator" \
 	--grpc-addr 127.0.0.1:9090 --proxy-addr 127.0.0.1:5007 \
 	--vendor-dir "$repo_root/vendor" "$@" &
@@ -30,10 +48,10 @@ cp=$!
 	--addr 127.0.0.1:8080 \
 	--orchestrator-grpc 127.0.0.1:9090 --orchestrator-proxy 127.0.0.1:5007 \
 	--redis-addr 127.0.0.1:6379 --data-url http://127.0.0.1:8081 \
-	--db "$repo_root/vendor/microsandbox.db" &
+	--store-dsn "postgres://postgres@127.0.0.1:5432/microsandbox?sslmode=disable" &
 api=$!
 
 # Stop all three on Ctrl-C / exit; the orchestrator destroys any running VMs as it goes down.
 trap 'kill "$api" "$cp" "$orch" 2>/dev/null' INT TERM EXIT
-echo "services up: api on http://127.0.0.1:8080 (SDK base_url); client-proxy data :8081 (catalog on redis :6379); orchestrator gRPC :9090 proxy :5007"
+echo "services up: api on http://127.0.0.1:8080 (SDK base_url); client-proxy data :8081 (catalog on redis :6379, store on postgres :5432); orchestrator gRPC :9090 proxy :5007"
 wait
