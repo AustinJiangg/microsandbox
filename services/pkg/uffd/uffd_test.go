@@ -9,6 +9,8 @@ package uffd
 
 import (
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 	"unsafe"
 )
@@ -131,5 +133,44 @@ func TestMessageFieldOffsets(t *testing.T) {
 	binary.LittleEndian.PutUint64(rm[msgRemoveEnd:], 0x3000)
 	if start, end := removeRange(rm); start != 0x1000 || end != 0x3000 {
 		t.Errorf("removeRange = (%#x, %#x), want (0x1000, 0x3000)", start, end)
+	}
+}
+
+// MmapSource is the page supply the handler used directly before Stage 15a's PageSource refactor
+// (now one impl behind the interface). This exercises it without a VM: a plain file mmap needs no
+// KVM/privilege. We check ReadAt returns the right page bytes and that readPage turns a page past
+// the file end into an error -- the bounds check that used to live inline in serveFault.
+func TestMmapSourceReadPage(t *testing.T) {
+	const pageSize = 4096
+	// A 3-page file where page i is filled with the byte value i, so a read is recognizable.
+	data := make([]byte, 3*pageSize)
+	for i := 0; i < 3; i++ {
+		for j := 0; j < pageSize; j++ {
+			data[i*pageSize+j] = byte(i)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "memfile")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write memfile: %v", err)
+	}
+	src, err := MmapSource(path)
+	if err != nil {
+		t.Fatalf("MmapSource: %v", err)
+	}
+	defer src.Close()
+
+	// Middle page (offset 1*pageSize): every byte must be 1.
+	page := make([]byte, pageSize)
+	if err := readPage(src, page, pageSize); err != nil {
+		t.Fatalf("readPage(page 1): %v", err)
+	}
+	for i, b := range page {
+		if b != 1 {
+			t.Fatalf("page 1 byte %d = %d, want 1", i, b)
+		}
+	}
+	// A page starting at the file end is a short read -> an error (the old serveFault bounds check).
+	if err := readPage(src, page, 3*pageSize); err == nil {
+		t.Error("readPage past end = nil, want an error")
 	}
 }

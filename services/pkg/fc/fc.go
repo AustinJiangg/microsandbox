@@ -245,7 +245,15 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 		// during the load to hand over the uffd fd + guest layout. Record it on the VM right away
 		// so a later failure (or Destroy) stops it and unmaps the memfile.
 		udsPath := filepath.Join(workdir, "uffd.sock")
-		h, herr := uffd.Serve(udsPath, memfile)
+		// Build the page source (a read-only mmap of the local memfile) and hand it to the handler.
+		// Stage 15 makes this pluggable -- a bucket-backed source streams pages from object storage --
+		// but here it stays the local mmap, so the behavior is identical to before the 15a refactor.
+		src, serr := uffd.MmapSource(memfile)
+		if serr != nil {
+			vm.Destroy()
+			return nil, fmt.Errorf("open memfile page source: %w", serr)
+		}
+		h, herr := uffd.Serve(udsPath, src) // takes ownership of src (closes it on failure / teardown)
 		if herr != nil {
 			vm.Destroy()
 			return nil, fmt.Errorf("start uffd handler: %w", herr)

@@ -29,6 +29,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -156,6 +157,33 @@ func resolveFault(regions []GuestRegion, addr uint64) (alignedAddr, memOffset, p
 	return 0, 0, 0, false
 }
 
+// maxPageSize is the largest page size across the guest regions -- the size of the one reusable
+// per-fault buffer (a fault fills buf[:pageSize] for its region's page size, then UFFDIO_COPY reads
+// it). Falls back to the 4 KiB base page so the buffer is never zero-length.
+func maxPageSize(regions []GuestRegion) uint64 {
+	max := uint64(4096)
+	for _, r := range regions {
+		if r.PageSize > max {
+			max = r.PageSize
+		}
+	}
+	return max
+}
+
+// readPage fills p (one page) from the page source at memfile offset off. A full read is success
+// even if the source reports io.EOF at the exact end; a genuine short read (the page lies past the
+// memfile end) becomes an error -- the same failure the old in-line bounds check raised.
+func readPage(src io.ReaderAt, p []byte, off int64) error {
+	n, err := src.ReadAt(p, off)
+	if n == len(p) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return fmt.Errorf("read memfile page at %d: %w", off, err)
+}
+
 // faultAddr / removeRange read the union fields of a uffd_msg at their kernel offsets.
 func faultAddr(msg []byte) uint64 { return binary.LittleEndian.Uint64(msg[msgAddressOffset:]) }
 func removeRange(msg []byte) (start, end uint64) {
@@ -168,32 +196,70 @@ func removeRange(msg []byte) (start, end uint64) {
 type Handler struct {
 	udsPath  string
 	listener net.Listener
+	src      PageSource // supplies guest pages (local mmap today; object storage in Stage 15b)
 
 	stopOnce sync.Once
 	stopW    int           // write end of the stop pipe; a byte here wakes the serve loop's epoll
-	done     chan struct{} // closed once the serve goroutine has fully exited (mem unmapped, fds closed)
+	done     chan struct{} // closed once the serve goroutine has fully exited (page source closed, fds closed)
 
 	mu  sync.Mutex
 	err error // first fatal error from the serve goroutine
 }
 
-// Serve binds a Unix domain socket at udsPath and mmaps memfilePath read-only, then spawns a
-// goroutine that accepts firecracker's one connection, receives the uffd fd + guest layout,
-// and serves page faults from the memfile until Stop (or the VM dies). It returns as soon as
-// the socket is listening: the caller MUST call Serve *before* firecracker's PUT
-// /snapshot/load, which connects to this socket during the load (a hard ordering requirement).
-func Serve(udsPath, memfilePath string) (*Handler, error) {
-	// Map the memfile read-only -- the source bytes for every page we copy in. Do it up front
-	// so a missing/empty memfile fails here, before firecracker's snapshot load.
+// PageSource supplies a restored guest's memory pages from the snapshot memfile, addressed by byte
+// offset. It is the seam Stage 13 promised and Stage 15 cashes: today MmapSource maps the local
+// memfile (the original behavior, factored out of Serve); Stage 15b adds a source that streams pages
+// from object storage. ReadAt fills p with len(p) bytes at offset off -- io.ReaderAt semantics, which
+// a *minio.Object already satisfies, so the bucket source will be a thin wrapper.
+type PageSource interface {
+	io.ReaderAt
+	Close() error
+}
+
+// mmapSource serves pages from a read-only mmap of a local memfile -- the page supply the handler
+// used directly before Stage 15. ReadAt copies one page out of the mapping.
+type mmapSource struct{ mem []byte }
+
+// MmapSource maps memfilePath read-only and returns it as a PageSource. Doing the mmap here (rather
+// than inside Serve) is the whole 15a refactor: the caller now picks the page supply -- a local file
+// today, a bucket later -- and Serve no longer knows where pages come from. A missing/empty memfile
+// fails here, up front, before firecracker's snapshot load (same as before).
+func MmapSource(memfilePath string) (PageSource, error) {
 	mem, err := mmapFile(memfilePath)
 	if err != nil {
 		return nil, err
 	}
+	return &mmapSource{mem: mem}, nil
+}
 
+func (m *mmapSource) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || off >= int64(len(m.mem)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.mem[off:])
+	if n < len(p) {
+		return n, io.EOF // the page extends past the memfile -- readPage turns this into an error
+	}
+	return n, nil
+}
+
+func (m *mmapSource) Close() error {
+	unmap(m.mem)
+	m.mem = nil
+	return nil
+}
+
+// Serve binds a Unix domain socket at udsPath, then spawns a goroutine that accepts firecracker's
+// one connection, receives the uffd fd + guest layout, and serves page faults from src until Stop
+// (or the VM dies). It takes ownership of src: on a setup failure it closes src, and on success the
+// handler closes src when the serve goroutine exits. It returns as soon as the socket is listening:
+// the caller MUST call Serve *before* firecracker's PUT /snapshot/load, which connects to this
+// socket during the load (a hard ordering requirement).
+func Serve(udsPath string, src PageSource) (*Handler, error) {
 	// The stop pipe: Stop() writes a byte to stopW to wake the serve loop's epoll (Decision 5).
 	var p [2]int
 	if err := syscall.Pipe(p[:]); err != nil {
-		unmap(mem)
+		_ = src.Close()
 		return nil, fmt.Errorf("uffd stop pipe: %w", err)
 	}
 	stopR, stopW := p[0], p[1]
@@ -201,18 +267,18 @@ func Serve(udsPath, memfilePath string) (*Handler, error) {
 	// Clear any stale socket from a crashed run, then listen before returning.
 	if err := os.Remove(udsPath); err != nil && !os.IsNotExist(err) {
 		closeStop(stopR, stopW)
-		unmap(mem)
+		_ = src.Close()
 		return nil, fmt.Errorf("clear stale uffd socket %s: %w", udsPath, err)
 	}
 	l, err := net.Listen("unix", udsPath)
 	if err != nil {
 		closeStop(stopR, stopW)
-		unmap(mem)
+		_ = src.Close()
 		return nil, fmt.Errorf("listen uffd uds %s: %w", udsPath, err)
 	}
 
-	h := &Handler{udsPath: udsPath, listener: l, stopW: stopW, done: make(chan struct{})}
-	go h.serve(mem, stopR)
+	h := &Handler{udsPath: udsPath, listener: l, src: src, stopW: stopW, done: make(chan struct{})}
+	go h.serve(stopR)
 	return h, nil
 }
 
@@ -252,9 +318,9 @@ func (h *Handler) fail(err error) {
 // serve is the goroutine: receive the handshake, then serve faults until stopped or the VM
 // dies. Cleanup runs LIFO on exit, with done closed last so a waiter in Stop sees a fully
 // torn-down handler.
-func (h *Handler) serve(mem []byte, stopR int) {
+func (h *Handler) serve(stopR int) {
 	defer close(h.done)
-	defer unmap(mem)
+	defer func() { _ = h.src.Close() }()
 	defer func() { _ = syscall.Close(stopR) }()
 
 	uffdFD, regions, err := h.recvHandshake()
@@ -264,7 +330,7 @@ func (h *Handler) serve(mem []byte, stopR int) {
 	}
 	defer func() { _ = syscall.Close(uffdFD) }()
 
-	if err := faultLoop(uffdFD, stopR, mem, regions); err != nil {
+	if err := faultLoop(uffdFD, stopR, h.src, regions); err != nil {
 		h.fail(err)
 	}
 }
@@ -326,7 +392,7 @@ func parseOneFD(oob []byte) (int, error) {
 // faultLoop waits on the uffd fd and the stop pipe together (epoll), serving each page fault
 // off the uffd fd. It returns nil on a clean stop (Stop fired, or the uffd hung up because
 // firecracker exited) and an error on an unexpected failure.
-func faultLoop(uffdFD, stopR int, mem []byte, regions []GuestRegion) error {
+func faultLoop(uffdFD, stopR int, src PageSource, regions []GuestRegion) error {
 	epfd, err := syscall.EpollCreate1(0)
 	if err != nil {
 		return fmt.Errorf("epoll_create1: %w", err)
@@ -342,6 +408,9 @@ func faultLoop(uffdFD, stopR int, mem []byte, regions []GuestRegion) error {
 
 	events := make([]syscall.EpollEvent, 2)
 	msg := make([]byte, sizeofUffdMsg)
+	// One reusable page buffer, sized to the largest region page: a fault fills page[:pageSize] from
+	// src, then UFFDIO_COPY reads it. Reused across faults so the serve hot path does not allocate.
+	page := make([]byte, maxPageSize(regions))
 	for {
 		n, err := syscall.EpollWait(epfd, events, -1)
 		if err != nil {
@@ -359,7 +428,7 @@ func faultLoop(uffdFD, stopR int, mem []byte, regions []GuestRegion) error {
 				if events[i].Events&(syscall.EPOLLHUP|syscall.EPOLLERR) != 0 {
 					return nil
 				}
-				stop, err := readAndServe(uffdFD, msg, mem, regions)
+				stop, err := readAndServe(uffdFD, msg, page, src, regions)
 				if err != nil {
 					return err
 				}
@@ -374,7 +443,7 @@ func faultLoop(uffdFD, stopR int, mem []byte, regions []GuestRegion) error {
 // readAndServe reads one fault message off the uffd fd and serves it. stop is true on EOF
 // (firecracker gone). Level-triggered epoll re-wakes us if more messages are queued, so we
 // read exactly one per wake (simple over batched -- a learning implementation).
-func readAndServe(uffdFD int, msg, mem []byte, regions []GuestRegion) (stop bool, err error) {
+func readAndServe(uffdFD int, msg, page []byte, src PageSource, regions []GuestRegion) (stop bool, err error) {
 	n, err := syscall.Read(uffdFD, msg)
 	if err != nil {
 		if err == syscall.EINTR || err == syscall.EAGAIN {
@@ -388,14 +457,14 @@ func readAndServe(uffdFD int, msg, mem []byte, regions []GuestRegion) (stop bool
 	if n != sizeofUffdMsg {
 		return false, fmt.Errorf("short uffd message: %d bytes (want %d)", n, sizeofUffdMsg)
 	}
-	return false, handleEvent(uffdFD, msg, mem, regions)
+	return false, handleEvent(uffdFD, msg, page, src, regions)
 }
 
 // handleEvent dispatches one uffd_msg by its event tag.
-func handleEvent(uffdFD int, msg, mem []byte, regions []GuestRegion) error {
+func handleEvent(uffdFD int, msg, page []byte, src PageSource, regions []GuestRegion) error {
 	switch msg[msgEventOffset] {
 	case uffdEventPagefault:
-		return serveFault(uffdFD, mem, regions, faultAddr(msg))
+		return serveFault(uffdFD, page, src, regions, faultAddr(msg))
 	case uffdEventRemove:
 		start, end := removeRange(msg)
 		return serveRemove(uffdFD, start, end)
@@ -404,23 +473,27 @@ func handleEvent(uffdFD int, msg, mem []byte, regions []GuestRegion) error {
 	}
 }
 
-// serveFault copies the faulting page in from the memfile via UFFDIO_COPY, waking the blocked
+// serveFault copies the faulting page in from the page source via UFFDIO_COPY, waking the blocked
 // vCPU. Benign races are absorbed: EEXIST means another fault already populated the page;
 // EAGAIN means the mapping changed under us (e.g. a concurrent REMOVE) -- hand back zeros.
-func serveFault(uffdFD int, mem []byte, regions []GuestRegion, addr uint64) error {
+func serveFault(uffdFD int, page []byte, src PageSource, regions []GuestRegion, addr uint64) error {
 	alignedAddr, memOffset, pageSize, ok := resolveFault(regions, addr)
 	if !ok {
 		return fmt.Errorf("page fault at %#x outside all guest regions", addr)
 	}
-	if memOffset+pageSize > uint64(len(mem)) {
-		return fmt.Errorf("copy src [%d,%d) past memfile (%d bytes)", memOffset, memOffset+pageSize, len(mem))
+	// Pull the page's bytes from the source into the reusable buffer. For the local mmap this is a
+	// copy out of the mapping; for a bucket source (Stage 15b) it is a range read + cache. A short
+	// read means the page lies past the memfile end -- a mappings/math bug, surfaced as an error.
+	buf := page[:pageSize]
+	if err := readPage(src, buf, int64(memOffset)); err != nil {
+		return err
 	}
 
-	// src points into the mmap'd memfile, which is off-heap and never moved/collected by the
-	// GC while mem stays reachable -- so holding its address as an integer here is safe.
+	// &buf[0] is handed to the kernel as the copy source. buf is a Go slice the GC does not move and
+	// that stays reachable across this synchronous ioctl, so holding its address as an integer is safe.
 	arg := uffdioCopy{
 		dst: alignedAddr,
-		src: uint64(uintptr(unsafe.Pointer(&mem[memOffset]))),
+		src: uint64(uintptr(unsafe.Pointer(&buf[0]))),
 		len: pageSize,
 	}
 	err := ioctl(uffdFD, uffdioCopyOp, unsafe.Pointer(&arg))
