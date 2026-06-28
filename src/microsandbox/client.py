@@ -105,6 +105,7 @@ class Sandbox:
         self._data_url_override = data_url or os.environ.get("MICROSANDBOX_DATA_URL")
         self._data_url: str | None = None  # set by _create (override, response, or default)
         self._sandbox_id: str | None = None  # the api's handle for the VM (set by _create)
+        self._token: str | None = None  # per-sandbox data-plane access token (set by _create, Stage 16)
 
         # File / shell namespaces, with a feel aligned to E2B's sandbox.files /
         # sandbox.commands. They only talk to the control plane when called.
@@ -131,6 +132,9 @@ class Sandbox:
             body["template"] = self._template
         info = self._control_plane("POST", "/sandboxes", body)
         self._sandbox_id = info["id"]
+        # The per-sandbox access token client-proxy requires on the in-VM control services
+        # (Stage 16). Sent as X-Access-Token by _host_header on every data call.
+        self._token = info.get("token")
         # The api tells the SDK where to reach the sandbox's data path (client-proxy). An
         # explicit override wins; else use the response; else the default.
         self._data_url = (
@@ -157,16 +161,21 @@ class Sandbox:
     # ----- HTTP to the control plane -----
 
     def _host_header(self, port: int) -> dict:
-        """The Host header that routes a data request to one of this sandbox's in-VM TCP ports.
+        """The headers that route + authenticate a data request to one of this sandbox's in-VM
+        control ports (envd 49983 / code-interpreter 49999).
 
-        Stage 12b: client-proxy routes by the <port>-<id> hostname (the port selects the in-VM
-        service -- envd, code-interpreter, or a user port), so a data call carries its route in
-        the Host header. The SDK still connects to client-proxy's address (data_url) and only
-        overrides the Host header, so no DNS is needed on a single machine.
+        Stage 12b: client-proxy routes by the <port>-<id> hostname, so a data call carries its
+        route in the Host header. The SDK still connects to client-proxy's address (data_url)
+        and only overrides the Host header, so no DNS is needed on a single machine. Stage 16:
+        the in-VM control services are gated, so the per-sandbox access token rides along as
+        X-Access-Token (only these control-port calls send it; user ports are public).
         """
         if self._sandbox_id is None:
             raise RuntimeError("sandbox is closed")
-        return {"Host": f"{port}-{self._sandbox_id}"}
+        headers = {"Host": f"{port}-{self._sandbox_id}"}
+        if self._token:
+            headers["X-Access-Token"] = self._token
+        return headers
 
     def get_host(self, port: int) -> str:
         """Return the <port>-<id> hostname that reaches the given guest port through client-proxy.

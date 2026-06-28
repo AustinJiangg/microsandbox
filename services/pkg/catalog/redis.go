@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -38,30 +39,40 @@ func NewRedis(addr string) *Redis {
 	return &Redis{rdb: redis.NewClient(&redis.Options{Addr: addr})}
 }
 
-// Set records (or overwrites) the node for a sandbox id. No TTL (0): the api explicitly
-// Deletes on destroy, so we don't rely on expiry for correctness. A non-nil error is
-// load-bearing -- the api rolls the just-built VM back rather than leave an unroutable zombie.
-func (c *Redis) Set(id, node string) error {
+// Set records (or overwrites) the route for a sandbox id, stored as a small JSON blob at one
+// key (as the bare node string was before Stage 16). No TTL (0): the api explicitly Deletes on
+// destroy, so we don't rely on expiry for correctness. A non-nil error is load-bearing -- the
+// api rolls the just-built VM back rather than leave an unroutable zombie.
+func (c *Redis) Set(id string, route Route) error {
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()
-	return c.rdb.Set(ctx, keyPrefix+id, node, 0).Err()
+	blob, err := json.Marshal(route)
+	if err != nil {
+		return err
+	}
+	return c.rdb.Set(ctx, keyPrefix+id, blob, 0).Err()
 }
 
-// Get returns the node for a sandbox id. A missing key is ("", false, nil) -- a genuine
+// Get returns the route for a sandbox id. A missing key is (Route{}, false, nil) -- a genuine
 // "no such sandbox", which client-proxy turns into a 404. A transport/server failure is
-// ("", false, err) -- distinct from a miss, so client-proxy can answer 5xx instead of
-// wrongly claiming the sandbox doesn't exist.
-func (c *Redis) Get(id string) (string, bool, error) {
+// (Route{}, false, err) -- distinct from a miss, so client-proxy can answer 5xx instead of
+// wrongly claiming the sandbox doesn't exist. A value that doesn't parse as JSON is treated as
+// a legacy bare-node string (a pre-Stage-16 entry), so a Redis surviving the upgrade still routes.
+func (c *Redis) Get(id string) (Route, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()
-	node, err := c.rdb.Get(ctx, keyPrefix+id).Result()
+	val, err := c.rdb.Get(ctx, keyPrefix+id).Result()
 	if errors.Is(err, redis.Nil) {
-		return "", false, nil
+		return Route{}, false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return Route{}, false, err
 	}
-	return node, true, nil
+	var route Route
+	if jerr := json.Unmarshal([]byte(val), &route); jerr != nil {
+		return Route{Node: val}, true, nil // legacy bare-node value (no token)
+	}
+	return route, true, nil
 }
 
 // Delete drops a sandbox's route. Idempotent: Redis DEL on an absent key returns 0, not an

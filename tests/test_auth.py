@@ -88,3 +88,28 @@ def test_team_isolation(control_plane):
         assert sb.run_code("print(40 + 2)").stdout.strip() == "42"
     finally:
         sb.close()
+
+
+def test_data_plane_requires_token(control_plane):
+    """client-proxy gates the in-VM control services (envd / code-interpreter): a tampered
+    access token gets 401, the correct one works (which every other e2e test exercises)."""
+    sb = Sandbox(base_url=control_plane, api_key=DEV_KEY)
+    try:
+        good = sb._token
+        assert good, "the api should mint and return an access token"
+
+        # Tamper the token: the control-port data call (run_code, port 49999) is rejected.
+        sb._token = "sbx_wrong"
+        with pytest.raises(RuntimeError) as exc:
+            sb.run_code("print(1)")
+        assert "token" in str(exc.value).lower()
+
+        # A files op (envd, port 49983) is gated the same way.
+        with pytest.raises(RuntimeError):
+            sb.files.write("/tmp/x", "y")
+
+        # Restore the real token: the same calls now work.
+        sb._token = good
+        assert sb.run_code("print(6 * 7)").stdout.strip() == "42"
+    finally:
+        sb.close()

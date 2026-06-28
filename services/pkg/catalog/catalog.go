@@ -12,17 +12,26 @@ package catalog
 
 import "sync"
 
-// Catalog maps a sandbox id to its node. "node" is the orchestrator data-proxy address
-// (e.g. "127.0.0.1:5007") that client-proxy reverse-proxies that sandbox's data path to;
-// in E2B it is the orchestrator's IP and client-proxy hits :5007 on it -- same shape.
+// Route is what a sandbox id maps to: the node that holds it plus, since Stage 16, the
+// per-sandbox access token. Node is the orchestrator data-proxy address (e.g. "127.0.0.1:5007")
+// that client-proxy reverse-proxies that sandbox's data path to; in E2B it is the orchestrator's
+// IP and client-proxy hits :5007 on it -- same shape. Token is the secret minted by the api at
+// create time; client-proxy requires it (an X-Access-Token header) before routing to the in-VM
+// *control* services, leaving user-exposed ports public. See docs/STAGE16_DESIGN.md.
+type Route struct {
+	Node  string `json:"node"`
+	Token string `json:"token,omitempty"`
+}
+
+// Catalog maps a sandbox id to its Route (node + access token).
 //
 // Every method returns an error because the real backend (Redis) is a network store that
 // can fail -- and that failure is load-bearing: the api's create rolls the VM back if Set
 // fails, and client-proxy must tell "Redis is down" (5xx) apart from "no such sandbox" (404)
 // on Get. The in-process map can't fail, so InMemory always returns a nil error.
 type Catalog interface {
-	Set(id, node string) error
-	Get(id string) (node string, ok bool, err error)
+	Set(id string, route Route) error
+	Get(id string) (route Route, ok bool, err error)
 	Delete(id string) error
 }
 
@@ -32,36 +41,36 @@ type Catalog interface {
 // and only a shared store (Redis) is reachable by both. The map is tiny (one entry per live
 // sandbox), so an RWMutex fits.
 type InMemory struct {
-	mu    sync.RWMutex
-	nodes map[string]string
+	mu     sync.RWMutex
+	routes map[string]Route
 }
 
 // NewInMemory returns an empty in-memory catalog.
 func NewInMemory() *InMemory {
-	return &InMemory{nodes: map[string]string{}}
+	return &InMemory{routes: map[string]Route{}}
 }
 
-// Set records (or overwrites) the node for a sandbox id. The in-memory map never fails.
-func (c *InMemory) Set(id, node string) error {
+// Set records (or overwrites) the route for a sandbox id. The in-memory map never fails.
+func (c *InMemory) Set(id string, route Route) error {
 	c.mu.Lock()
-	c.nodes[id] = node
+	c.routes[id] = route
 	c.mu.Unlock()
 	return nil
 }
 
-// Get returns the node for a sandbox id, and whether it is known. The error is always nil
+// Get returns the route for a sandbox id, and whether it is known. The error is always nil
 // (it exists to satisfy the interface the Redis backend needs).
-func (c *InMemory) Get(id string) (string, bool, error) {
+func (c *InMemory) Get(id string) (Route, bool, error) {
 	c.mu.RLock()
-	node, ok := c.nodes[id]
+	route, ok := c.routes[id]
 	c.mu.RUnlock()
-	return node, ok, nil
+	return route, ok, nil
 }
 
 // Delete drops a sandbox's route. Idempotent: deleting an absent id is a no-op.
 func (c *InMemory) Delete(id string) error {
 	c.mu.Lock()
-	delete(c.nodes, id)
+	delete(c.routes, id)
 	c.mu.Unlock()
 	return nil
 }

@@ -22,24 +22,24 @@ func TestRedisRoundTrip(t *testing.T) {
 
 	// A missing key is a miss, not an error: ok=false, err=nil (client-proxy turns this into
 	// a 404, never a 5xx).
-	if node, ok, err := c.Get(id); err != nil || ok || node != "" {
-		t.Fatalf("Get(absent) = (%q, %v, %v), want (\"\", false, nil)", node, ok, err)
+	if route, ok, err := c.Get(id); err != nil || ok || route.Node != "" {
+		t.Fatalf("Get(absent) = (%+v, %v, %v), want ({}, false, nil)", route, ok, err)
 	}
 
-	if err := c.Set(id, "127.0.0.1:5007"); err != nil {
+	if err := c.Set(id, Route{Node: "127.0.0.1:5007", Token: "tok_a"}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	node, ok, err := c.Get(id)
-	if err != nil || !ok || node != "127.0.0.1:5007" {
-		t.Fatalf("Get after Set = (%q, %v, %v), want (127.0.0.1:5007, true, nil)", node, ok, err)
+	route, ok, err := c.Get(id)
+	if err != nil || !ok || route.Node != "127.0.0.1:5007" || route.Token != "tok_a" {
+		t.Fatalf("Get after Set = (%+v, %v, %v), want ({127.0.0.1:5007 tok_a}, true, nil)", route, ok, err)
 	}
 
-	// Set overwrites (a sandbox could be re-registered on a different node).
-	if err := c.Set(id, "127.0.0.1:6007"); err != nil {
+	// Set overwrites (a sandbox could be re-registered on a different node / token).
+	if err := c.Set(id, Route{Node: "127.0.0.1:6007", Token: "tok_b"}); err != nil {
 		t.Fatalf("Set overwrite: %v", err)
 	}
-	if node, _, _ := c.Get(id); node != "127.0.0.1:6007" {
-		t.Fatalf("Get after overwrite = %q, want 127.0.0.1:6007", node)
+	if route, _, _ := c.Get(id); route.Node != "127.0.0.1:6007" || route.Token != "tok_b" {
+		t.Fatalf("Get after overwrite = %+v, want {127.0.0.1:6007 tok_b}", route)
 	}
 
 	if err := c.Delete(id); err != nil {

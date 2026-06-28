@@ -58,13 +58,14 @@ func TestHandleDataRoutesToNode(t *testing.T) {
 	defer backend.Close()
 
 	cp := newTestProxy()
-	cp.catalog.Set("sb_1", strings.TrimPrefix(backend.URL, "http://"))
+	cp.catalog.Set("sb_1", catalog.Route{Node: strings.TrimPrefix(backend.URL, "http://"), Token: "tok_test"})
 
 	front := httptest.NewServer(http.HandlerFunc(cp.handleData))
 	defer front.Close()
 
 	req, _ := http.NewRequest("POST", front.URL+"/execute", strings.NewReader(`{"code":"x=1"}`))
-	req.Host = "49983-sb_1" // <port>-<id>: the envd port for sandbox sb_1
+	req.Host = "49983-sb_1"                      // <port>-<id>: the envd port for sandbox sb_1
+	req.Header.Set("X-Access-Token", "tok_test") // control port: token required (Stage 16)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request: %v", err)
@@ -101,12 +102,13 @@ func TestHandleDataStreamsSSE(t *testing.T) {
 	defer backend.Close()
 
 	cp := newTestProxy()
-	cp.catalog.Set("sb_1", strings.TrimPrefix(backend.URL, "http://"))
+	cp.catalog.Set("sb_1", catalog.Route{Node: strings.TrimPrefix(backend.URL, "http://"), Token: "tok_test"})
 	front := httptest.NewServer(http.HandlerFunc(cp.handleData))
 	defer front.Close()
 
 	req, _ := http.NewRequest("POST", front.URL+"/execute", nil)
-	req.Host = "49999-sb_1" // the code-interpreter port; any well-formed route streams the same
+	req.Host = "49999-sb_1"                      // the code-interpreter port; any well-formed route streams the same
+	req.Header.Set("X-Access-Token", "tok_test") // control port: token required (Stage 16)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request: %v", err)
@@ -125,5 +127,63 @@ func TestHandleDataStreamsSSE(t *testing.T) {
 	}
 	if !sawStdout || !sawEnd {
 		t.Fatalf("streamed SSE missing events (stdout=%v end=%v)", sawStdout, sawEnd)
+	}
+}
+
+// A control port (envd / code-interpreter) requires the per-sandbox access token: a request
+// with a missing or wrong X-Access-Token is 401, never reaching the backend (Stage 16).
+func TestHandleDataControlPortTokenRequired(t *testing.T) {
+	var reached bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer backend.Close()
+
+	cp := newTestProxy()
+	cp.catalog.Set("sb_1", catalog.Route{Node: strings.TrimPrefix(backend.URL, "http://"), Token: "tok_secret"})
+
+	for _, tc := range []struct{ name, token string }{
+		{"missing token", ""},
+		{"wrong token", "tok_wrong"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reached = false
+			req := httptest.NewRequest("POST", "/execute", nil)
+			req.Host = "49983-sb_1"
+			if tc.token != "" {
+				req.Header.Set("X-Access-Token", tc.token)
+			}
+			rec := httptest.NewRecorder()
+			cp.handleData(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+			if reached {
+				t.Fatal("request reached the backend despite a bad token")
+			}
+		})
+	}
+}
+
+// A user-exposed port (anything but the control ports) is public: it routes with no token,
+// because exposing a port means publishing a URL (Stage 12c / 16).
+func TestHandleDataUserPortIsPublic(t *testing.T) {
+	var reached bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		io.WriteString(w, "hello")
+	}))
+	defer backend.Close()
+
+	cp := newTestProxy()
+	cp.catalog.Set("sb_1", catalog.Route{Node: strings.TrimPrefix(backend.URL, "http://"), Token: "tok_secret"})
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "8000-sb_1" // a user server on :8000, no token sent
+	rec := httptest.NewRecorder()
+	cp.handleData(rec, req)
+	if rec.Code != http.StatusOK || !reached {
+		t.Fatalf("user port: status=%d reached=%v, want 200 + reached", rec.Code, reached)
 	}
 }

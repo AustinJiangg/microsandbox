@@ -16,16 +16,16 @@ func TestSetGetDelete(t *testing.T) {
 		t.Fatal("Get on an empty catalog returned ok=true")
 	}
 
-	c.Set("sb_1", "127.0.0.1:5007")
-	node, ok, _ := c.Get("sb_1")
-	if !ok || node != "127.0.0.1:5007" {
-		t.Fatalf("Get after Set = (%q, %v), want (127.0.0.1:5007, true)", node, ok)
+	c.Set("sb_1", Route{Node: "127.0.0.1:5007", Token: "tok_a"})
+	route, ok, _ := c.Get("sb_1")
+	if !ok || route.Node != "127.0.0.1:5007" || route.Token != "tok_a" {
+		t.Fatalf("Get after Set = (%+v, %v), want ({127.0.0.1:5007 tok_a}, true)", route, ok)
 	}
 
-	// Set overwrites (a sandbox could be re-registered on a different node).
-	c.Set("sb_1", "127.0.0.1:6007")
-	if node, _, _ := c.Get("sb_1"); node != "127.0.0.1:6007" {
-		t.Fatalf("Get after overwrite = %q, want 127.0.0.1:6007", node)
+	// Set overwrites (a sandbox could be re-registered on a different node / token).
+	c.Set("sb_1", Route{Node: "127.0.0.1:6007", Token: "tok_b"})
+	if route, _, _ := c.Get("sb_1"); route.Node != "127.0.0.1:6007" || route.Token != "tok_b" {
+		t.Fatalf("Get after overwrite = %+v, want {127.0.0.1:6007 tok_b}", route)
 	}
 
 	c.Delete("sb_1")
@@ -45,7 +45,7 @@ func TestConcurrentAccess(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		id := fmt.Sprintf("sb_%d", i)
 		wg.Add(2)
-		go func() { defer wg.Done(); c.Set(id, "127.0.0.1:5007") }()
+		go func() { defer wg.Done(); c.Set(id, Route{Node: "127.0.0.1:5007", Token: "tok"}) }()
 		go func() { defer wg.Done(); c.Get(id); c.Delete(id) }()
 	}
 	wg.Wait()

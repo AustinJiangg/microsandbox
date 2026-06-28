@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -25,6 +26,18 @@ type teamCtxKey struct{}
 func hashKey(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
+}
+
+// newAccessToken mints the per-sandbox data-plane secret (Stage 16): "sbx_" + 128 random bits
+// of hex. client-proxy requires it (X-Access-Token) before routing to the in-VM control
+// services. crypto/rand failing is catastrophic (no entropy), so the caller treats the error
+// as fatal to the create rather than hand out a weak token.
+func newAccessToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "sbx_" + hex.EncodeToString(b[:]), nil
 }
 
 // withAuth wraps a handler so it runs only for a request carrying a valid X-API-Key. On

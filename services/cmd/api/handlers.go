@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"microsandbox/services/pkg/catalog"
 	pb "microsandbox/services/pkg/grpc/orchestrator"
 )
 
@@ -39,17 +40,30 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register the sandbox's data-path route in the catalog (a Redis SET; client-proxy reads
-	// it to route data requests). This is load-bearing -- a sandbox with no route is
-	// unreachable -- so on failure (e.g. Redis down) we roll the just-built VM back (gRPC
-	// Delete) rather than return a booted-but-unroutable zombie. This is a direct Redis write
-	// now (Stage 14a), exactly like E2B's api; before 14a it went over an RPC to client-proxy.
-	if err := a.catalog.Set(resp.GetSandboxId(), a.nodeAddr); err != nil {
+	// Mint the per-sandbox data-plane access token (Stage 16). The rollback helper tears the
+	// just-built VM down on any failure between here and a successful route register, so a
+	// booted-but-unusable VM never leaks.
+	rollback := func() {
 		rb, cancelRB := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelRB()
 		if _, derr := a.client.Delete(rb, &pb.SandboxDeleteRequest{SandboxId: resp.GetSandboxId()}); derr != nil {
-			log.Printf("rollback: delete %s after failed route register: %v", resp.GetSandboxId(), derr)
+			log.Printf("rollback: delete %s: %v", resp.GetSandboxId(), derr)
 		}
+	}
+	token, err := newAccessToken()
+	if err != nil {
+		rollback()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not mint access token: " + err.Error()})
+		return
+	}
+
+	// Register the sandbox's data-path route (node + token) in the catalog (a Redis SET;
+	// client-proxy reads it to route and to gate the data path). This is load-bearing -- a
+	// sandbox with no route is unreachable -- so on failure (e.g. Redis down) we roll the
+	// just-built VM back rather than return a booted-but-unroutable zombie. This is a direct
+	// Redis write now (Stage 14a), exactly like E2B's api; before 14a it went over an RPC.
+	if err := a.catalog.Set(resp.GetSandboxId(), catalog.Route{Node: a.nodeAddr, Token: token}); err != nil {
+		rollback()
 		writeJSON(w, http.StatusBadGateway,
 			map[string]string{"error": "could not register sandbox route: " + err.Error()})
 		return
@@ -67,9 +81,10 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if err := a.store.InsertSandbox(resp.GetSandboxId(), templateName, team); err != nil {
 		log.Printf("store: insert %s: %v", resp.GetSandboxId(), err)
 	}
-	// Hand the SDK the id plus where to reach its data path (client-proxy). The data_url
-	// is constant across sandboxes this stage; Stage 12 makes it a per-sandbox hostname.
-	writeJSON(w, http.StatusCreated, map[string]string{"id": resp.GetSandboxId(), "data_url": a.dataURL})
+	// Hand the SDK the id, where to reach its data path (client-proxy), and the access token
+	// the SDK must send (X-Access-Token) on data calls to the in-VM control services (Stage 16).
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"id": resp.GetSandboxId(), "data_url": a.dataURL, "token": token})
 }
 
 // handleDestroy: DELETE /sandboxes/{id} -> authorise (the sandbox must belong to the caller's

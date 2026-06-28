@@ -2,11 +2,19 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"net/http"
 	"net/http/httputil"
 	"strconv"
 	"strings"
 )
+
+// controlPorts are the in-VM services the SDK drives (envd files/commands on 49983, the
+// code-interpreter on 49999). The data path to these is gated by the per-sandbox access token
+// (Stage 16). Any other port is a user-exposed server (e.g. a web app on :8000 reached via
+// get_host) and stays public -- that is the exposure feature, so it carries no token. These
+// MUST match services/pkg/fc (EnvdTCPPort / CodeInterpreterTCPPort) and the SDK's constants.
+var controlPorts = map[string]bool{"49983": true, "49999": true}
 
 // nodeCtxKey carries the resolved node address from handleData into the shared reverse
 // proxy's Rewrite. One ReverseProxy instance serves every request; the per-request target
@@ -42,7 +50,7 @@ func (s *clientProxy) handleData(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed host, want <port>-<sandboxId>"})
 		return
 	}
-	node, found, err := s.catalog.Get(id)
+	route, found, err := s.catalog.Get(id)
 	if err != nil {
 		// The catalog (Redis) is unreachable: a dependency failure, not a missing sandbox.
 		// 502 (not 404) so a transient Redis outage isn't mistaken for "no such sandbox" --
@@ -54,11 +62,22 @@ func (s *clientProxy) handleData(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no route for sandbox: " + id})
 		return
 	}
+	// Stage 16: gate the in-VM control services (envd / code-interpreter) on the per-sandbox
+	// access token. A constant-time compare avoids leaking the token by timing; an empty stored
+	// token never authorises (it would mean a sandbox registered without one). User-exposed
+	// ports are not gated -- they are public URLs, the whole point of exposing a port.
+	if controlPorts[port] {
+		presented := r.Header.Get("X-Access-Token")
+		if route.Token == "" || subtle.ConstantTimeCompare([]byte(presented), []byte(route.Token)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or missing access token"})
+			return
+		}
+	}
 	// Hand the orchestrator the id (to find the VM) and the port (to dial); its data proxy still
-	// routes by these headers, so the catalog interface stays the id->node map it was.
+	// routes by these headers, so the orchestrator side is unchanged.
 	r.Header.Set("X-Sandbox-Id", id)
 	r.Header.Set("X-Sandbox-Port", port)
-	r = r.WithContext(context.WithValue(r.Context(), nodeCtxKey{}, node))
+	r = r.WithContext(context.WithValue(r.Context(), nodeCtxKey{}, route.Node))
 	s.proxy.ServeHTTP(w, r)
 }
 
