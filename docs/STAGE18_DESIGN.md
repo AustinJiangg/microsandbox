@@ -212,7 +212,27 @@ Where a rootfs's blocks physically sit and which build owns them are invisible t
 suite (currently **43/43**) is the oracle: a sandbox booted from a layered (assembled) rootfs must run code,
 keep kernel state, and expose ports exactly as before; a **new** layered-template test asserts a `base`-derived
 template carries its added content (e.g. an extra package) **and** that `{B}/rootfs.ext4` is materially smaller
-than a full rootfs (the COW win, measured). 18b reports the honest bytes-stored / assemble-time numbers.
+than a full rootfs (the COW win, measured). 18c reports the honest bytes-stored / assemble-time numbers.
+
+### Decision 8 — a layered build must mkfs the child at the **base's fixed size** (measured; the COW precondition)
+E2B's rootfs diff is small because a layer is the **same block device** mutated in place. Our `build-rootfs.sh`
+instead `mkfs.ext4 -d`s a **fresh** image each build, sizing it `du(content) + margin` — so a naive block diff of
+two independently-built images depends entirely on whether `mkfs.ext4 -d` lays the shared files at the **same
+block offsets**. Measured on this box (synthetic A vs B = A + a small "package"):
+
+| how A and B are mkfs'd | changed blocks (B vs A) |
+|---|---|
+| **same fixed size**, B = A + one file | **0.7%** |
+| **different sizes** (`du+margin` each, B larger) | **31%** — changing the image size shifts ext4's block-group layout, so most "changed" blocks are spurious relocations, not content |
+| **same fixed size**, B = A + a multi-file package (~3 MiB) | **2.9%** (~the genuinely-added bytes) |
+
+So `mkfs.ext4 -d` *is* deterministic and append-friendly **at a fixed size**, but resizing reshuffles the layout.
+The COW precondition is therefore: **a layered build pins the child rootfs to the base's exact size** (the
+single-machine analogue of E2B's shared device). 18c teaches `build-rootfs.sh` a fixed-size argument and passes
+the base's size; it fails loudly if the child's content exceeds the base size (the user must rebuild the base
+with more margin). The storage **mechanism** (18b) stays correct for *any* sizes — it just stores a bigger diff
+when sizes differ — so the size-pin is an efficiency precondition, not a correctness one. **Honest:** without the
+size-pin the diff is ~31% (still less than a full image, but far from the 2.9% the pin buys).
 
 ## 5. Code "from → to" map
 
@@ -227,7 +247,13 @@ than a full rootfs (the COW win, measured). 18b reports the honest bytes-stored 
 | template build | flat (no base) | optional `base` → diff over it; api `from`, SDK `base=` |
 | deps | none added | **none** (owner = table index, not uuid) |
 
-## 6. Three independently verifiable sub-steps
+## 6. Independently verifiable sub-steps
+
+> Re-split after 18a: the empirical size-pin finding (Decision 8) made the original 18b — "producer +
+> boot wiring" in one step — too large and entangled with `build-rootfs.sh`. It is now 18b (the pure
+> `pkg/storage` mechanism, KVM-free) + 18c (the build/orchestrator wiring incl. the size-pin) + 18d
+> (api/SDK + the real e2e + docs). The header substrate (18a) and the storage mechanism (18b) stay
+> KVM-free and fully unit-tested before any VM/build path is touched — the 14a/15a/17a discipline.
 
 ### Stage 18a — `pkg/storage/header`: the owner + the merge algebra (no wiring)
 Add to the header package: the owner-bearing `BuildMap`/`Metadata` (format v2) + the build table; `CreateMapping`
@@ -240,17 +266,29 @@ mapping; `NormalizeMappings` coalescing; `Resolve` returning the right `(owner, 
 ranges and the zero/gap owner otherwise. Nothing else changes; `go test ./services/...` green. (Mirrors how
 17a/14a/15a banked the format before swapping behavior.)
 
-### Stage 18b — wire the rootfs producer + the layered materialize/boot path
-`pkg/storage` gains `RootfsHeaderName`, `PublishRootfsDiff` (upload diff + v2 header), and `MaterializeLayered`
-(assemble the baked rootfs by reading each run from its owner's object through a small per-build object cache;
-gap → zeros). `pkg/build` resolves+assembles the `base` rootfs, runs `BuildDiff`, `MergeMappings` onto the base
-header, uploads the diff+header (no `base` → today's whole upload, unchanged). The orchestrator's
-`prepareSpawn`/`prepareRestore` probe `rootfs.ext4.header` → `MaterializeLayered`, else `Materialize` whole.
-Unit tests: `MaterializeLayered` over a `Local` two-build fixture reconstructs the exact full rootfs; the
-no-header fallback boots the whole object; an assemble across `base`+`child`+gap is byte-correct. **Measured**
-and reported as-is: a derived template's `{B}/rootfs.ext4` size vs a full rootfs, and assemble time.
+### Stage 18b — `pkg/storage`: the rootfs COW mechanism (no build/VM wiring)
+`pkg/storage` gains `RootfsHeaderName` + `OpenRootfsHeader` (the rootfs analogue of `OpenMemfileHeader`),
+`PublishRootfsDiff(baseBuildID, childRootfsPath, childBuildID)` (materialize+assemble the base's full rootfs,
+`header.BuildDiff` the child against it, `NormalizeMappings(MergeMappings(baseMapping, childDiff))`, upload the
+compacted diff as `{child}/rootfs.ext4` + the flattened v2 header as `{child}/rootfs.ext4.header`), and
+`MaterializeLayered(buildID, dst)` (assemble the baked rootfs by reading each run from its owner's object via a
+per-owner `OpenReaderAt` cache, gaps/zero-owner runs left zero in a truncated file; **no header → today's whole
+download**, the Stage-15 fallback). **KVM-free unit tests over a `Local` two-build fixture**: a base uploaded
+whole + a child diff → `MaterializeLayered(child)` reconstructs the child byte-for-byte; a three-layer chain
+(A→B→C) assembles correctly; a child that zeroes a block assembles zeros there; the no-header base falls back to
+the whole object; the stored `{child}/rootfs.ext4` holds only the changed non-zero blocks (measured smaller).
+Nothing in `pkg/build`/orchestrator/api changes; `go test ./services/...` green. (The 17a/15a discipline: bank
+the mechanism, unit-tested, before any VM/build path.)
 
-### Stage 18c — wire the layered template API/SDK + docs + honest review
+### Stage 18c — wire the producer + boot path (build/orchestrator), incl. the size-pin
+`build-rootfs.sh` learns a fixed-size argument; `pkg/build` for a `base`-set build resolves the base alias,
+materializes the base rootfs, builds the child **pinned to the base's size** (Decision 8), and publishes via
+`PublishRootfsDiff` (no `base` → today's whole upload, unchanged). The orchestrator's `prepareSpawn`/
+`prepareRestore` probe `rootfs.ext4.header` → `MaterializeLayered`, else `Materialize` whole; the
+`TemplateService` carries an optional `base`. Unit-test the build command sequence (the size-pin arg) with the
+injectable executor; the assemble path is already covered by 18b.
+
+### Stage 18d — wire the layered template API/SDK + docs + honest review
 `TemplateCreate` carries an optional `base`; api `POST /templates` gains `from`; SDK `build_template(base=…)`.
 A new Python e2e: build `derived` with `base=default` + a `RUN pip install <small pkg>`, create a sandbox on it,
 assert the package imports (content carried) **and** that the stored rootfs diff is materially smaller than a
