@@ -38,6 +38,11 @@ const (
 	// COMPACTED object (non-zero blocks only) and the boot path remaps logical offsets through the
 	// header, serving gaps as zeros without a fetch; absent, {buildID}/memfile is the raw full memfile.
 	HeaderName = "memfile.header"
+	// RootfsHeaderName is the rootfs's copy-on-write index (Stage 18): with it present,
+	// {buildID}/rootfs.ext4 is the build's DIFF (its changed blocks only) and the boot path assembles
+	// the full rootfs from each run's owning build (MaterializeLayered); absent, {buildID}/rootfs.ext4
+	// is the whole rootfs (a non-layered build) and the boot path downloads it whole.
+	RootfsHeaderName = "rootfs.ext4.header"
 )
 
 // aliasPrefix namespaces the mutable name->buildID pointers away from the immutable {buildID}/ prefixes.
@@ -187,13 +192,19 @@ func uploadLocalFile(ctx context.Context, sp StorageProvider, localPath, key str
 // OpenMemfileHeader fetches and parses {buildID}/memfile.header, returning (nil, nil) when it is absent
 // -- an unindexed (pre-Stage-17) bucket, where the caller falls back to streaming the full raw memfile.
 func OpenMemfileHeader(ctx context.Context, sp StorageProvider, buildID string) (*header.Header, error) {
-	key := ArtifactKey(buildID, HeaderName)
+	return openHeader(ctx, sp, ArtifactKey(buildID, HeaderName))
+}
+
+// openHeader fetches and parses a serialized header object at key, returning (nil, nil) when the object
+// is absent (the caller's signal to fall back to the whole-object path). Shared by the memfile (Stage 17)
+// and rootfs (Stage 18) header readers.
+func openHeader(ctx context.Context, sp StorageProvider, key string) (*header.Header, error) {
 	ok, err := sp.Exists(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return nil, nil // no header: fall back to the Stage-15 full-object path
+		return nil, nil // no header: fall back to the whole-object path
 	}
 	rc, err := sp.Open(ctx, key)
 	if err != nil {
@@ -202,11 +213,11 @@ func OpenMemfileHeader(ctx context.Context, sp StorageProvider, buildID string) 
 	defer rc.Close()
 	b, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, fmt.Errorf("read memfile header: %w", err)
+		return nil, fmt.Errorf("read header %s: %w", key, err)
 	}
 	h, err := header.Deserialize(b)
 	if err != nil {
-		return nil, fmt.Errorf("parse memfile header for build %q: %w", buildID, err)
+		return nil, fmt.Errorf("parse header %s: %w", key, err)
 	}
 	return &h, nil
 }
