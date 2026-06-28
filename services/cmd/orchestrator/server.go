@@ -261,7 +261,22 @@ func (s *server) prepareRestore(tmpl template.Template) (uffd.PageSource, error)
 	if err != nil {
 		return nil, err
 	}
-	return uffd.NewChunkedSource(rr, rr.Close, 0), nil
+	// Stage 17: if the build carries a memfile header, {buildID}/memfile is COMPACTED -- resolve each
+	// faulting logical offset through the header's mapping (gaps served as zeros, no fetch). Without a
+	// header it is the raw full memfile (a pre-Stage-17 bucket) -- stream it whole as before.
+	hdr, err := storage.OpenMemfileHeader(ctx, s.storage, buildID)
+	if err != nil {
+		rr.Close()
+		return nil, err
+	}
+	if hdr == nil {
+		return uffd.NewChunkedSource(rr, rr.Close, 0), nil
+	}
+	extents := make([]uffd.Extent, len(hdr.Mapping))
+	for i, m := range hdr.Mapping {
+		extents[i] = uffd.Extent{Logical: int64(m.Offset), Length: int64(m.Length), Physical: int64(m.BuildStorageOffset)}
+	}
+	return uffd.NewMappedSource(rr, rr.Close, extents, int64(hdr.Metadata.Size), 0), nil
 }
 
 // prepareSpawn ensures a cold start's rootfs is at its baked local path, materializing it from object

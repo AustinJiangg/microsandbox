@@ -121,12 +121,18 @@ func (b *Builder) publish(buildID, name, dir string, withSnapshot bool) error {
 		snap := filepath.Join(dir, "snapshot")
 		uploads = append(uploads,
 			struct{ local, key string }{filepath.Join(snap, "vmstate"), storage.ArtifactKey(buildID, storage.SnapfileName)},
-			struct{ local, key string }{filepath.Join(snap, "memfile"), storage.ArtifactKey(buildID, storage.MemfileName)},
 		)
 	}
 	for _, u := range uploads {
 		if err := uploadFile(ctx, b.storage, u.local, u.key); err != nil {
 			return fmt.Errorf("upload %s: %w", u.key, err)
+		}
+	}
+	// The memfile is compacted + indexed, not uploaded raw (Stage 17): PublishMemfile uploads
+	// {buildID}/memfile (present blocks only) and {buildID}/memfile.header. See docs/STAGE17_DESIGN.md.
+	if withSnapshot {
+		if err := storage.PublishMemfile(ctx, b.storage, filepath.Join(dir, "snapshot", "memfile"), buildID); err != nil {
+			return err
 		}
 	}
 	if err := storage.SetAlias(ctx, b.storage, name, buildID); err != nil {

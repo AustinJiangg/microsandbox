@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"microsandbox/services/pkg/storage/header"
 	"microsandbox/services/pkg/template"
 )
 
@@ -33,6 +34,10 @@ const (
 	RootfsName   = "rootfs.ext4"
 	MemfileName  = "memfile"
 	SnapfileName = "snapfile" // E2B's name for the Firecracker VM state (our local file is "vmstate")
+	// HeaderName is the memfile's per-block index (Stage 17): with it present, {buildID}/memfile is the
+	// COMPACTED object (non-zero blocks only) and the boot path remaps logical offsets through the
+	// header, serving gaps as zeros without a fetch; absent, {buildID}/memfile is the raw full memfile.
+	HeaderName = "memfile.header"
 )
 
 // aliasPrefix namespaces the mutable name->buildID pointers away from the immutable {buildID}/ prefixes.
@@ -141,4 +146,67 @@ func Materialize(ctx context.Context, sp StorageProvider, key, dst string) error
 		return err
 	}
 	return os.Rename(tmp, dst) // atomic publish at the baked path
+}
+
+// PublishMemfile compacts memfilePath through the header index and uploads BOTH the compacted object
+// ({buildID}/memfile -- only the non-zero blocks) and its serialized header ({buildID}/memfile.header).
+// It replaces uploading the raw memfile (Stage 17): storage holds only present bytes, and the boot path
+// resolves a logical offset through the header, serving gaps as zeros without a fetch. The compacted
+// object is uploaded BEFORE the header, so a present header always implies a present compacted object
+// (the boot path probes the header first). Both producers -- pkg/build and cmd/msb-seed -- call this.
+func PublishMemfile(ctx context.Context, sp StorageProvider, memfilePath, buildID string) error {
+	h, compactPath, err := header.BuildFile(memfilePath, header.DefaultBlockSize)
+	if err != nil {
+		return fmt.Errorf("index memfile %s: %w", memfilePath, err)
+	}
+	defer os.Remove(compactPath)
+	if err := uploadLocalFile(ctx, sp, compactPath, ArtifactKey(buildID, MemfileName)); err != nil {
+		return fmt.Errorf("upload compacted memfile: %w", err)
+	}
+	hb := h.Serialize()
+	if err := sp.Upload(ctx, ArtifactKey(buildID, HeaderName), bytes.NewReader(hb), int64(len(hb))); err != nil {
+		return fmt.Errorf("upload memfile header: %w", err)
+	}
+	return nil
+}
+
+// uploadLocalFile streams a local file to key with its size (PutObject needs the content length).
+func uploadLocalFile(ctx context.Context, sp StorageProvider, localPath, key string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return sp.Upload(ctx, key, f, fi.Size())
+}
+
+// OpenMemfileHeader fetches and parses {buildID}/memfile.header, returning (nil, nil) when it is absent
+// -- an unindexed (pre-Stage-17) bucket, where the caller falls back to streaming the full raw memfile.
+func OpenMemfileHeader(ctx context.Context, sp StorageProvider, buildID string) (*header.Header, error) {
+	key := ArtifactKey(buildID, HeaderName)
+	ok, err := sp.Exists(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil // no header: fall back to the Stage-15 full-object path
+	}
+	rc, err := sp.Open(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, fmt.Errorf("read memfile header: %w", err)
+	}
+	h, err := header.Deserialize(b)
+	if err != nil {
+		return nil, fmt.Errorf("parse memfile header for build %q: %w", buildID, err)
+	}
+	return &h, nil
 }

@@ -10,7 +10,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"microsandbox/services/pkg/storage/header"
 )
 
 func TestArtifactKey(t *testing.T) {
@@ -134,6 +137,71 @@ func TestMaterialize(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(dst); !bytes.Equal(got, sentinel) {
 		t.Errorf("cache hit re-downloaded: dst = %q, want the sentinel %q", got, sentinel)
+	}
+}
+
+// TestPublishAndOpenMemfileHeader round-trips the Stage-17 producer/consumer storage seam: a memfile
+// with a zero gap is compacted on publish (only the present blocks are stored) and its header parses
+// back to the expected mapping.
+func TestPublishAndOpenMemfileHeader(t *testing.T) {
+	bs := int(header.DefaultBlockSize)
+	mem := bytes.Repeat([]byte{1}, bs)                // present
+	mem = append(mem, make([]byte, bs)...)            // zero gap
+	mem = append(mem, bytes.Repeat([]byte{2}, bs)...) // present
+	memPath := filepath.Join(t.TempDir(), "memfile")
+	if err := os.WriteFile(memPath, mem, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sp := NewLocal(t.TempDir())
+	ctx := context.Background()
+	if err := PublishMemfile(ctx, sp, memPath, "bld1"); err != nil {
+		t.Fatalf("PublishMemfile: %v", err)
+	}
+
+	// The compacted object holds only the two present blocks, zeros omitted.
+	rc, err := sp.Open(ctx, ArtifactKey("bld1", MemfileName))
+	if err != nil {
+		t.Fatalf("open compacted memfile: %v", err)
+	}
+	comp, _ := io.ReadAll(rc)
+	rc.Close()
+	want := append(bytes.Repeat([]byte{1}, bs), bytes.Repeat([]byte{2}, bs)...)
+	if !bytes.Equal(comp, want) {
+		t.Fatalf("compacted object = %d bytes, want %d (present blocks only)", len(comp), len(want))
+	}
+
+	// The header parses back and maps the two present runs to their physical offsets.
+	h, err := OpenMemfileHeader(ctx, sp, "bld1")
+	if err != nil || h == nil {
+		t.Fatalf("OpenMemfileHeader = %+v, %v; want a parsed header", h, err)
+	}
+	if h.Metadata.Size != uint64(len(mem)) {
+		t.Errorf("header Size = %d, want %d", h.Metadata.Size, len(mem))
+	}
+	wantMap := header.Mapping{
+		{Offset: 0, Length: uint64(bs), BuildStorageOffset: 0},
+		{Offset: uint64(2 * bs), Length: uint64(bs), BuildStorageOffset: uint64(bs)},
+	}
+	if !reflect.DeepEqual(h.Mapping, wantMap) {
+		t.Fatalf("mapping = %+v, want %+v", h.Mapping, wantMap)
+	}
+}
+
+// TestOpenMemfileHeaderAbsent covers the backward-compat fallback: a build with a raw memfile but no
+// header object (a pre-Stage-17 bucket) returns (nil, nil), so the boot path streams the full object.
+func TestOpenMemfileHeaderAbsent(t *testing.T) {
+	sp := NewLocal(t.TempDir())
+	ctx := context.Background()
+	if err := sp.Upload(ctx, ArtifactKey("old", MemfileName), bytes.NewReader([]byte("raw")), 3); err != nil {
+		t.Fatal(err)
+	}
+	h, err := OpenMemfileHeader(ctx, sp, "old")
+	if err != nil {
+		t.Fatalf("OpenMemfileHeader (absent) error: %v", err)
+	}
+	if h != nil {
+		t.Fatalf("OpenMemfileHeader (absent) = %+v, want nil (fallback to full object)", h)
 	}
 }
 

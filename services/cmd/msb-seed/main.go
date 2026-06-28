@@ -57,8 +57,10 @@ func main() {
 		if err := upload(ctx, sp, vmstate, storage.ArtifactKey(bid, storage.SnapfileName)); err != nil {
 			log.Fatalf("upload snapfile: %v", err)
 		}
-		if err := upload(ctx, sp, memfile, storage.ArtifactKey(bid, storage.MemfileName)); err != nil {
-			log.Fatalf("upload memfile: %v", err)
+		// The memfile is compacted + indexed (Stage 17): PublishMemfile uploads the present blocks as
+		// {buildID}/memfile and the per-block index as {buildID}/memfile.header.
+		if err := storage.PublishMemfile(ctx, sp, memfile, bid); err != nil {
+			log.Fatalf("publish memfile: %v", err)
 		}
 	}
 	// Flip the alias last, so a resolver never sees a half-published build.
