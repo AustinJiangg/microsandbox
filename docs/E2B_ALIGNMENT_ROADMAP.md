@@ -17,11 +17,14 @@
 > Decision D1)**, **13 (UFFD lazy snapshot restore behind `--uffd`; `File` stays the
 > default)**, **14 (the storage swaps go live: catalog → Redis, store → Postgres)**, and **15 (the
 > last storage swap: `Local → object storage`, MinIO/S3 — rootfs/snapfile materialized, memfile
-> streamed over UFFD), and **16 (the first production-fidelity stage: auth — `X-API-Key`→team,
-> team-scoped resources, and a per-sandbox data-plane access token)** are **done** — see their design
+> streamed over UFFD), **16 (the first production-fidelity stage: auth — `X-API-Key`→team,
+> team-scoped resources, and a per-sandbox data-plane access token)**, and **17 (the first
+> storage-mechanism-depth item: the streamed memfile stored compacted behind a per-block
+> `pkg/storage/header` index — zero/gap pages served without a fetch)** are **done** — see their design
 > docs and the "Done" list in `CLAUDE.md`. The remainder (production fidelity — multi-host / a TS SDK;
-> plus deferred storage-mechanism depth — NBD-served rootfs, chunk/header/compression, COW layers; and
-> auth depth — a key-management API, token expiry/rotation, TLS) is the **deferred** forward plan.
+> plus the rest of the storage-mechanism depth — NBD-served rootfs over the same header, chunk
+> compression, COW layers, a cross-node cache; and auth depth — a key-management API, token
+> expiry/rotation, TLS) is the **deferred** forward plan.
 
 ## 1. Why this document
 
@@ -216,13 +219,26 @@ ports stay public. **Honest scope:** keys seeded by flag (no key-management API)
 (no expiry/rotation/signing), plaintext on loopback — the auth *seam*, not a hardened gateway; still
 not security-audited. e2e **43/43** (37 prior + 6 auth). **Detail: `docs/STAGE16_DESIGN.md`.**
 
+### Stage 17 — storage depth (1): a `.header`-indexed, compacted memfile ✅
+The first of the deferred storage-mechanism-depth items, and the first storage stage that **stores and
+fetches strictly less** rather than only adding fidelity. Added `pkg/storage/header` (mirroring E2B's
+`pkg/storage/header`): a `Metadata` + ordered `Mapping` of present (non-zero) runs; the builder/seeder
+**compact** the stored memfile (only non-zero blocks, via `storage.PublishMemfile`) and write a
+`{buildID}/memfile.header`, and the boot path resolves each faulting logical offset through the mapping —
+serving zero/gap pages with **no fetch** (`uffd.NewMappedSource`, storage-free `Extent`), else falling
+back to the Stage-15 full-object stream for an unindexed bucket. Single-build simplification: E2B's
+per-entry `BuildId` (the COW owner) and chunk compression are deferred. **Measured:** the 512.0 MiB
+default memfile → 228.6 MiB compacted (2.2×), 6,560-byte header; e2e 43/43 in s3 mode; no isolated
+single-box latency win (net setup dominates). See `docs/STAGE17_DESIGN.md`.
+
 ### Still deferred
-- **Storage-mechanism depth (deeper E2B fidelity behind the same seam).** Verified against
-  `e2b-dev/infra`: E2B serves the **rootfs lazily over a userspace NBD block device** (not
-  materialized whole, as we do), stores rootfs+memfile **chunked + compressed with a `.header`
-  per-page-state index**, builds templates as **copy-on-write diff layers**, and shares chunks via a
-  **cross-node cache**. Each deepens the *mechanism* behind the Stage-15 `StorageProvider` /
-  `PageSource` interfaces without changing the seam — candidate future stages (`docs/STAGE15_DESIGN.md` §11).
+- **More storage-mechanism depth (deeper E2B fidelity behind the same seam).** Verified against
+  `e2b-dev/infra`, and now building on the Stage-17 `pkg/storage/header`: E2B serves the **rootfs lazily
+  over a userspace NBD block device** (not materialized whole, as we do — over the *same* header), stores
+  rootfs+memfile **chunked + compressed** (the header gains per-block stored lengths), builds templates as
+  **copy-on-write diff layers** (the header's per-entry build owner), and shares chunks via a **cross-node
+  cache**. Each deepens the *mechanism* behind the `StorageProvider` / `PageSource` / `header` interfaces
+  without changing the seam — candidate future stages (`docs/STAGE15_DESIGN.md` §11, `docs/STAGE17_DESIGN.md` §10).
 - **Later — production fidelity.** Auth landed in Stage 16 (above); what remains: multi-host
   scheduling (real node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource
   limits and start/ready commands, plus auth depth (a key-management API, token expiry/rotation, TLS).

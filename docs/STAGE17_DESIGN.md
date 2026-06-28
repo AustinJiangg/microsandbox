@@ -1,6 +1,6 @@
 # Stage 17 design: storage-mechanism depth (1) — a `.header`-indexed, compacted memfile
 
-> Status: **proposed (design only).** First of the deferred "storage-mechanism depth" items the
+> Status: **done (17a + 17b + 17c).** First of the deferred "storage-mechanism depth" items the
 > roadmap parked behind the Stage-15 `StorageProvider` / `PageSource` seams
 > (`docs/E2B_ALIGNMENT_ROADMAP.md` §5 "Still deferred"; `docs/STAGE15_DESIGN.md` §11). Stage 15 made
 > object storage the source of truth and streamed the memfile page-by-page over UFFD, but as **one
@@ -35,6 +35,16 @@
 > this loopback box (where the bytes saved are cheap to move anyway) is **measured in 17b and reported
 > as-is** — no pre-claim. The durable win is the header mechanism itself: it is the precondition for the
 > NBD rootfs (same index), COW layered builds (the per-entry build owner), and a cross-node chunk cache.
+>
+> **Outcome (measured, this WSL2 box).** The default template's **512.0 MiB** memfile compacts to
+> **228.6 MiB** stored (44.6% — a 2.2× reduction; 283 MiB of zeros dropped) across **272 present runs**,
+> with a **6,560-byte** header; the build-time scan is **~0.52 s**, one-time at publish/seed. Full e2e
+> **43/43 in s3 mode** (each restore streams the *compacted* `default/memfile` over UFFD via the
+> mapping, gap pages served as zeros with no fetch); the `local-fs` + File / mmap escape hatches are
+> untouched and stay green. As with Stages 13–15 this is **not** a single-box latency win — restore-to-
+> ready is dominated by per-sandbox network setup (Stages 13/15), and compaction's effect on it is
+> within noise — but it is the first storage stage that **stores and fetches strictly less**, and the
+> `pkg/storage/header` mechanism (the shared substrate of the deferred NBD/COW/cache work) now exists.
 
 ## 1. Goal & non-goals
 
@@ -221,7 +231,7 @@ reports the honest number (Stages 13–15's discipline).
 
 ## 6. Three independently verifiable sub-steps
 
-### Stage 17a — `pkg/storage/header`: the format + builder (no wiring)
+### Stage 17a — `pkg/storage/header`: the format + builder (no wiring) ✅
 Add the package: `Metadata`/`BuildMap`/`Mapping`, `Serialize`/`Deserialize` (fixed-width little-endian),
 `BuildFromMemfile(path, blockSize) → (Mapping, compactedPath/Reader, error)` (zero-block detection + run
 coalescing + sequential storage offsets), and `Extents()`/resolution helpers. **KVM-free unit tests**:
@@ -231,21 +241,26 @@ zero/gap signal otherwise (incl. the tail past the last entry, and a fully-zero 
 Nothing else changes; `go test ./services/...` green. (Mirrors how 14a/15a banked the interface before
 swapping behavior.)
 
-### Stage 17b — wire it: producers compact+index, the boot path consumes the header
-`pkg/build` + `cmd/msb-seed` build the header+compacted object and upload both. `pkg/uffd` gains
-`NewMappedSource` (+ unit tests over a `Local`/in-memory `io.ReaderAt`: gap → zeros with zero reads,
-present → correct bytes, a fault buffer spanning a gap↔present boundary). `prepareRestore` probes the
-header and builds the mapped source, else falls back. `conftest`/`dev-up` re-seed (the existing seed call
-now writes the new form — usually no fixture change). Verify: `go test ./services/...` green; Python e2e
-green against Postgres + Redis + MinIO (target **43/43**), memfile compacted + streamed via the mapping.
-**Measure** restore-to-ready + bytes fetched vs Stage 15 and record the honest number.
+### Stage 17b — wire it: producers compact+index, the boot path consumes the header ✅
+`pkg/build` + `cmd/msb-seed` build the header+compacted object and upload both (via a shared
+`storage.PublishMemfile`). `pkg/uffd` gained `NewMappedSource` + `Extent` (storage-free plain ints) with
+unit tests over an in-memory `io.ReaderAt`: gap → zeros **with zero physical reads** (asserted via a
+counting reader), present → correct bytes, a buffer spanning gap↔present (the hugepage case), all-zero →
+EOF past size. `storage` gained `HeaderName`/`OpenMemfileHeader` (+ a round-trip and a no-header
+**fallback** unit test). `prepareRestore` probes the header → `NewMappedSource`, else `NewChunkedSource`.
+The existing `_seed_template` re-seeds the new form unchanged (no fixture edit). **Measured:** the
+512.0 MiB default memfile → 228.6 MiB compacted (2.2×) across 272 runs, 6,560-byte header, ~0.52 s scan;
+`go test ./services/...` green; Python e2e **43/43** against Postgres + Redis + MinIO with the compacted
+memfile streamed via the mapping. No isolated restore-to-ready win (within noise; net setup dominates) —
+the honest win is storing/fetching strictly less, as the header above records.
 
-### Stage 17c — docs, defaults, honest review
-Finalize this doc's status; update `CLAUDE.md` (Done list + the storage line), `docs/ARCHITECTURE.md`
-(the artifacts state-seam line), and the roadmap (move §11 item 2's *index* half to done; compression /
-COW / NBD stay listed). Confirm the **warm pool** (it rides `Restore`, so it streams via the mapping too)
-and the **template-build** path (it now compacts+indexes) behave. Re-run the full e2e and give the
-🔴/🟡/🟢 self-review.
+### Stage 17c — docs, defaults, honest review ✅
+Finalized this doc's status + measured outcome; updated `CLAUDE.md` (Done list + the storage line),
+`docs/ARCHITECTURE.md` (the artifacts state-seam line), and the roadmap (§11 item 2's *index/compaction*
+half → done; compression / COW / NBD stay listed). The **warm pool** rides `fc.Restore` (→
+`prepareRestore`), so a pooled VM streams via the mapping identically — exercised by the e2e's restore
+cases. The **template-build** path now compacts+indexes through the same `storage.PublishMemfile` the
+seeder uses (one writer, one format). Full e2e re-run 43/43; 🟢 self-review.
 
 ## 7. Keeping tests green (honest trade-offs)
 

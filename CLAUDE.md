@@ -60,7 +60,10 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    **`TemplateService`** (Stage 10): the api's `POST /templates` kicks an async template
    build there (`pkg/build` wrapping the build scripts, `pkg/storage` publishing the artifacts to
    **S3 object storage** — MinIO locally — since Stage 15; the orchestrator materializes rootfs/snapfile
-   and streams the memfile from the bucket over UFFD).
+   and streams the memfile from the bucket over UFFD). Since **Stage 17** the memfile is stored
+   **compacted** (non-zero blocks only) behind a per-block index (`pkg/storage/header`, mirroring E2B's
+   `pkg/storage/header`); the boot path resolves each faulting offset through the mapping and serves
+   zero/gap pages without a fetch.
    Stage 4 first extracted all this as a single `control-plane/` binary; Stage 8 dissolved it
    into `services/`; Stage 9 sank the data path off the api. See `docs/STAGE10_DESIGN.md` +
    `docs/STAGE9_DESIGN.md` + `docs/STAGE8_DESIGN.md` +
@@ -228,10 +231,30 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   *seam*, not a hardened gateway; **still not security-audited, never safe for untrusted input.**
   Go units green (incl. live Postgres + Redis); real-machine e2e **43/43** (37 prior + 6 auth).
   See `docs/STAGE16_DESIGN.md`.
+- **Done (Stage 17 — storage depth (1): a `.header`-indexed, compacted memfile)**: the first of the
+  deferred storage-mechanism-depth items (`docs/STAGE15_DESIGN.md` §11), and the first storage stage that
+  **stores and fetches strictly less** rather than only adding fidelity. 17a added `pkg/storage/header`
+  (mirroring E2B's `pkg/storage/header`): a fixed-width `Metadata` + an ordered `Mapping` of present
+  (non-zero) runs, `Serialize`/`Deserialize`, and `Build`/`BuildFile` that scan a memfile in 4 KiB blocks
+  into `(mapping, compacted-bytes)` by dropping all-zero blocks — pure, KVM-free, hand-serialized
+  little-endian (no new dep; E2B's per-entry `BuildId`/`BaseBuildId` dropped until COW). 17b wired it:
+  `pkg/build` + `cmd/msb-seed` upload via a shared `storage.PublishMemfile` (compacted `{buildID}/memfile`
+  + `{buildID}/memfile.header`); `pkg/uffd` gained `NewMappedSource` + a plain `Extent` (stays
+  storage-free) that serves a gap as zeros **with no fetch** and present runs through the chunk cache at
+  the remapped physical offset; `prepareRestore` probes the header (`storage.OpenMemfileHeader`) → mapped
+  source, else falls back to the Stage-15 full-object `chunkedSource` (an old, unindexed bucket still
+  boots — covered by a unit test). **Measured:** the 512.0 MiB default memfile → **228.6 MiB** compacted
+  (44.6%, **2.2×**) across 272 runs, a 6,560-byte header, ~0.52 s one-time build scan; e2e **43/43** in s3
+  mode (the compacted memfile streamed over UFFD via the mapping). **Honest:** not a single-box latency
+  win (restore-to-ready is dominated by per-sandbox net setup, unchanged); the win is real compaction +
+  zero-page fetch elision, and the `header` mechanism is the shared substrate the deferred NBD rootfs /
+  COW layers / chunk cache all consume. See `docs/STAGE17_DESIGN.md`.
 - **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): production fidelity —
   multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript
-  SDK; plus the deferred storage-mechanism depth (NBD rootfs, chunk/header/compression, COW layers)
-  and auth depth (a key-management API, token expiry/rotation, TLS).
+  SDK; plus the rest of the storage-mechanism depth now that Stage 17 banked the `pkg/storage/header`
+  index (NBD-streamed rootfs over the same header, memfile/rootfs **compression** on the existing
+  mapping, COW layered builds, a cross-node chunk cache) and auth depth (a key-management API, token
+  expiry/rotation, TLS).
 
 ## Development conventions
 
