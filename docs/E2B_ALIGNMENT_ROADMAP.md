@@ -17,9 +17,11 @@
 > Decision D1)**, **13 (UFFD lazy snapshot restore behind `--uffd`; `File` stays the
 > default)**, **14 (the storage swaps go live: catalog → Redis, store → Postgres)**, and **15 (the
 > last storage swap: `Local → object storage`, MinIO/S3 — rootfs/snapfile materialized, memfile
-> streamed over UFFD)** are **done** — see their design docs and the "Done" list in `CLAUDE.md`. The
-> remainder (production fidelity — auth / multi-host / a TS SDK; plus deferred storage-mechanism depth
-> — NBD-served rootfs, chunk/header/compression, COW layers) is the **deferred** forward plan.
+> streamed over UFFD), and **16 (the first production-fidelity stage: auth — `X-API-Key`→team,
+> team-scoped resources, and a per-sandbox data-plane access token)** are **done** — see their design
+> docs and the "Done" list in `CLAUDE.md`. The remainder (production fidelity — multi-host / a TS SDK;
+> plus deferred storage-mechanism depth — NBD-served rootfs, chunk/header/compression, COW layers; and
+> auth depth — a key-management API, token expiry/rotation, TLS) is the **deferred** forward plan.
 
 ## 1. Why this document
 
@@ -202,6 +204,18 @@ build now; E2B's layered-step cache is a noted later enhancement.)
   end-to-end-pluggable page source. e2e 37/37 in s3 mode. See `docs/STAGE15_DESIGN.md` (its §11
   itemizes the deferred mechanism depth, verified against `e2b-dev/infra`).
 
+### Stage 16 — auth (`X-API-Key`→team, team-scoped resources, a data-plane access token) ✅
+The first production-fidelity stage; gives the system **identity**. The api authenticates every
+request (except `/health`) with an `X-API-Key` resolving to a **team** (keys stored hashed in
+`pkg/store`'s new `teams`/`api_keys` tables, seeded by `--seed-api-keys`); sandboxes/builds are
+**team-owned** so list/delete/build-status are team-scoped (another team's id is 404, not 403).
+The data plane gets a **per-sandbox access token** minted by the api at create, carried in the
+catalog (`catalog.Route{Node, Token}`) and returned to the SDK; client-proxy gates the in-VM
+**control ports** (envd `:49983`, code-interpreter `:49999`) on `X-Access-Token` while user-exposed
+ports stay public. **Honest scope:** keys seeded by flag (no key-management API), token bearer-only
+(no expiry/rotation/signing), plaintext on loopback — the auth *seam*, not a hardened gateway; still
+not security-audited. e2e **43/43** (37 prior + 6 auth). **Detail: `docs/STAGE16_DESIGN.md`.**
+
 ### Still deferred
 - **Storage-mechanism depth (deeper E2B fidelity behind the same seam).** Verified against
   `e2b-dev/infra`: E2B serves the **rootfs lazily over a userspace NBD block device** (not
@@ -209,9 +223,9 @@ build now; E2B's layered-step cache is a noted later enhancement.)
   per-page-state index**, builds templates as **copy-on-write diff layers**, and shares chunks via a
   **cross-node cache**. Each deepens the *mechanism* behind the Stage-15 `StorageProvider` /
   `PageSource` interfaces without changing the seam — candidate future stages (`docs/STAGE15_DESIGN.md` §11).
-- **Later — production fidelity.** Auth (`X-API-Key`→team), multi-host scheduling (real
-  node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource limits
-  and start/ready commands.
+- **Later — production fidelity.** Auth landed in Stage 16 (above); what remains: multi-host
+  scheduling (real node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource
+  limits and start/ready commands, plus auth depth (a key-management API, token expiry/rotation, TLS).
 
 ## 6. Repo layout after Stage 10
 

@@ -42,15 +42,20 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    (kept in `src/` as reference).
 4. **control plane** — `services/` (Go module `microsandbox/services`), split into
    E2B-shaped services (Stages 8–9). **`cmd/api`** is the **lifecycle-only** public REST
-   front (owns a Postgres metadata store, `pkg/store` — SQLite still selectable; Stage 14b);
-   it calls **`cmd/orchestrator`** over
+   front (owns a Postgres metadata store, `pkg/store` — SQLite still selectable; Stage 14b).
+   Since **Stage 16** it **authenticates** every request (except `/health`) with an
+   `X-API-Key` resolving to a **team** (keys stored hashed in `pkg/store`; seeded by
+   `--seed-api-keys`); sandboxes/builds are **team-owned** so list/delete are team-scoped. It
+   calls **`cmd/orchestrator`** over
    **gRPC** (`SandboxService`). The orchestrator owns the microVM fleet + warm pool
    (`pkg/{fc,pool,network,template}`) and a header-routed **data proxy** (`pkg/proxy`) that
    bridges the data path to the daemon over the VM's NIC (TCP; Stage 12). **`cmd/client-proxy`**
    (Stage 9) is the edge data proxy: it reads a shared routing **catalog** (`pkg/catalog`,
-   sandbox→node in **Redis** since Stage 14a, written by the api on create) and routes each data
+   sandbox→`{node, access-token}` in **Redis** since Stage 14a, written by the api on create) and routes each data
    request by its `<port>-<id>` `Host` header
-   (Stage 12; the port selects the in-VM service or a user port) to the orchestrator's proxy. So the SDK talks to **two** endpoints — the api (lifecycle) and client-proxy
+   (Stage 12; the port selects the in-VM service or a user port) to the orchestrator's proxy. Since **Stage 16** it
+   **gates the in-VM control ports** (envd `:49983`, code-interpreter `:49999`) on the
+   per-sandbox **access token** (`X-Access-Token`), leaving user-exposed ports public. So the SDK talks to **two** endpoints — the api (lifecycle) and client-proxy
    (data, learned from the create response). The orchestrator also hosts a
    **`TemplateService`** (Stage 10): the api's `POST /templates` kicks an async template
    build there (`pkg/build` wrapping the build scripts, `pkg/storage` publishing the artifacts to
@@ -202,9 +207,31 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   fidelity gaps deliberately deferred — **NBD-streamed rootfs** (E2B serves the rootfs lazily too, not
   materialized), chunk/header/compression, COW layer diffs, a cross-node cache — are itemized in
   `docs/STAGE15_DESIGN.md` §11. See `docs/STAGE15_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): production fidelity — auth (`X-API-Key`→team),
+- **Done (Stage 16 — auth: `X-API-Key`→team + a data-plane access token)**: the first
+  production-fidelity stage gives the system **identity** (every prior stage was "one box, no
+  auth"). 16a made the api **authenticate** every request (except `/health`) with an `X-API-Key`
+  resolving to a **team** (a `withAuth` middleware: sha256 the key → `ResolveAPIKey` → team in
+  ctx; 401 on miss, 500 on a store failure — distinct), seeded a dev key via `--seed-api-keys`
+  (`key=team` list, default `msb_dev_key=default`), and made `pkg/store` **team-aware** (new
+  `teams`/`api_keys` tables — keys stored **hashed** — plus an idempotent `team_id` migration on
+  `sandboxes`/`builds`; `Open` runs the ALTER so an existing DB upgrades); resources are
+  **team-owned** so list/delete/build-status are team-scoped (another team's id is **404**, not
+  403 — no existence leak; the ownership check precedes any VM teardown). 16b gave the data plane
+  a **per-sandbox access token**: the api mints `sbx_`+128-bit on create, stores it in the catalog
+  (`catalog.Route{Node, Token}` — Redis JSON, with a legacy bare-node fallback that fails closed),
+  and returns it; client-proxy **gates the in-VM control ports** (envd `:49983`, code-interpreter
+  `:49999`) on `X-Access-Token` (constant-time compare; empty token never authorises), while
+  **user-exposed ports stay public** (the exposure feature; `test_ports.py` stays green); the SDK
+  reads `api_key=`/`MICROSANDBOX_API_KEY` and sends both headers (no silent default, matching
+  E2B). **Honest scope:** keys are seeded by flag (no key-management API), the token is bearer-only
+  (no expiry/rotation/signing), and everything is still plaintext on loopback — auth here is the
+  *seam*, not a hardened gateway; **still not security-audited, never safe for untrusted input.**
+  Go units green (incl. live Postgres + Redis); real-machine e2e **43/43** (37 prior + 6 auth).
+  See `docs/STAGE16_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): production fidelity —
   multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript
-  SDK; plus the deferred storage-mechanism depth (NBD rootfs, chunk/header/compression, COW layers).
+  SDK; plus the deferred storage-mechanism depth (NBD rootfs, chunk/header/compression, COW layers)
+  and auth depth (a key-management API, token expiry/rotation, TLS).
 
 ## Development conventions
 
@@ -219,15 +246,17 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   messages are in English. Comments explain **why**, not what.
 - Keep `tests/` all green. The host-side unit tests now live in Go
   (`go test ./services/...` — TCP data proxy, network slot derivation, pool, templates, the
-  metadata store, the catalog + client-proxy routing, no VM/KVM needed; the Redis / Postgres
+  metadata store (incl. teams/keys + team scoping), the catalog + client-proxy routing (incl.
+  the per-sandbox token gate), no VM/KVM needed; the Redis / Postgres
   catalog + store variants self-skip unless `REDIS_ADDR` / `MSB_TEST_PG_DSN` point at a live
   server, so a bare `go test` stays hermetic). The Python end-to-end / stateful / snapshot /
-  metadata / ports tests run on real VMs (driven through the api + client-proxy + orchestrator)
+  metadata / ports / auth tests run on real VMs (driven through the api + client-proxy + orchestrator)
   and auto-skip when go / firecracker / `/dev/kvm` / the per-sandbox-network privilege / the
   vendor artifacts are missing; since Stages 14–15 the fixture also brings up Postgres + Redis +
   MinIO (`docker compose`, with a `docker run` fallback) and seeds the template artifacts into the
   bucket, so on a box with **no docker** the VM group now fails loudly rather than silently running
-  on in-process state. The orchestrator defaults to `--storage s3`; `MSB_ORCH_FLAGS="--storage
+  on in-process state. Since Stage 16 the fixture also exports `MICROSANDBOX_API_KEY=msb_dev_key`
+  (the api seeds it) so existing tests authenticate unchanged. The orchestrator defaults to `--storage s3`; `MSB_ORCH_FLAGS="--storage
   local-fs"` reverts the VM e2e to reading artifacts from `vendor/` directly.
 - **Safety rule**: the microVM is the first isolation strong enough to *discuss*
   untrusted code, but it is a learning implementation, **not security-audited** —
@@ -235,7 +264,10 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   arbitrary external input. Since Stage 12 the sandbox is no longer "fully offline":
   it is **inbound-reachable** (so its ports can be exposed) and **outbound-denied by
   default** (DNAT only, no MASQUERADE) — this *narrows* the isolation, so the
-  not-safe-for-untrusted-input rule matters more, not less.
+  not-safe-for-untrusted-input rule matters more, not less. Stage 16 added a **lock on the
+  control plane** (`X-API-Key`→team) and a **token on the data plane**, but these are learning
+  seams over **plaintext loopback** — not a hardened gateway, and they do **not** change the
+  not-safe-for-untrusted-input rule.
 
 ## Common commands
 
@@ -258,6 +290,7 @@ scripts/gen-proto.sh                              # regenerate the gRPC stubs fr
 
 # Minimal end-to-end smoke (Stages 8-9: start orchestrator + client-proxy + api first; needs the vendor artifacts):
 scripts/dev-up.sh &                              # builds + runs all three; SDK base_url = http://127.0.0.1:8080 (pass --pool-size K / --pool name=K to warm VMs)
+export MICROSANDBOX_API_KEY=msb_dev_key          # Stage 16: the api authenticates X-API-Key->team; the api seeds this dev key by default
 python -c 'from microsandbox import Sandbox; s=Sandbox(); s.run_code("x=41"); print(s.run_code("print(x+1)").stdout); s.close()'
 kill %1                                           # stop the services (dev-up traps the signal and stops all three)
 

@@ -1,6 +1,10 @@
 # Stage 16 design — auth: `X-API-Key` → team, team-scoped resources, a data-plane access token
 
-> Status: **proposed.** This is the first production-fidelity stage after the Stage 8–15
+> Status: **done** (16a `feat: authenticate the api with X-API-Key and scope resources to teams`,
+> 16b `feat: gate the data plane with a per-sandbox access token`). Built as designed; the two
+> deltas from this doc are noted inline (§4.2 the seed flag, §5.1 the legacy Redis fallback).
+> Verified: `go test ./services/...` green (incl. live Postgres + Redis); real-machine e2e
+> **43/43** (37 prior + 6 auth). This is the first production-fidelity stage after the Stage 8–15
 > decomposition (`docs/E2B_ALIGNMENT_ROADMAP.md` §"Later — production fidelity"). It adds the
 > one thing every prior stage deliberately skipped because we were "one repo, one machine":
 > **identity**. Read `docs/ARCHITECTURE.md` (the layers) and `docs/STAGE14_DESIGN.md` (the
@@ -158,12 +162,16 @@ Handlers read the team from the context and thread it through the store:
   `ListBuilds(team)`; `handleTemplateBuildStatus` → `BuildTeam(id)` check → `404` if not the
   team's.
 
-**Seeding.** On startup the api ensures a default team and a default dev key so local use
-works out of the box:
+**Seeding.** On startup the api ensures the configured teams + keys so local use works out of
+the box.
 
-- `--seed-team` (default `default`), `--seed-api-key` (default `msb_dev_key`). The api calls
-  `EnsureTeam` + `InsertAPIKey(hashKey(seedKey), seedTeam)` (both idempotent). Passing
-  `--seed-api-key ""` disables seeding (a deployment that provisions keys out-of-band).
+> **Delta from this design (16a):** rather than the two flags `--seed-team` + `--seed-api-key`
+> sketched here, the implementation uses **one** flag, `--seed-api-keys`, a comma-separated list
+> of `key=team` pairs (a bare `key` maps to team `default`), default `msb_dev_key=default`. One
+> flag covers the single-team default *and* the multi-team test seed (the conftest passes
+> `msb_dev_key=default,msb_team_b_key=team_b`) without a second flag. `seedAPIKeys` calls
+> `EnsureTeam` + `InsertAPIKey(hashKey(key), team)` per entry (both idempotent); an empty spec
+> seeds nothing (a deployment that provisions keys out-of-band).
 
 This is the E2B shape (keys in Postgres, resolved per request) at learning scale.
 
@@ -187,7 +195,10 @@ type Catalog interface {
 }
 ```
 
-- `Redis` stores the `Route` as a small JSON blob at `sandbox:<id>` (one key, as today).
+- `Redis` stores the `Route` as a small JSON blob at `sandbox:<id>` (one key, as today). A
+  value that doesn't parse as JSON is treated as a legacy bare-node string (`Route{Node: val}`,
+  empty token) so a Redis surviving the upgrade still routes — and an empty token never
+  authorises a control port (§5.2), so a stale entry fails closed.
 - `InMemory` (the unit-test double) stores `map[string]Route`.
 
 On create, the api mints a token (`crypto/rand`, `sbx_` + 32 hex), writes
@@ -273,17 +284,17 @@ suite (37 cases) stays green unchanged; `test_auth.py` overrides/omits it per ca
 Ordered so the suite is green after every commit. The design doc lands first, matching the
 project's rhythm (e.g. Stage 15's `docs: add Stage 15 design` preceded `15a`).
 
-- **doc** — `docs: add Stage 16 design` (this file). *(this commit)*
-- **16a — lifecycle auth + team scoping.** Store tables/columns/queries + migration; the api
+- ✅ **doc** — `docs: add Stage 16 design` (this file).
+- ✅ **16a — lifecycle auth + team scoping.** Store tables/columns/queries + migration; the api
   auth middleware, seeding, and team-scoped handlers; the SDK sends `X-API-Key`; conftest
   sets the dev key. Green: lifecycle authenticated + team-scoped, data plane unchanged.
   `test_auth.py` lifecycle cases + the store units.
   → `feat: authenticate the api with X-API-Key and scope resources to teams`
-- **16b — data-plane token.** `catalog.Route{Node,Token}`; the api mints + returns the token;
+- ✅ **16b — data-plane token.** `catalog.Route{Node,Token}`; the api mints + returns the token;
   client-proxy validates it for the control ports; the SDK sends `X-Access-Token`. Green: data
   plane gated, user ports still public. `test_auth.py` data-plane case + catalog/client-proxy units.
   → `feat: gate the data plane with a per-sandbox access token`
-- **16c — docs.** Finalize this doc's status, update `CLAUDE.md` (architecture paragraph +
+- ✅ **16c — docs.** Finalize this doc's status, update `CLAUDE.md` (architecture paragraph +
   Done list + the smoke command needs the key), `E2B_ALIGNMENT_ROADMAP.md` (auth done),
   `ARCHITECTURE.md`.
   → `docs: mark Stage 16 (auth: X-API-Key→team + data-plane token) done`
