@@ -55,15 +55,16 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record the sandbox in the durable metadata store. Best-effort: the VM is already
-	// live and routable, so a metadata write failure is logged, not surfaced -- in this
-	// single-node stage the orchestrator's in-memory registry is the operational truth,
+	// Record the sandbox in the durable metadata store, owned by the caller's team. Best-effort:
+	// the VM is already live and routable, so a metadata write failure is logged, not surfaced --
+	// in this single-node stage the orchestrator's in-memory registry is the operational truth,
 	// and the store is the record that becomes authoritative across restarts / nodes.
+	team := teamFromContext(r.Context())
 	templateName := req.Template
 	if templateName == "" {
 		templateName = "default"
 	}
-	if err := a.store.InsertSandbox(resp.GetSandboxId(), templateName); err != nil {
+	if err := a.store.InsertSandbox(resp.GetSandboxId(), templateName, team); err != nil {
 		log.Printf("store: insert %s: %v", resp.GetSandboxId(), err)
 	}
 	// Hand the SDK the id plus where to reach its data path (client-proxy). The data_url
@@ -71,10 +72,23 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"id": resp.GetSandboxId(), "data_url": a.dataURL})
 }
 
-// handleDestroy: DELETE /sandboxes/{id} -> gRPC Delete -> drop from the store -> 204
-// (or 404 on unknown id). The store delete is best-effort for the same reason as above.
+// handleDestroy: DELETE /sandboxes/{id} -> authorise (the sandbox must belong to the caller's
+// team) -> gRPC Delete -> drop from the store -> 204 (404 on unknown id or another team's
+// sandbox). The ownership check precedes the gRPC Delete on purpose: we must never tear down
+// a VM the caller doesn't own. A sandbox that isn't the team's is reported as 404, not 403, so
+// we don't even admit it exists. The store delete is best-effort for the reason above.
 func (a *api) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	team := teamFromContext(r.Context())
+	owner, ok, err := a.store.SandboxTeam(id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "ownership lookup failed: " + err.Error()})
+		return
+	}
+	if !ok || owner != team {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such sandbox: " + id})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	if _, err := a.client.Delete(ctx, &pb.SandboxDeleteRequest{SandboxId: id}); err != nil {
@@ -92,12 +106,12 @@ func (a *api) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleList: GET /sandboxes -> 200 {"sandboxes":[{id,template,status,created_at}...]}.
-// The api lists from its own metadata store (E2B's api lists from Postgres), not by
-// asking the orchestrator -- the store is the api's durable record. The orchestrator
-// still exposes a live gRPC List for reconciliation; we don't need it here yet.
+// handleList: GET /sandboxes -> 200 {"sandboxes":[{id,template,status,created_at}...]}, scoped
+// to the caller's team. The api lists from its own metadata store (E2B's api lists from
+// Postgres), not by asking the orchestrator -- the store is the api's durable record. The
+// orchestrator still exposes a live gRPC List for reconciliation; we don't need it here yet.
 func (a *api) handleList(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.store.ListSandboxes()
+	rows, err := a.store.ListSandboxes(teamFromContext(r.Context()))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

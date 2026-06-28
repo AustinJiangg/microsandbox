@@ -50,6 +50,8 @@ func main() {
 	dataURL := flag.String("data-url", "http://127.0.0.1:8081", "public client-proxy data URL returned to the SDK as where to send the data path")
 	storeDSN := flag.String("store-dsn", "postgres://postgres@127.0.0.1:5432/microsandbox?sslmode=disable",
 		"metadata store DSN: postgres://… (default, Stage 14b) or sqlite://<path> (or a bare path) for the single-file backend")
+	seedAPIKeys := flag.String("seed-api-keys", "msb_dev_key=default",
+		"comma-separated key=team pairs to seed on startup (a bare key maps to team 'default'); empty seeds nothing (Stage 16)")
 	flag.Parse()
 
 	// gRPC client to the orchestrator. NewClient is lazy (it connects on the first RPC,
@@ -80,19 +82,27 @@ func main() {
 		dataURL:   *dataURL,
 	}
 
+	// Stage 16: seed the configured API keys (default a well-known dev key -> default team) so
+	// local use works out of the box. Idempotent, so it is safe on every startup.
+	if err := a.seedAPIKeys(*seedAPIKeys); err != nil {
+		log.Fatalf("seed api keys: %v", err)
+	}
+
 	// Lifecycle-only routes (Stage 9c): the data path lives on client-proxy now. A request
 	// to /sandboxes/{id}/<anything> matches none of these and gets a 404, which is correct
-	// -- the SDK no longer sends the data path here.
+	// -- the SDK no longer sends the data path here. Every route except /health is wrapped in
+	// withAuth (Stage 16): it requires an X-API-Key that resolves to a team and scopes the
+	// handler to it. /health stays open so the test fixture / a load balancer can probe it.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", a.handleHealth)
-	mux.HandleFunc("POST /sandboxes", a.handleCreate)
-	mux.HandleFunc("DELETE /sandboxes/{id}", a.handleDestroy)
-	mux.HandleFunc("GET /sandboxes", a.handleList)
+	mux.HandleFunc("POST /sandboxes", a.withAuth(a.handleCreate))
+	mux.HandleFunc("DELETE /sandboxes/{id}", a.withAuth(a.handleDestroy))
+	mux.HandleFunc("GET /sandboxes", a.withAuth(a.handleList))
 	// Template builds (Stage 10): create kicks an async build in the orchestrator; the SDK
 	// polls the build status; list is the api's durable record.
-	mux.HandleFunc("POST /templates", a.handleTemplateCreate)
-	mux.HandleFunc("GET /templates", a.handleTemplateList)
-	mux.HandleFunc("GET /templates/builds/{id}", a.handleTemplateBuildStatus)
+	mux.HandleFunc("POST /templates", a.withAuth(a.handleTemplateCreate))
+	mux.HandleFunc("GET /templates", a.withAuth(a.handleTemplateList))
+	mux.HandleFunc("GET /templates/builds/{id}", a.withAuth(a.handleTemplateBuildStatus))
 
 	httpServer := &http.Server{Addr: *addr, Handler: mux}
 	go func() {

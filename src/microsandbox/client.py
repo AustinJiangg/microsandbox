@@ -64,6 +64,10 @@ class Sandbox:
         template: name of a custom image to boot, built with scripts/build-template.sh
             (see docs/STAGE6_DESIGN.md). Defaults to the stock image. The name must be a
             template built under vendor/templates/<name>/; an unknown name is rejected.
+        api_key: the API key sent as X-API-Key on lifecycle calls; the api resolves it to a
+            team and scopes the sandbox to it (Stage 16). Defaults to the MICROSANDBOX_API_KEY
+            env var. Without one the api answers 401 -- there is no silent default, matching
+            E2B (which requires E2B_API_KEY); locally the api seeds a dev key "msb_dev_key".
         base_url: where the api (lifecycle) is reachable. Defaults to the
             MICROSANDBOX_URL env var, then http://127.0.0.1:8080.
         data_url: where client-proxy (the data path) is reachable. Normally learned from
@@ -83,12 +87,16 @@ class Sandbox:
         timeout_seconds: float = 30.0,
         from_snapshot: bool = False,
         template: str | None = None,
+        api_key: str | None = None,
         base_url: str | None = None,
         data_url: str | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self._from_snapshot = from_snapshot
         self._template = template
+        # The API key sent as X-API-Key on lifecycle calls (Stage 16). No silent default: an
+        # absent key reaches the api as no header and earns a 401.
+        self._api_key = api_key or os.environ.get("MICROSANDBOX_API_KEY")
         self._base_url = (
             base_url or os.environ.get("MICROSANDBOX_URL", _DEFAULT_CONTROL_PLANE_URL)
         ).rstrip("/")
@@ -183,11 +191,18 @@ class Sandbox:
         becomes a RuntimeError; an unreachable api becomes a RuntimeError with a hint.
         """
         data = json.dumps(body).encode() if body is not None else None
+        headers: dict[str, str] = {}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        # Stage 16: authenticate the lifecycle call. Omitted when unset, so the api's 401 makes
+        # the missing-key case explicit rather than the SDK inventing a default.
+        if self._api_key:
+            headers["X-API-Key"] = self._api_key
         request = urllib.request.Request(
             self._base_url + path,
             data=data,
             method=method,
-            headers={"Content-Type": "application/json"} if data is not None else {},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as resp:
@@ -336,6 +351,7 @@ def build_template(
     dockerfile: str,
     *,
     with_snapshot: bool = True,
+    api_key: str | None = None,
     base_url: str | None = None,
     poll_interval: float = 1.0,
     timeout: float = 600.0,
@@ -356,6 +372,8 @@ def build_template(
         name: the template name to publish (an existing one is replaced); "default" is
             rejected (it is the baked stock image).
         dockerfile: the recipe contents.
+        api_key: the X-API-Key for the build (defaults to MICROSANDBOX_API_KEY); the build is
+            recorded against the resolved team (Stage 16).
         base_url: where the api is reachable (defaults to MICROSANDBOX_URL, then :8080).
         poll_interval: seconds between status polls.
         timeout: seconds to wait for the build before raising.
@@ -363,17 +381,19 @@ def build_template(
     api = (
         base_url or os.environ.get("MICROSANDBOX_URL", _DEFAULT_CONTROL_PLANE_URL)
     ).rstrip("/")
+    key = api_key or os.environ.get("MICROSANDBOX_API_KEY")
 
     created = _api_request(
         "POST",
         api + "/templates",
         {"name": name, "dockerfile": dockerfile, "with_snapshot": with_snapshot},
+        api_key=key,
     )
     build_id = created["build_id"]
 
     deadline = time.monotonic() + timeout
     while True:
-        status = _api_request("GET", api + f"/templates/builds/{build_id}")
+        status = _api_request("GET", api + f"/templates/builds/{build_id}", api_key=key)
         state = status.get("state")
         if state == "success":
             return
@@ -388,15 +408,22 @@ def build_template(
         time.sleep(poll_interval)
 
 
-def _api_request(method: str, url: str, body: dict | None = None) -> dict:
+def _api_request(
+    method: str, url: str, body: dict | None = None, api_key: str | None = None
+) -> dict:
     """One HTTP call to the api, returning parsed JSON (or {}). A module-level twin of
     Sandbox._control_plane, for the lifecycle-free template build API."""
     data = json.dumps(body).encode() if body is not None else None
+    headers: dict[str, str] = {}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    if api_key:
+        headers["X-API-Key"] = api_key  # Stage 16: authenticate the template build call
     request = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"} if data is not None else {},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request) as resp:

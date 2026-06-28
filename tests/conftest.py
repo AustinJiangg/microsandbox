@@ -367,10 +367,17 @@ def control_plane(tmp_path_factory):
              "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr,
              "--redis-addr", redis_addr,
              "--data-url", f"http://{cp_data_addr}",
-             "--store-dsn", pg_dsn],
+             "--store-dsn", pg_dsn,
+             # Stage 16: seed the dev key (default team) the whole suite authenticates with,
+             # plus a second team's key so test_auth.py can prove cross-team isolation.
+             "--seed-api-keys", "msb_dev_key=default,msb_team_b_key=team_b"],
             stdout=api_log, stderr=subprocess.STDOUT,
         )
         _wait_healthy(base_url + "/health", api, logdir / "api.log")
+        # Stage 16: every lifecycle call now needs an X-API-Key. Export the seeded dev key so
+        # the existing fixtures' plain Sandbox(...) constructions authenticate unchanged; the
+        # auth tests override/clear it per case.
+        os.environ["MICROSANDBOX_API_KEY"] = "msb_dev_key"
         yield base_url
     finally:
         # SIGTERM the api first, then client-proxy, then the orchestrator (which destroys

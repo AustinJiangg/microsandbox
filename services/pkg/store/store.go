@@ -25,6 +25,7 @@ type Sandbox struct {
 	ID        string
 	Template  string
 	Status    string
+	TeamID    string // the owning team (Stage 16); reads are scoped to it, so it is not re-emitted in the api JSON
 	CreatedAt string // a timestamp string; SQLite stores CURRENT_TIMESTAMP as text, Postgres formats its timestamptz to RFC3339
 }
 
@@ -34,6 +35,7 @@ type Build struct {
 	Name      string
 	State     string // building | success | failed
 	Detail    string
+	TeamID    string // the owning team (Stage 16)
 	CreatedAt string
 }
 
@@ -41,13 +43,27 @@ type Build struct {
 // (Postgres) is a network database; the api treats most writes as best-effort and logs
 // failures (the orchestrator's in-memory registry is the live truth this stage). The two
 // implementations -- sqliteStore and postgresStore -- satisfy this one contract.
+//
+// Stage 16 makes it team-aware (E2B's api-key->team model): rows carry a team_id, reads are
+// scoped to a team, and the store also resolves an API key (stored hashed) to its team. The
+// ownership lookups (SandboxTeam / BuildTeam) let the api authorise a delete / status read
+// before touching the live VM, rather than scope the mutation itself -- the teardown that
+// follows is unscoped because ownership was already checked. See docs/STAGE16_DESIGN.md.
 type Store interface {
-	InsertSandbox(id, template string) error
-	DeleteSandbox(id string) error
-	ListSandboxes() ([]Sandbox, error)
-	InsertBuild(buildID, name string) error
+	// sandboxes -- team-scoped
+	InsertSandbox(id, template, teamID string) error
+	SandboxTeam(id string) (teamID string, ok bool, err error) // ownership lookup (for delete)
+	DeleteSandbox(id string) error                             // unscoped; called after the ownership check
+	ListSandboxes(teamID string) ([]Sandbox, error)
+	// template builds -- team-scoped
+	InsertBuild(buildID, name, teamID string) error
+	BuildTeam(buildID string) (teamID string, ok bool, err error)
 	UpdateBuild(buildID, state, detail string) error
-	ListBuilds() ([]Build, error)
+	ListBuilds(teamID string) ([]Build, error)
+	// auth (Stage 16): keys are stored hashed (sha256 hex); the seed helpers are idempotent
+	ResolveAPIKey(keyHash string) (teamID string, ok bool, err error)
+	EnsureTeam(id, name string) error
+	InsertAPIKey(keyHash, teamID string) error
 	Close() error
 }
 
@@ -57,7 +73,15 @@ type Store interface {
 // that Postgres rejects multiple statements in a single Exec, so postgres.go applies these
 // one at a time (splitSchema), while SQLite runs the whole string at once. The builds table
 // arrives with the TemplateService (Stage 10): the api records each template build and its
-// outcome, like E2B's api owns templates/builds in Postgres.
+// outcome, like E2B's api owns templates/builds in Postgres. Stage 16 adds the teams +
+// api_keys tables (keys stored hashed) for the X-API-Key->team auth.
+//
+// The team_id column on sandboxes/builds is added by migrateTeamColumns, NOT here: a poor
+// man's "CREATE TABLE IF NOT EXISTS" is a no-op against a table that already exists (the
+// conftest reuses a Postgres already on :5432, so a prior session's DB lacks the column), so
+// the column has to be added with an idempotent ALTER instead. Keeping it out of the CREATE
+// above leaves one source of truth for that column (the migration), exercised on fresh and
+// existing DBs alike.
 const schema = `
 CREATE TABLE IF NOT EXISTS sandboxes (
     id         TEXT PRIMARY KEY,
@@ -71,7 +95,22 @@ CREATE TABLE IF NOT EXISTS builds (
     state      TEXT NOT NULL,
     detail     TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS teams (
+    id   TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_hash   TEXT PRIMARY KEY,
+    team_id    TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`
+
+// teamColumnTables are the pre-existing tables that gain a team_id column in Stage 16. The
+// DEFAULT 'default' backfills any rows written before the upgrade into the default team, so
+// an old DB stays consistent. Each backend adds the column idempotently (see migrateTeamColumns
+// in sqlite.go / postgres.go) because the two engines spell "add a column if absent" differently.
+var teamColumnTables = []string{"sandboxes", "builds"}
 
 // splitSchema breaks the multi-statement schema into individual statements. Postgres's
 // extended query protocol (pgx's default) rejects more than one command per Exec, so its

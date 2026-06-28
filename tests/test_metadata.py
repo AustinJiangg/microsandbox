@@ -4,13 +4,20 @@ go / firecracker / kvm), then checks the api's metadata endpoint reflects create
 """
 
 import json
+import os
 import urllib.request
 
 from microsandbox import Sandbox
 
 
 def _list_ids(base_url: str) -> set[str]:
-    with urllib.request.urlopen(base_url + "/sandboxes", timeout=5) as r:
+    # Stage 16: GET /sandboxes now requires an X-API-Key. Use the suite's seeded dev key (the
+    # conftest exports it) so this raw request is scoped to the same team the Sandbox uses.
+    req = urllib.request.Request(
+        base_url + "/sandboxes",
+        headers={"X-API-Key": os.environ.get("MICROSANDBOX_API_KEY", "")},
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
         return {sb["id"] for sb in json.load(r)["sandboxes"]}
 
 
