@@ -15,10 +15,11 @@
 > now behavioral), and **12 (per-sandbox TAP/netns networking; the data path flipped vsock →
 > TCP routed by real `<port>-<id>` hostnames; user-port exposure; vsock retired — reversing
 > Decision D1)**, **13 (UFFD lazy snapshot restore behind `--uffd`; `File` stays the
-> default)**, and **14 (the storage swaps go live: catalog → Redis, store → Postgres)** are
-> **done** — see their design docs and the "Done" list in `CLAUDE.md`. The remainder (the last
-> storage swap — `Local → object storage`, Stage 15 — then auth / multi-host / a TS SDK) is the
-> **deferred** forward plan.
+> default)**, **14 (the storage swaps go live: catalog → Redis, store → Postgres)**, and **15 (the
+> last storage swap: `Local → object storage`, MinIO/S3 — rootfs/snapfile materialized, memfile
+> streamed over UFFD)** are **done** — see their design docs and the "Done" list in `CLAUDE.md`. The
+> remainder (production fidelity — auth / multi-host / a TS SDK; plus deferred storage-mechanism depth
+> — NBD-served rootfs, chunk/header/compression, COW layers) is the **deferred** forward plan.
 
 ## 1. Why this document
 
@@ -191,13 +192,23 @@ build now; E2B's layered-step cache is a noted later enhancement.)
   precondition), **not** speed; e2e 37/37 on Postgres + Redis. Object storage was split out to
   Stage 15. See `docs/STAGE14_DESIGN.md`.
 
+- **Stage 15 — `Local → object storage` (the last storage swap).** ✅ Template artifacts live in
+  **S3** (MinIO locally; pure-Go `minio-go`), keyed by an immutable `{buildID}/…` prefix + an
+  `aliases/<name>` pointer. The Stage-13 UFFD page source became **pluggable** (`uffd.PageSource`:
+  `MmapSource` + a chunked `bucketSource`); the orchestrator **materializes** rootfs/snapfile to their
+  baked local paths and **streams the memfile** page-by-page from the bucket over UFFD (the Stage-13
+  payoff). `--storage s3` is the default; `local-fs` is the escape hatch. Honest: not a single-box
+  speedup (per-page would blow the health timeout, so reads are chunked); the win is the seam + an
+  end-to-end-pluggable page source. e2e 37/37 in s3 mode. See `docs/STAGE15_DESIGN.md` (its §11
+  itemizes the deferred mechanism depth, verified against `e2b-dev/infra`).
+
 ### Still deferred
-- **Stage 15 — `Local → object storage` (the last storage swap).** The non-isomorphic seam Stage
-  14 deliberately left out: the Firecracker snapshot bakes in its rootfs's absolute path, so a
-  template's `rootfs.ext4`/`snapfile` must be materialized to a local path before boot, while the
-  `memfile` can stream page-by-page from the bucket via the Stage-13 UFFD handler. UFFD already made
-  the memfile page source pluggable — the precondition for sourcing snapshot memory from object
-  storage / a peer node rather than a local file.
+- **Storage-mechanism depth (deeper E2B fidelity behind the same seam).** Verified against
+  `e2b-dev/infra`: E2B serves the **rootfs lazily over a userspace NBD block device** (not
+  materialized whole, as we do), stores rootfs+memfile **chunked + compressed with a `.header`
+  per-page-state index**, builds templates as **copy-on-write diff layers**, and shares chunks via a
+  **cross-node cache**. Each deepens the *mechanism* behind the Stage-15 `StorageProvider` /
+  `PageSource` interfaces without changing the seam — candidate future stages (`docs/STAGE15_DESIGN.md` §11).
 - **Later — production fidelity.** Auth (`X-API-Key`→team), multi-host scheduling (real
   node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource limits
   and start/ready commands.

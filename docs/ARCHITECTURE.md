@@ -141,8 +141,8 @@ the template builder:
   pipes bytes, and it runs the `/health` probe so a sandbox is healthy by the time Create
   returns ("ready on delivery"). It also serves a gRPC
   **`TemplateService`** (Stage 10): `TemplateCreate` kicks an async build (`pkg/build`
-  wrapping `docker build` → `build-rootfs.sh` → `build-snapshot.sh`, placing artifacts via
-  `pkg/storage`); the api polls `TemplateBuildStatus`. Like E2B, the builder lives here
+  wrapping `docker build` → `build-rootfs.sh` → `build-snapshot.sh`, publishing artifacts via
+  `pkg/storage` to S3 object storage since Stage 15); the api polls `TemplateBuildStatus`. Like E2B, the builder lives here
   because it needs the same docker + KVM + firecracker the VM fleet does.
 
 Corresponds to E2B's `infra` (api + client-proxy + orchestrator). Keeping these boundaries
@@ -227,6 +227,6 @@ staged code lives on in the git history if you want to study the progression.
 | services/pkg/build + TemplateService | `template-manager` (in E2B's orchestrator) | async template builds, polled for status (Stage 10) |
 | services/pkg/store (Postgres; SQLite selectable) | the api's Postgres | durable sandbox + build metadata (E2B uses Postgres + sqlc; Stage 14b) |
 | services/pkg/catalog (Redis) | the `sandbox-catalog` (Redis) | sandbox → node routing the client-proxy reads (E2B uses Redis; Stage 14a) |
-| services/pkg/storage (Local dir) | object storage (GCS/S3) | where template artifacts live (E2B keys by build id; we publish in place) |
+| services/pkg/storage (S3 via minio-go; Local dir = test double) | object storage (GCS/S3) | where template artifacts live, buildID-keyed + an `aliases/<name>` pointer (Stage 15); rootfs/snapfile materialized locally, memfile streamed page-by-page over UFFD. (E2B serves the rootfs lazily over NBD too — deferred) |
 | (firecracker config in services/pkg/fc) | Firecracker orchestration / jailer | microVM creation and isolation |
 | services/pkg/network | E2B's per-sandbox TAP/netns + DNAT | the per-sandbox network slot: TAP in its own netns, veth, DNAT (inbound only, no MASQUERADE) (Stage 12) |

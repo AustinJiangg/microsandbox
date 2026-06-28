@@ -1,6 +1,6 @@
 # Stage 15 design: the last storage swap — `Local → object storage` (MinIO/S3)
 
-> Status: **planned.** The third and final state seam of the roadmap's "storage swaps go
+> Status: **done (15a + 15b + 15c).** The third and final state seam of the roadmap's "storage swaps go
 > live" item (`docs/E2B_ALIGNMENT_ROADMAP.md` §5 "Still deferred"). Stage 14 cashed in the two
 > *isomorphic* seams (catalog → Redis, store → Postgres) and **deliberately split this one out**
 > (`docs/STAGE14_DESIGN.md` §10) because it is **not isomorphic**: a template's artifacts can't
@@ -41,6 +41,14 @@
 > can still boot it (download rootfs/snapfile, stream the memfile) — the precondition for the
 > deferred multi-host work. This doc claims no latency win; 15b measures the real number and
 > reports it as-is (the same honesty Stages 13 and 14 held to).
+>
+> **Outcome (measured, this WSL2 box).** Full e2e **37/37 in s3 mode**, each snapshot restore
+> streaming `default/memfile` over UFFD in 1 MiB chunks from MinIO (boots within the ~10s health
+> timeout -- per-page would not, so chunked was chosen from the start, Decision 6); the escape hatches
+> stay green (`--storage local-fs` File backend; `--storage local-fs --uffd` local mmap). As
+> predicted, not a single-box speedup -- the win is real object storage + a page source pluggable end
+> to end (mmap <-> bucket), the precondition for multi-host / peer-sourced memory. `minio-go` (pure
+> Go) keeps the binaries static.
 
 ## 1. Goal & non-goals
 
@@ -195,15 +203,18 @@ same path* if absent, so the baked reference stays valid and `scripts/build-snap
 untouched. (E2B sidesteps the baked path entirely by serving the rootfs as an NBD device — see §11
 item 1; a relocatable node-local cache dir with a rebaked snapshot is a noted later refinement.)
 
-### Decision 4 — exercise the download honestly: the fixture seeds MinIO, then clears the local copy
-With `vendor/` as both build output and cache, a build-box boot is always a cache hit and would
-**never** download — so the materialize/stream path would go untested. The conftest/dev-up fixture
-therefore (1) **seeds** the locally-built `vendor/` artifacts into MinIO (under `default/…` + the
-alias), then (2) **removes the local rootfs + snapfile** (keeping nothing but the bucket), so the
-orchestrator must `GetObject` them back to the baked path on first boot, and the memfile — never
-written back locally — is proven to stream from the bucket. This is the same spirit as Stage 13b
-forcing the real ioctl path under a real VM: make the new path actually run, then measure it. (In
-real multi-host use the cold cache is the norm — a fresh node simply has no local copy.)
+### Decision 4 — the memfile stream is e2e-proven; the materialize-download is unit-tested (revised)
+The plan was to clear the local artifacts after seeding so the orchestrator must `GetObject` them
+back, forcing the download path to run in the e2e. **In practice that was dropped.** The `ensure_*`
+fixtures rebuild a *missing* local artifact via `docker` (and the root orchestrator's own template
+builds leave a root-owned `~/.docker` buildx lock that makes a forced normal-user rebuild flaky), so
+clearing the cache fights the fixtures rather than the orchestrator. What ships instead is just as
+honest: the **memfile-streaming payoff is exercised in the e2e** (every snapshot restore streams
+`default/memfile` from MinIO over UFFD — that path has no local fallback), and the
+**materialize-if-missing download is covered hermetically** by `storage.TestMaterialize` (cache-miss
+downloads to a temp path; cache-hit skips). In real multi-host use a fresh node has no local copy, so
+the download runs naturally there. (A relocatable cache dir the snapshot is rebaked against — §11 — 
+would let the e2e force a cold cache cleanly without fighting the rebuild fixtures; deferred.)
 
 ### Decision 5 — `minio-go`, because `*minio.Object` *is* the page source
 Client choice (a clear best, not a user fork): `github.com/minio/minio-go/v7` is pure Go (holding
@@ -281,7 +292,7 @@ tests/conftest.py                  # control_plane fixture: minio up, seed + cle
 
 ## 7. Three independently verifiable sub-steps
 
-### Stage 15a — `pkg/uffd`: make the page source pluggable (refactor only)
+### Stage 15a — `pkg/uffd`: make the page source pluggable (refactor only) ✅
 Extract `PageSource` (`ReadPageAt(p []byte, off int64) error`, `Close() error`); factor today's
 mmap path into `MmapSource`; change `Serve(uds, memfilePath)` → `Serve(uds, PageSource)`; have
 `fc.Restore` pass `uffd.MmapSource(memfile)`. **No behavior change** — the File path is untouched
@@ -290,7 +301,7 @@ and the local-UFFD path serves identical bytes, just through the interface. Veri
 --uffd`) still 37/37. Nothing object-storage yet; this banks the precondition cleanly, exactly as
 Stage 14a/b extracted interfaces before swapping behavior.
 
-### Stage 15b — `pkg/storage` S3 + `bucketSource`; build uploads (buildID/alias); orchestrator materializes + streams
+### Stage 15b — `pkg/storage` S3 + `bucketSource`; build uploads (buildID/alias); orchestrator materializes + streams ✅
 Add the `minio` compose service + the `minio-go` dep. Reshape `pkg/storage` into the blob interface
 with `S3` + `Local` impls and the `{buildID}/{file}` + `aliases/<name>` key scheme. Add
 `bucketSource` (S3 Range per page + cache) implementing `uffd.PageSource`. Make `pkg/build` upload
@@ -303,7 +314,7 @@ skips); Python e2e green against MinIO with the memfile streamed over UFFD (sand
 code, keep state, expose ports). **Measure** restore-to-ready vs Stage 14 and record the honest
 number; decide if Decision 6's prefetch is needed.
 
-### Stage 15c — docs, defaults, dev-up, honest review
+### Stage 15c — docs, defaults, dev-up, honest review ✅
 Finalize this doc's status; update `CLAUDE.md` (the "Done" list + the storage line in core
 architecture + common commands), `docs/ARCHITECTURE.md` (the artifacts state-seam line), and the
 roadmap (move "the storage swaps go live" fully to done; the remaining fidelity gaps — NBD rootfs,

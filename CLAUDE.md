@@ -53,7 +53,9 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    (Stage 12; the port selects the in-VM service or a user port) to the orchestrator's proxy. So the SDK talks to **two** endpoints — the api (lifecycle) and client-proxy
    (data, learned from the create response). The orchestrator also hosts a
    **`TemplateService`** (Stage 10): the api's `POST /templates` kicks an async template
-   build there (`pkg/build` wrapping the build scripts, `pkg/storage` placing the artifacts).
+   build there (`pkg/build` wrapping the build scripts, `pkg/storage` publishing the artifacts to
+   **S3 object storage** — MinIO locally — since Stage 15; the orchestrator materializes rootfs/snapfile
+   and streams the memfile from the bucket over UFFD).
    Stage 4 first extracted all this as a single `control-plane/` binary; Stage 8 dissolved it
    into `services/`; Stage 9 sank the data path off the api. See `docs/STAGE10_DESIGN.md` +
    `docs/STAGE9_DESIGN.md` + `docs/STAGE8_DESIGN.md` +
@@ -182,10 +184,27 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   Postgres variants skip without `REDIS_ADDR` / `MSB_TEST_PG_DSN`); real-machine e2e **37/37** on
   Postgres + Redis (behavioral parity — the swap moved state location, not semantics). The third
   seam (`Local → object storage`) is split to **Stage 15**. See `docs/STAGE14_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): the last storage swap (Stage 15 —
-  `Local → object storage`, materializing the rootfs/snapfile locally and streaming the memfile
-  page-by-page from the bucket via the Stage-13 UFFD handler); then auth, multi-host scheduling,
-  a TypeScript SDK.
+- **Done (Stage 15 — the last storage swap: `Local → object storage`, MinIO/S3)**: template artifacts
+  now live in an **S3 object store** (the running default) — the third state seam Decision D3 built
+  behind an interface, and the one that is **not isomorphic** (a Firecracker snapshot bakes in its
+  rootfs's absolute path, so artifacts can't merely be opened from a bucket). 15a made the Stage-13
+  UFFD page source **pluggable** (`uffd.PageSource` + `MmapSource`, pure refactor; e2e 37/37 unchanged);
+  15b reshaped `pkg/storage` into E2B's blob `StorageProvider` (`Upload`/`Open`/`OpenReaderAt`/`Exists`,
+  `s3.go` over pure-Go `minio-go` + `Local` as the test double), added a **chunked bucket page source**
+  (`uffd.NewChunkedSource`, 1 MiB), made `pkg/build` **upload** to immutable `{buildID}/…` + flip an
+  `aliases/<name>` pointer, and wired the orchestrator (`--storage s3` default / `local-fs`) to
+  **materialize rootfs + snapfile** to their baked local paths and **stream the memfile page-by-page
+  from the bucket via UFFD** (the Stage-13 payoff); the default template is seeded by `cmd/msb-seed`,
+  compose gained `minio`. **Honest: on one box this is fidelity, not speed** (per-page would blow the
+  health timeout, so reads are chunked) — the win is real object storage + a page source pluggable end
+  to end (mmap ↔ bucket), the precondition for multi-host / peer-sourced memory. e2e **37/37 in s3
+  mode** (memfile streamed from MinIO; `local-fs` + `local-fs --uffd` escape hatches green too). The
+  fidelity gaps deliberately deferred — **NBD-streamed rootfs** (E2B serves the rootfs lazily too, not
+  materialized), chunk/header/compression, COW layer diffs, a cross-node cache — are itemized in
+  `docs/STAGE15_DESIGN.md` §11. See `docs/STAGE15_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): production fidelity — auth (`X-API-Key`→team),
+  multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript
+  SDK; plus the deferred storage-mechanism depth (NBD rootfs, chunk/header/compression, COW layers).
 
 ## Development conventions
 
@@ -205,9 +224,11 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   server, so a bare `go test` stays hermetic). The Python end-to-end / stateful / snapshot /
   metadata / ports tests run on real VMs (driven through the api + client-proxy + orchestrator)
   and auto-skip when go / firecracker / `/dev/kvm` / the per-sandbox-network privilege / the
-  vendor artifacts are missing; since Stage 14 the fixture also brings up Postgres + Redis
-  (`docker compose`, with a `docker run` fallback), so on a box with **no docker** the VM group
-  now fails loudly rather than silently running on in-process state.
+  vendor artifacts are missing; since Stages 14–15 the fixture also brings up Postgres + Redis +
+  MinIO (`docker compose`, with a `docker run` fallback) and seeds the template artifacts into the
+  bucket, so on a box with **no docker** the VM group now fails loudly rather than silently running
+  on in-process state. The orchestrator defaults to `--storage s3`; `MSB_ORCH_FLAGS="--storage
+  local-fs"` reverts the VM e2e to reading artifacts from `vendor/` directly.
 - **Safety rule**: the microVM is the first isolation strong enough to *discuss*
   untrusted code, but it is a learning implementation, **not security-audited** —
   never imply in docs or code that it is safe to expose as a service or feed
@@ -220,8 +241,8 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
 
 ```bash
 pip install -e ".[dev]"                          # install (dev mode)
-docker compose up -d                             # Stage 14: bring up the shared state (postgres + redis) the api/client-proxy use; conftest + dev-up also start it on demand (with a `docker run` fallback for engines without the compose plugin)
-pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs api + client-proxy + orchestrator and provisions postgres + redis)
+docker compose up -d                             # Stages 14-15: bring up the shared state (postgres + redis + minio) the control plane uses; conftest + dev-up also start it on demand (with a `docker run` fallback for engines without the compose plugin)
+pytest                                           # run tests (VM cases auto-skip without go/firecracker/kvm; the fixture builds+runs api + client-proxy + orchestrator, provisions postgres + redis + minio, and seeds template artifacts into the bucket; orchestrator defaults to --storage s3, MSB_ORCH_FLAGS=--storage local-fs reverts to local artifacts)
 go test ./services/...                           # host-side unit tests: TCP data proxy, network slot derivation, pool, templates, metadata store, catalog + client-proxy (no VM/KVM; the redis/postgres variants skip unless REDIS_ADDR / MSB_TEST_PG_DSN are set)
 go test ./daemon                                 # in-VM daemon unit tests: handlers + kernel-message translation (no VM/KVM)
 pytest tests/test_microvm.py::test_runs_in_microvm -v   # one real-VM end-to-end case
@@ -254,8 +275,9 @@ scripts/build-template.sh example --no-snapshot                 # + each built t
 - Before changing the isolation/transport layer, read `docs/ARCHITECTURE.md` to
   confirm the boundaries, then act.
 - The host control plane lives in `services/` (Go module `microsandbox/services`):
-  `cmd/{api,client-proxy,orchestrator}` are the binaries,
-  `pkg/{fc,pool,proxy,template,store,catalog,storage,build}` the libraries, `proto/` the gRPC
+  `cmd/{api,client-proxy,orchestrator,msb-seed}` are the binaries (`msb-seed` publishes the baked
+  default/script-built templates into the object store — dev/test glue),
+  `pkg/{fc,pool,network,proxy,template,store,catalog,storage,build,uffd}` the libraries, `proto/` the gRPC
   contract (`orchestrator` + `templatemanager`; generated stubs in `pkg/grpc/`, committed — rerun
   `scripts/gen-proto.sh` only when a `.proto` changes, which needs `protoc`). Host-side
   changes take effect at the next `scripts/build-services.sh`; no rootfs rebuild needed
