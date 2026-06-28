@@ -229,6 +229,57 @@ def ensure_postgres() -> str:
     raise RuntimeError(f"postgres at {dsn} did not come up within 60s")
 
 
+@functools.lru_cache(maxsize=1)
+def ensure_minio() -> str:
+    """Bring up the MinIO object store that holds template artifacts (Stage 15), and return its S3
+    endpoint host:port. Reuses one already listening on :9000 (a dev instance or a prior session).
+
+    Same rationale as ensure_redis/ensure_postgres: docker is already required, so this adds no new
+    *class* of dependency, and a failure is loud, not a skip -- the "flip the default" cost. The minio
+    server image ships neither curl nor mc, so there is no compose healthcheck; we poll the port and
+    let the S3 provider's MakeBucket-if-absent be the real readiness signal (the seeder retries while
+    minio finishes coming up).
+    """
+    host, port = "127.0.0.1", 9000
+    endpoint = f"{host}:{port}"
+    if _port_open(host, port):
+        return endpoint
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    compose = ["docker", "compose", "-f", str(repo_root / "docker-compose.yml"), "up", "-d", "minio"]
+    if subprocess.run(compose, capture_output=True).returncode != 0:
+        # No compose plugin: provision the same image directly via the engine.
+        subprocess.run(["docker", "rm", "-f", "microsandbox-minio"], capture_output=True)
+        subprocess.run(
+            ["docker", "run", "-d", "--name", "microsandbox-minio",
+             "-e", "MINIO_ROOT_USER=minioadmin", "-e", "MINIO_ROOT_PASSWORD=minioadmin",
+             "-p", f"{host}:{port}:9000", "-p", "127.0.0.1:9001:9001",
+             "minio/minio:latest", "server", "/data", "--console-address", ":9001"],
+            check=True,
+        )
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if _port_open(host, port):
+            return endpoint
+        time.sleep(0.1)
+    raise RuntimeError(f"minio at {endpoint} did not come up within 30s")
+
+
+def _seed_template(repo_root: pathlib.Path, endpoint: str, name: str) -> None:
+    """Publish a locally-built template's artifacts into MinIO via the Go seeder (go run msb-seed),
+    so the orchestrator can materialize/stream them from the bucket. Retries briefly while minio
+    finishes coming up (the port can open a beat before it serves S3 / the seeder's MakeBucket)."""
+    cmd = ["go", "run", "./services/cmd/msb-seed",
+           "--vendor-dir", str(repo_root / "vendor"), "--name", name, "--s3-endpoint", endpoint]
+    deadline = time.time() + 30
+    while True:
+        r = subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        if time.time() > deadline:
+            raise RuntimeError(f"seeding template {name} into {endpoint} failed: {r.stderr}")
+        time.sleep(0.5)
+
+
 @pytest.fixture(scope="session")
 def control_plane(tmp_path_factory):
     """Build and run the Go services (orchestrator + client-proxy + api) once per session.
@@ -260,6 +311,24 @@ def control_plane(tmp_path_factory):
     base_url = f"http://{api_addr}"
     redis_addr = ensure_redis()  # the shared routing catalog the api writes + client-proxy reads
     pg_dsn = ensure_postgres()   # the api's durable metadata store (Stage 14b)
+
+    # Stage 15: template artifacts live in MinIO (the flipped default). When the orchestrator runs in
+    # s3 mode (the default; MSB_ORCH_FLAGS can override to "--storage local-fs"), build the local
+    # artifacts, bring up MinIO, and seed default + example into the bucket so the orchestrator can
+    # materialize rootfs/snapfile and stream the memfile from it.
+    orch_flags = os.environ.get("MSB_ORCH_FLAGS", "")
+    if "--storage local-fs" not in orch_flags:
+        ensure_snapshot()          # default's rootfs + snapshot, so default/memfile etc. can be seeded
+        ensure_example_template()  # the example template's rootfs (cold-start, no snapshot)
+        s3_endpoint = ensure_minio()
+        _seed_template(repo_root, s3_endpoint, "default")
+        _seed_template(repo_root, s3_endpoint, "example")
+        # We deliberately do NOT clear local artifacts to "force" a bucket download here. The ensure_*
+        # fixtures rebuild a missing local artifact via docker, and the root orchestrator's own
+        # template builds leave a root-owned ~/.docker buildx lock that makes a forced normal-user
+        # rebuild flaky -- so forcing a cold cache fights the fixtures. The materialize-download path is
+        # covered hermetically by storage.TestMaterialize; the memfile-streaming payoff IS exercised
+        # here (every snapshot restore streams default/memfile from MinIO). See docs/STAGE15_DESIGN.md.
 
     logdir = tmp_path_factory.mktemp("services")
     orch_log = open(logdir / "orchestrator.log", "wb")

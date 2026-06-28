@@ -175,11 +175,23 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 // vsock_override; Stage 12 replaced vsock with the netns. See docs/STAGE5_DESIGN.md +
 // docs/STAGE12_DESIGN.md.
 //
-// useUffd selects the snapshot memory backend (Stage 13b): false = File (firecracker mmaps
-// the memfile and the kernel demand-pages it); true = Uffd (a pkg/uffd handler we start
-// becomes the VM's memory supplier, serving each guest page fault from the memfile). The
-// File path is unchanged, so the default behavior is identical. See docs/STAGE13_DESIGN.md.
-func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manager, useUffd bool) (*MicroVM, error) {
+// memSource selects the snapshot memory backend (Stage 15 generalized Stage 13's File/Uffd flag into
+// a page source the caller supplies): nil = File (firecracker mmaps the local memfile and the kernel
+// demand-pages it, with us outside); non-nil = Uffd (our pkg/uffd handler becomes the VM's memory
+// supplier, serving each guest page fault from memSource -- a local mmap in local-fs --uffd mode, or a
+// bucket reader streaming pages from object storage in s3 mode). See docs/STAGE13_DESIGN.md +
+// docs/STAGE15_DESIGN.md.
+func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manager, memSource uffd.PageSource) (*MicroVM, error) {
+	// We take ownership of memSource: if we fail before handing it to uffd.Serve, close it so the
+	// caller's mmap / open object doesn't leak. Once Serve is called (served=true) the handler owns it.
+	served := false
+	if memSource != nil {
+		defer func() {
+			if !served {
+				_ = memSource.Close()
+			}
+		}()
+	}
 	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
 	}
@@ -194,9 +206,13 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 		return nil, fmt.Errorf("missing snapshot (%s) for template %q; run scripts/build-snapshot.sh"+
 			" (or scripts/build-template.sh %s) first", snap, tmpl.Name, tmpl.Name)
 	}
-	if _, err := os.Stat(memfile); err != nil {
-		return nil, fmt.Errorf("missing snapshot (%s) for template %q; run scripts/build-snapshot.sh"+
-			" (or scripts/build-template.sh %s) first", snap, tmpl.Name, tmpl.Name)
+	// The memfile must be local only for the File backend; with a memSource (UFFD) it is streamed
+	// from object storage (or already opened by the caller), so we don't require it on disk.
+	if memSource == nil {
+		if _, err := os.Stat(memfile); err != nil {
+			return nil, fmt.Errorf("missing snapshot (%s) for template %q; run scripts/build-snapshot.sh"+
+				" (or scripts/build-template.sh %s) first", snap, tmpl.Name, tmpl.Name)
+		}
 	}
 	// The snapshot references its rootfs by the absolute path baked in at build time,
 	// so that rootfs must still be present for the load to succeed (Stage 6: it lives
@@ -234,26 +250,20 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 	vm.Slot = slot
 	vm.netMgr = netMgr
 
-	// Choose the snapshot memory backend. Default File: firecracker mmaps the memfile and the
-	// kernel demand-pages it, with us on the outside. With --uffd we instead start our own
-	// userfaultfd handler (pkg/uffd) and point firecracker at its socket, so the first touch of
-	// each guest page faults out to us and we copy it in from the memfile -- we become the VM's
-	// memory supplier (Stage 13b). See docs/STAGE13_DESIGN.md.
+	// Choose the snapshot memory backend (Stage 15 generalized Stage 13's File/Uffd switch into the
+	// caller's page-source choice). memSource == nil => File: firecracker mmaps the local memfile and
+	// the kernel demand-pages it, with us on the outside. memSource != nil => Uffd: our pkg/uffd
+	// handler becomes the VM's memory supplier, serving each guest page fault from memSource -- a local
+	// mmap (--uffd) or a bucket reader streaming pages from object storage (s3 mode). See
+	// docs/STAGE13_DESIGN.md + docs/STAGE15_DESIGN.md.
 	memBackend := map[string]any{"backend_type": "File", "backend_path": memfile}
-	if useUffd {
+	if memSource != nil {
 		// The handler must be listening BEFORE /snapshot/load: firecracker connects to its socket
-		// during the load to hand over the uffd fd + guest layout. Record it on the VM right away
-		// so a later failure (or Destroy) stops it and unmaps the memfile.
+		// during the load to hand over the uffd fd + guest layout. uffd.Serve takes ownership of
+		// memSource (closes it on its own failure, and on Destroy via the handler).
 		udsPath := filepath.Join(workdir, "uffd.sock")
-		// Build the page source (a read-only mmap of the local memfile) and hand it to the handler.
-		// Stage 15 makes this pluggable -- a bucket-backed source streams pages from object storage --
-		// but here it stays the local mmap, so the behavior is identical to before the 15a refactor.
-		src, serr := uffd.MmapSource(memfile)
-		if serr != nil {
-			vm.Destroy()
-			return nil, fmt.Errorf("open memfile page source: %w", serr)
-		}
-		h, herr := uffd.Serve(udsPath, src) // takes ownership of src (closes it on failure / teardown)
+		served = true
+		h, herr := uffd.Serve(udsPath, memSource)
 		if herr != nil {
 			vm.Destroy()
 			return nil, fmt.Errorf("start uffd handler: %w", herr)

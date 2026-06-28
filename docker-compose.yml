@@ -1,11 +1,12 @@
-# Provisioning for the control plane's shared state (Stage 14). Redis backs the sandbox
-# routing catalog (services/pkg/catalog) that the api writes and client-proxy reads;
-# Postgres backs the api's metadata store (services/pkg/store) since Stage 14b. The e2e
+# Provisioning for the control plane's shared state (Stages 14-15). Redis backs the sandbox
+# routing catalog (services/pkg/catalog) that the api writes and client-proxy reads; Postgres
+# backs the api's metadata store (services/pkg/store) since Stage 14b; MinIO is the object store
+# holding template artifacts (rootfs/snapfile/memfile, buildID-keyed) since Stage 15. The e2e
 # fixture (tests/conftest.py) and scripts/dev-up.sh bring these up, reusing them if already
 # running.
 #
-# Dev/test only: no auth, bound to loopback. This is a learning setup -- NOT security-audited
-# and NOT safe to expose. See docs/STAGE14_DESIGN.md.
+# Dev/test only: no auth (throwaway creds), bound to loopback. This is a learning setup -- NOT
+# security-audited and NOT safe to expose. See docs/STAGE14_DESIGN.md + docs/STAGE15_DESIGN.md.
 services:
   redis:
     image: redis:7-alpine
@@ -33,3 +34,17 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+  minio:
+    # Object storage for template artifacts (Stage 15). The orchestrator/builder speak the S3 API
+    # to it via minio-go. No healthcheck here: the minio server image ships neither curl nor mc, so
+    # conftest/dev-up poll the port and the S3 provider's MakeBucket-if-absent is the readiness signal.
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      # Throwaway root creds for this single-box learning setup (NOT safe to expose).
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    # Loopback-only publish: the artifact store must never be reachable off-box.
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API (the orchestrator/builder/seeder target this)
+      - "127.0.0.1:9001:9001"   # web console (dev convenience only)

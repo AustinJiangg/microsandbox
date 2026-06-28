@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,7 +14,9 @@ import (
 	"microsandbox/services/pkg/network"
 	"microsandbox/services/pkg/pool"
 	"microsandbox/services/pkg/proxy"
+	"microsandbox/services/pkg/storage"
 	"microsandbox/services/pkg/template"
+	"microsandbox/services/pkg/uffd"
 )
 
 // server owns the microVM fleet: it creates VMs (cold start or snapshot restore,
@@ -22,9 +27,10 @@ import (
 // handlers got thinner, the VM management did not move. See docs/STAGE8_DESIGN.md.
 type server struct {
 	vendorDir string
-	pools     map[string]*pool.Pool // template name -> its warm pool; empty when no --pool/--pool-size
-	net       *network.Manager      // Stage 12: per-sandbox netns/TAP/veth/DNAT slots (cold-start + restore paths)
-	useUffd   bool                  // Stage 13b: restore snapshots over the Uffd backend (--uffd) instead of File
+	storage   storage.StorageProvider // object store for artifacts (Stage 15); nil = local-fs: read local paths directly
+	pools     map[string]*pool.Pool   // template name -> its warm pool; empty when no --pool/--pool-size
+	net       *network.Manager        // Stage 12: per-sandbox netns/TAP/veth/DNAT slots (cold-start + restore paths)
+	useUffd   bool                    // Stage 13b: in local-fs mode, restore over Uffd (--uffd) instead of File
 
 	mu        sync.Mutex             // guards sandboxes
 	sandboxes map[string]*fc.MicroVM // sandbox id -> running VM
@@ -39,9 +45,10 @@ const networkSlots = 256
 // a from_snapshot create for that template is served in ~ms. An empty poolSpecs keeps
 // the original behavior of restoring on the request path. The pool's "make one VM"
 // step is restoreHealthy -- the same one the unpooled from_snapshot path uses.
-func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool) *server {
+func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool, sp storage.StorageProvider) *server {
 	s := &server{
 		vendorDir: vendorDir,
+		storage:   sp,
 		sandboxes: map[string]*fc.MicroVM{},
 		pools:     map[string]*pool.Pool{},
 		net:       network.NewManager(networkSlots),
@@ -52,7 +59,7 @@ func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool) *server
 		// fresh per-iteration variable, so each closure captures its own template.
 		tmpl, _ := template.Resolve(vendorDir, name)
 		p := pool.New(k, func() (pool.VM, error) {
-			vm, err := restoreHealthy(vendorDir, tmpl, s.net, s.useUffd)
+			vm, err := s.restoreHealthy(tmpl)
 			if err != nil {
 				return nil, err
 			}
@@ -133,9 +140,9 @@ func (s *server) create(fromSnapshot bool, tmpl template.Template) (*fc.MicroVM,
 			vm = v.(*fc.MicroVM) // the pool only ever holds *fc.MicroVM (newServer's restore)
 		}
 	case fromSnapshot:
-		vm, err = restoreHealthy(s.vendorDir, tmpl, s.net, s.useUffd)
+		vm, err = s.restoreHealthy(tmpl)
 	default:
-		vm, err = spawnHealthy(s.vendorDir, tmpl, s.net)
+		vm, err = s.spawnHealthy(tmpl)
 	}
 	if err != nil {
 		return nil, err
@@ -205,14 +212,73 @@ func healthyOrDestroy(vm *fc.MicroVM, err error) (*fc.MicroVM, error) {
 	return vm, nil
 }
 
-// restoreHealthy / spawnHealthy mint an id, create a VM (restored from the snapshot /
-// cold-started), and block until it is healthy.
-func restoreHealthy(vendorDir string, tmpl template.Template, netMgr *network.Manager, useUffd bool) (*fc.MicroVM, error) {
-	return healthyOrDestroy(fc.Restore(fc.NewID(), vendorDir, tmpl, netMgr, useUffd))
+// restoreHealthy / spawnHealthy mint an id, prepare the template's artifacts (Stage 15: materialize
+// from object storage in s3 mode), create the VM (restored / cold-started), and block until healthy.
+func (s *server) restoreHealthy(tmpl template.Template) (*fc.MicroVM, error) {
+	memSource, err := s.prepareRestore(tmpl)
+	if err != nil {
+		return nil, fmt.Errorf("prepare restore artifacts for %q: %w", tmpl.Name, err)
+	}
+	return healthyOrDestroy(fc.Restore(fc.NewID(), s.vendorDir, tmpl, s.net, memSource))
 }
 
-func spawnHealthy(vendorDir string, tmpl template.Template, netMgr *network.Manager) (*fc.MicroVM, error) {
-	return healthyOrDestroy(fc.Spawn(fc.NewID(), vendorDir, tmpl, netMgr))
+func (s *server) spawnHealthy(tmpl template.Template) (*fc.MicroVM, error) {
+	if err := s.prepareSpawn(tmpl); err != nil {
+		return nil, fmt.Errorf("prepare spawn artifacts for %q: %w", tmpl.Name, err)
+	}
+	return healthyOrDestroy(fc.Spawn(fc.NewID(), s.vendorDir, tmpl, s.net))
+}
+
+// prepareRestore makes a restore's artifacts available and returns the memfile page source for it:
+//   - local-fs mode (no provider): artifacts are already at their local paths; the memfile is a local
+//     mmap when --uffd, else nil (firecracker's File backend mmaps it).
+//   - s3 mode: resolve the template's current build, materialize rootfs + snapfile (vmstate) to their
+//     baked local paths if missing, and stream the memfile from object storage via UFFD (never
+//     materialized). See docs/STAGE15_DESIGN.md.
+func (s *server) prepareRestore(tmpl template.Template) (uffd.PageSource, error) {
+	memfile := filepath.Join(tmpl.SnapshotDir, "memfile")
+	if s.storage == nil {
+		if s.useUffd {
+			return uffd.MmapSource(memfile)
+		}
+		return nil, nil // File backend (local memfile)
+	}
+	ctx := context.Background()
+	buildID, err := storage.ResolveAlias(ctx, s.storage, tmpl.Name)
+	if err != nil {
+		return nil, err
+	}
+	if err := storage.Materialize(ctx, s.storage, storage.ArtifactKey(buildID, storage.RootfsName), tmpl.Rootfs); err != nil {
+		return nil, err
+	}
+	vmstate := filepath.Join(tmpl.SnapshotDir, "vmstate")
+	if err := storage.Materialize(ctx, s.storage, storage.ArtifactKey(buildID, storage.SnapfileName), vmstate); err != nil {
+		return nil, err
+	}
+	// Stream the memfile page-by-page from the bucket via UFFD -- the Stage-15 payoff. The reader is
+	// owned by the uffd handler from here (closed on Destroy); 0 selects the default chunk size.
+	rr, err := s.storage.OpenReaderAt(ctx, storage.ArtifactKey(buildID, storage.MemfileName))
+	if err != nil {
+		return nil, err
+	}
+	return uffd.NewChunkedSource(rr, rr.Close, 0), nil
+}
+
+// prepareSpawn ensures a cold start's rootfs is at its baked local path, materializing it from object
+// storage on a cache miss (s3 mode). No snapshot/memfile is involved in a cold start.
+func (s *server) prepareSpawn(tmpl template.Template) error {
+	if s.storage == nil {
+		return nil // local-fs: the rootfs is already at its local path
+	}
+	if _, err := os.Stat(tmpl.Rootfs); err == nil {
+		return nil // cache hit: no need to resolve the alias or download
+	}
+	ctx := context.Background()
+	buildID, err := storage.ResolveAlias(ctx, s.storage, tmpl.Name)
+	if err != nil {
+		return err
+	}
+	return storage.Materialize(ctx, s.storage, storage.ArtifactKey(buildID, storage.RootfsName), tmpl.Rootfs)
 }
 
 // destroyAll terminates every running VM -- the warm pools' idle VMs first, then the

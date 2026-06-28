@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -43,14 +44,28 @@ func main() {
 	scriptsDir := flag.String("scripts-dir", "",
 		"dir with build-rootfs.sh / build-snapshot.sh for template builds (default: sibling of --vendor-dir)")
 	useUffd := flag.Bool("uffd", false,
-		"restore snapshots over a userfaultfd page-fault handler (pkg/uffd) instead of the File backend (Stage 13; default off until proven on this box)")
+		"in local-fs mode, restore snapshots over a userfaultfd page-fault handler (pkg/uffd) instead of the File backend (Stage 13). In s3 mode the memfile always streams over UFFD, so this is ignored")
+	storageMode := flag.String("storage", "s3",
+		"artifact source (Stage 15): s3 (object storage, the default) or local-fs (read artifacts from --vendor-dir directly)")
+	s3Endpoint := flag.String("s3-endpoint", "127.0.0.1:9000", "S3/MinIO endpoint host:port (no scheme), for --storage s3")
+	s3Bucket := flag.String("s3-bucket", "msb", "S3 bucket holding template artifacts, for --storage s3")
+	s3AccessKey := flag.String("s3-access-key", "minioadmin", "S3 access key, for --storage s3")
+	s3SecretKey := flag.String("s3-secret-key", "minioadmin", "S3 secret key, for --storage s3")
+	s3SSL := flag.Bool("s3-ssl", false, "use https for the S3 endpoint, for --storage s3")
 	flag.Parse()
 
 	poolSpecs, err := parsePoolSpecs(poolFlags, *poolSize)
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := newServer(*vendorDir, poolSpecs, *useUffd)
+	// Stage 15: build the artifact store (s3 default). In s3 mode this connects to MinIO/S3 and
+	// creates the bucket if absent; a failure here is loud (the "flip the default" cost), exactly
+	// like Stage 14's Postgres/Redis. local-fs returns a nil provider (read --vendor-dir directly).
+	provider, err := newStorageProvider(*storageMode, *s3Endpoint, *s3AccessKey, *s3SecretKey, *s3Bucket, *s3SSL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv := newServer(*vendorDir, poolSpecs, *useUffd, provider)
 
 	// Template builder (Stage 10): the scripts dir defaults to the sibling of vendor (their
 	// repo layout), overridable by flag. The builder writes artifacts in place under
@@ -59,7 +74,7 @@ func main() {
 	if sd == "" {
 		sd = filepath.Join(filepath.Dir(*vendorDir), "scripts")
 	}
-	tmplBuilder := build.New(storage.NewLocal(*vendorDir), sd)
+	tmplBuilder := build.New(provider, *vendorDir, sd)
 
 	// 1) gRPC SandboxService -- the lifecycle seam.
 	lis, err := net.Listen("tcp", *grpcAddr)
@@ -90,8 +105,8 @@ func main() {
 			log.Fatalf("data proxy serve: %v", err)
 		}
 	}()
-	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, scripts=%s, pools=%v, uffd=%v)",
-		*grpcAddr, *proxyAddr, *vendorDir, sd, poolSpecs, *useUffd)
+	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, scripts=%s, pools=%v, storage=%s, uffd=%v)",
+		*grpcAddr, *proxyAddr, *vendorDir, sd, poolSpecs, *storageMode, *useUffd)
 
 	// Graceful shutdown: stop accepting, then destroy every VM so we never leak
 	// firecracker processes (killing the process destroys the whole VM).
@@ -104,4 +119,19 @@ func main() {
 	defer cancel()
 	_ = proxyServer.Shutdown(ctx)
 	srv.destroyAll()
+}
+
+// newStorageProvider builds the artifact store from the flags (Stage 15): "s3" connects to MinIO/S3
+// (the default; creating the bucket if absent, which doubles as the readiness check), "local-fs"
+// returns a nil provider so the fleet reads artifacts from --vendor-dir directly (the pre-Stage-15
+// behavior, kept as an escape hatch). The build pipeline gets the same provider (nil => no upload).
+func newStorageProvider(mode, endpoint, accessKey, secretKey, bucket string, ssl bool) (storage.StorageProvider, error) {
+	switch mode {
+	case "local-fs":
+		return nil, nil
+	case "s3":
+		return storage.NewS3(context.Background(), endpoint, accessKey, secretKey, bucket, ssl)
+	default:
+		return nil, fmt.Errorf("--storage must be s3 or local-fs, got %q", mode)
+	}
 }

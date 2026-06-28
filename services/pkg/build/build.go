@@ -8,6 +8,7 @@
 package build
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,22 +20,24 @@ import (
 // Builder runs the build pipeline for one template at a time. run is the command executor,
 // injectable so tests can assert the command sequence without running anything.
 type Builder struct {
-	storage    storage.StorageProvider
-	scriptsDir string // the repo's scripts/; build-rootfs.sh / build-snapshot.sh self-locate REPO_ROOT
+	storage    storage.StorageProvider // bucket to publish to; nil in local-fs mode (no upload)
+	localRoot  string                  // local output/cache root (the orchestrator's vendorDir)
+	scriptsDir string                  // the repo's scripts/; build-rootfs.sh / build-snapshot.sh self-locate REPO_ROOT
 	run        func(name string, args ...string) (string, error)
 }
 
-// New returns a Builder that shells out for real, writing artifacts through sp.
-func New(sp storage.StorageProvider, scriptsDir string) *Builder {
-	return &Builder{storage: sp, scriptsDir: scriptsDir, run: runCmd}
+// New returns a Builder that shells out for real: it writes a template's artifacts locally under
+// localRoot and, when sp is non-nil (s3 mode), publishes them to the bucket. A nil sp is local-fs
+// mode (build locally only -- the orchestrator then boots from the local dir).
+func New(sp storage.StorageProvider, localRoot, scriptsDir string) *Builder {
+	return &Builder{storage: sp, localRoot: localRoot, scriptsDir: scriptsDir, run: runCmd}
 }
 
-// ValidateName reports whether name is a buildable template name, delegating to the storage
-// provider (which rejects "default" and invalid names). The orchestrator calls it to fail a
-// TemplateCreate synchronously rather than as an async build failure.
+// ValidateName reports whether name is a buildable template name (rejects "default" and invalid
+// names). The orchestrator calls it to fail a TemplateCreate synchronously rather than as an async
+// build failure.
 func (b *Builder) ValidateName(name string) error {
-	_, err := b.storage.TemplateDir(name)
-	return err
+	return storage.ValidateBuildable(name)
 }
 
 // runCmd executes a command, returning its combined output (for the build log) and an error
@@ -52,7 +55,7 @@ func runCmd(name string, args ...string) (string, error) {
 // the orchestrator's TemplateService -- runs it in a goroutine). On a step's failure it
 // returns an error carrying that command's output tail, and later steps do not run.
 func (b *Builder) Build(buildID, name, dockerfile string, withSnapshot bool) error {
-	dir, err := b.storage.TemplateDir(name)
+	dir, err := storage.LocalTemplateDir(b.localRoot, name)
 	if err != nil {
 		return err // rejects "default" / invalid names before running anything
 	}
@@ -92,7 +95,58 @@ func (b *Builder) Build(buildID, name, dockerfile string, withSnapshot bool) err
 			return fmt.Errorf("build-snapshot: %w\n%s", err, tail(out))
 		}
 	}
+
+	// 4) Publish to object storage (Stage 15): upload the immutable {buildID}/ artifacts, then flip
+	//    the aliases/<name> pointer at this build. Skipped in local-fs mode (no provider) -- there the
+	//    orchestrator boots from the local dir we just wrote, which in s3 mode doubles as the
+	//    materialize cache (a same-box boot is a cache hit). See docs/STAGE15_DESIGN.md.
+	if b.storage != nil {
+		if err := b.publish(buildID, name, dir, withSnapshot); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// publish uploads a freshly built template's artifacts under their immutable {buildID}/ prefix and
+// points aliases/<name> at this build. The local file names map to E2B's object names (the local
+// snapshot's "vmstate" is uploaded as "snapfile"). The alias is flipped only after every artifact is
+// up, so a resolver never sees a half-published build.
+func (b *Builder) publish(buildID, name, dir string, withSnapshot bool) error {
+	ctx := context.Background()
+	uploads := []struct{ local, key string }{
+		{filepath.Join(dir, "rootfs.ext4"), storage.ArtifactKey(buildID, storage.RootfsName)},
+	}
+	if withSnapshot {
+		snap := filepath.Join(dir, "snapshot")
+		uploads = append(uploads,
+			struct{ local, key string }{filepath.Join(snap, "vmstate"), storage.ArtifactKey(buildID, storage.SnapfileName)},
+			struct{ local, key string }{filepath.Join(snap, "memfile"), storage.ArtifactKey(buildID, storage.MemfileName)},
+		)
+	}
+	for _, u := range uploads {
+		if err := uploadFile(ctx, b.storage, u.local, u.key); err != nil {
+			return fmt.Errorf("upload %s: %w", u.key, err)
+		}
+	}
+	if err := storage.SetAlias(ctx, b.storage, name, buildID); err != nil {
+		return fmt.Errorf("set alias %s -> %s: %w", name, buildID, err)
+	}
+	return nil
+}
+
+// uploadFile streams a local file to key with its size (PutObject needs the content length).
+func uploadFile(ctx context.Context, sp storage.StorageProvider, localPath, key string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return sp.Upload(ctx, key, f, fi.Size())
 }
 
 // tail returns the trailing portion of s -- the useful end of a long build log.

@@ -5,7 +5,9 @@ package build
 // artifact paths -- without docker, firecracker, or KVM.
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -35,7 +37,10 @@ func (r *recorder) run(name string, args ...string) (string, error) {
 func newTestBuilder(t *testing.T, rec *recorder) (*Builder, string) {
 	t.Helper()
 	root := t.TempDir()
-	return &Builder{storage: storage.NewLocal(root), scriptsDir: "/repo/scripts", run: rec.run}, root
+	// storage=nil -> local-fs mode: the command-sequence assertions below aren't perturbed by the
+	// publish step (which would need the real artifact files the fake exec never creates). The
+	// upload+alias path is covered separately by TestBuildPublishesToBucket.
+	return &Builder{storage: nil, localRoot: root, scriptsDir: "/repo/scripts", run: rec.run}, root
 }
 
 func TestBuildWithSnapshot(t *testing.T) {
@@ -96,6 +101,44 @@ func TestBuildStopsOnFailure(t *testing.T) {
 	// docker build + build-rootfs ran; build-snapshot did not (the failure stopped it).
 	if len(rec.calls) != 2 {
 		t.Fatalf("got %d commands, want 2 (stop after the failing build-rootfs): %v", len(rec.calls), rec.calls)
+	}
+}
+
+// TestBuildPublishesToBucket covers the Stage 15 publish step: with a (Local dir-as-bucket)
+// provider, a successful build uploads the immutable {buildID}/ artifacts and flips aliases/<name>.
+// The fake exec creates the files build-rootfs/build-snapshot would produce, so publish has real
+// bytes to upload -- all hermetic (no MinIO, no docker, no KVM).
+func TestBuildPublishesToBucket(t *testing.T) {
+	bucket := storage.NewLocal(t.TempDir())
+	run := func(name string, args ...string) (string, error) {
+		switch {
+		case strings.Contains(name, "build-rootfs"): // build-rootfs.sh <image> <rootfsPath>
+			_ = os.WriteFile(args[1], []byte("ROOTFS"), 0o644)
+		case strings.Contains(name, "build-snapshot"): // build-snapshot.sh <rootfs> <snapDir>
+			snap := args[1]
+			_ = os.MkdirAll(snap, 0o755)
+			_ = os.WriteFile(filepath.Join(snap, "vmstate"), []byte("VMSTATE"), 0o644)
+			_ = os.WriteFile(filepath.Join(snap, "memfile"), []byte("MEMFILE"), 0o644)
+		}
+		return "", nil
+	}
+	b := &Builder{storage: bucket, localRoot: t.TempDir(), scriptsDir: "/repo/scripts", run: run}
+	if err := b.Build("bld_pub", "demo", "FROM x", true); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ctx := context.Background()
+	for _, k := range []string{
+		storage.ArtifactKey("bld_pub", storage.RootfsName),
+		storage.ArtifactKey("bld_pub", storage.SnapfileName), // local "vmstate" uploaded as "snapfile"
+		storage.ArtifactKey("bld_pub", storage.MemfileName),
+	} {
+		if ok, err := bucket.Exists(ctx, k); err != nil || !ok {
+			t.Errorf("bucket missing %s (ok=%v err=%v)", k, ok, err)
+		}
+	}
+	if got, err := storage.ResolveAlias(ctx, bucket, "demo"); err != nil || got != "bld_pub" {
+		t.Errorf("ResolveAlias(demo) = %q, %v; want bld_pub", got, err)
 	}
 }
 
