@@ -63,7 +63,10 @@ The core layers — see `docs/ARCHITECTURE.md` for the full design:
    and streams the memfile from the bucket over UFFD). Since **Stage 17** the memfile is stored
    **compacted** (non-zero blocks only) behind a per-block index (`pkg/storage/header`, mirroring E2B's
    `pkg/storage/header`); the boot path resolves each faulting offset through the mapping and serves
-   zero/gap pages without a fetch.
+   zero/gap pages without a fetch. Since **Stage 18** that header carries E2B's **copy-on-write owner**, so a
+   template built `from` a base stores its **rootfs as a diff** (`{B}/rootfs.ext4` = only its changed blocks +
+   a flattened `rootfs.ext4.header`); the boot path **assembles** the full rootfs by reading each run from its
+   owning build's object (`MaterializeLayered`), falling back to a whole-object download when there is no header.
    Stage 4 first extracted all this as a single `control-plane/` binary; Stage 8 dissolved it
    into `services/`; Stage 9 sank the data path off the api. See `docs/STAGE10_DESIGN.md` +
    `docs/STAGE9_DESIGN.md` + `docs/STAGE8_DESIGN.md` +
@@ -208,8 +211,10 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   to end (mmap ↔ bucket), the precondition for multi-host / peer-sourced memory. e2e **37/37 in s3
   mode** (memfile streamed from MinIO; `local-fs` + `local-fs --uffd` escape hatches green too). The
   fidelity gaps deliberately deferred — **NBD-streamed rootfs** (E2B serves the rootfs lazily too, not
-  materialized), chunk/header/compression, COW layer diffs, a cross-node cache — are itemized in
-  `docs/STAGE15_DESIGN.md` §11. See `docs/STAGE15_DESIGN.md`.
+  materialized), chunk/header, COW layer diffs (the header+merge done in Stage 18; rootfs), a cross-node
+  cache — are itemized in `docs/STAGE15_DESIGN.md` §11. (Compression was listed here too but is **not** an E2B
+  mechanism — Stage 18's source audit confirmed E2B stores raw blocks; it would be our own extension.)
+  See `docs/STAGE15_DESIGN.md`.
 - **Done (Stage 16 — auth: `X-API-Key`→team + a data-plane access token)**: the first
   production-fidelity stage gives the system **identity** (every prior stage was "one box, no
   auth"). 16a made the api **authenticate** every request (except `/health`) with an `X-API-Key`
@@ -249,12 +254,35 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   win (restore-to-ready is dominated by per-sandbox net setup, unchanged); the win is real compaction +
   zero-page fetch elision, and the `header` mechanism is the shared substrate the deferred NBD rootfs /
   COW layers / chunk cache all consume. See `docs/STAGE17_DESIGN.md`.
+- **Done (Stage 18 — storage depth (2): COW layered rootfs builds)**: E2B's real **copy-on-write layering**,
+  banked on the **rootfs** (a build-time block diff is meaningful there; the memfile needs live-VM
+  re-snapshotting → Stage 19). 18a grew `pkg/storage/header` into the full COW algebra — a per-entry **build
+  owner** as a header-local **build-table index** (not a uuid → zero new deps), `Metadata`
+  `BuildId`/`BaseBuildId`/`Generation`, **format v2** alongside the Stage-17 v1 memfile, and
+  `CreateMapping`/`MergeMappings`/`NormalizeMappings`/`BuildDiff`/`Locate`. 18b added the `pkg/storage` mechanism
+  (`PublishRootfsDiff` — diff the child vs the assembled base, upload only changed non-zero blocks +
+  `{B}/rootfs.ext4.header`; `MaterializeLayered` — assemble the full rootfs by reading each run from its **owning
+  build's** object; no header → the Stage-15 whole-object download). 18c wired the producer + boot path
+  (`build-rootfs.sh` learned a **fixed-size** arg; `pkg/build.Build` gained `base` → size-pin +
+  `PublishRootfsDiff`; orchestrator `prepareSpawn`/`prepareRestore` use `MaterializeLayered`; proto `base` field
+  **hand-edited** into the committed stub since protoc is absent, wire round-trip unit-tested). 18d wired the
+  surface (api `POST /templates` `from`, SDK `build_template(base=…)`) + a real-VM e2e
+  (`test_layered_template_via_api`: build `derived` over `default`, boot, content carried, code runs).
+  **Honest headline:** the mechanism is faithful and boots, but the **size win is bounded (~2.07×, 576 → 278.8
+  MiB), not the lab ~40×** — `docker build … RUN` + `docker export | mkfs.ext4 -d` **reshuffles the ext4 block
+  layout** when a layer is added (measured: two fresh mkfs of the *same* image differ ~3%, a `RUN`-layer child
+  differs from the base ~48%), so ~half the content reads as "changed". The size-pin (Decision 8) is
+  **necessary but not sufficient**; the missing piece is **block-layout preservation** (E2B mutates a persisted
+  block device in place; we re-create the FS each build) — a known divergence, *not* a defect in the merge
+  algebra (correct for any layout). e2e **44/44** in s3 mode. See `docs/STAGE18_DESIGN.md`.
 - **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): production fidelity —
   multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript
-  SDK; plus the rest of the storage-mechanism depth now that Stage 17 banked the `pkg/storage/header`
-  index (NBD-streamed rootfs over the same header, memfile/rootfs **compression** on the existing
-  mapping, COW layered builds, a cross-node chunk cache) and auth depth (a key-management API, token
-  expiry/rotation, TLS).
+  SDK; plus the rest of the storage-mechanism depth now that Stages 17–18 banked the `pkg/storage/header`
+  index + COW algebra (the **memfile COW** via live-VM re-snapshot = Stage 19; **block-layout preservation**
+  for the rootfs diff — an in-place/overlay block device or NBD over the same layered header, the gap that
+  caps Stage 18's size win; a cross-node chunk cache) and auth depth (a key-management API, token
+  expiry/rotation, TLS). Note: memfile/rootfs **compression is NOT an E2B mechanism** (verified against
+  `e2b-dev/infra` in Stage 18 — E2B stores raw blocks) — it would be our own optional extension, not a fidelity gap.
 
 ## Development conventions
 

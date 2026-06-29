@@ -43,3 +43,31 @@ def test_build_template_via_api(api_template_build):
 
     with Sandbox(template="apibuilt", base_url=base_url) as sb:
         assert "example template" in sb.files.read(MARKER)
+
+
+DERIVED_MARKER = "/etc/microsandbox-derived"
+
+
+def test_layered_template_via_api(api_template_build):
+    """Stage 18: build a copy-on-write LAYERED template (base="default") through the api, then boot it.
+
+    `derived` is the default image plus a marker file, but its rootfs is stored as a DIFF over the
+    default's (only its changed blocks + a flattened header), pinned to the default's size so the
+    diff stays small. This exercises the full SDK(base=) -> api(from) -> orchestrator -> pkg/build
+    layered path on a real VM: a sandbox cold-starts from the layered build, carries the child's
+    added content, and runs code -- proving the layered rootfs is a valid, bootable image.
+
+    The "stores only the diff" win is asserted hermetically in services/pkg/storage
+    (TestPublishAndMaterializeRootfsDiff: the diff object holds only the changed blocks); the
+    measured real bytes are recorded in docs/STAGE18_DESIGN.md. On one box the boot may cache-hit
+    the orchestrator's local build output, so the bucket-assemble path (default + derived objects)
+    is the one covered hermetically by the storage unit tests.
+    """
+    base_url = api_template_build
+    dockerfile = f'FROM microsandbox-agent\nRUN echo "derived COW layer" > {DERIVED_MARKER}\n'
+
+    build_template("derived", dockerfile, base="default", with_snapshot=False, base_url=base_url)
+
+    with Sandbox(template="derived", base_url=base_url) as sb:
+        assert "derived COW layer" in sb.files.read(DERIVED_MARKER)
+        assert sb.run_code("print(6 * 7)").stdout.strip() == "42"

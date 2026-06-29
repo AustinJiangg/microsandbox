@@ -10,14 +10,17 @@ import (
 	pbt "microsandbox/services/pkg/grpc/templatemanager"
 )
 
-// handleTemplateCreate: POST /templates {name, dockerfile, with_snapshot} -> gRPC
+// handleTemplateCreate: POST /templates {name, dockerfile, with_snapshot, from} -> gRPC
 // TemplateCreate -> record a build row -> 201 {build_id}. The build runs asynchronously in
-// the orchestrator; the SDK polls GET /templates/builds/{id}.
+// the orchestrator; the SDK polls GET /templates/builds/{id}. An optional `from` names a base
+// template, making this a copy-on-write layered build (Stage 18): the rootfs is stored as a diff
+// over `from`'s rather than whole.
 func (a *api) handleTemplateCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name         string `json:"name"`
 		Dockerfile   string `json:"dockerfile"`
 		WithSnapshot *bool  `json:"with_snapshot"` // pointer: an absent field means the default (true)
+		From         string `json:"from"`          // base template for a layered (COW) build; empty = a flat build
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -31,7 +34,7 @@ func (a *api) handleTemplateCreate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	resp, err := a.templates.TemplateCreate(ctx, &pbt.TemplateCreateRequest{
-		Name: req.Name, Dockerfile: req.Dockerfile, WithSnapshot: withSnapshot,
+		Name: req.Name, Dockerfile: req.Dockerfile, WithSnapshot: withSnapshot, Base: req.From,
 	})
 	if err != nil {
 		writeGRPCError(w, err)

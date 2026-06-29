@@ -93,12 +93,16 @@ truth, and teach the **non-isomorphic** boot path that follows:
   path** (Decision 3); we do *not* rebuild snapshots against a separate cache dir. `vendor/` is the
   cache at the baked path; the download path is exercised by the fixture clearing the local copy
   after seeding (Decision 4).
-- **No chunked/compressed/COW block storage (yet).** E2B stores rootfs+memfile as **compressed,
-  chunked, copy-on-write layers** with a `.header` index tracking per-block provenance and
-  `NotPresent/Dirty/Zero` state (`pkg/storage/header`). 15b starts with **per-page `Range` reads +
-  a local page cache** on a single flat artifact set; chunked prefetch is measured-in only if the
-  restore time demands it (Decision 6). Compression, the `.header` index, COW diff layers, and the
-  cross-node NFS cache are **deferred** (§11, items 2–4).
+- **No chunked/COW block storage (yet).** E2B stores rootfs+memfile as **chunked, copy-on-write layers**
+  with a `.header` index tracking per-block provenance and `NotPresent/Dirty/Zero` state
+  (`pkg/storage/header`). 15b starts with **per-page `Range` reads + a local page cache** on a single flat
+  artifact set; chunked prefetch is measured-in only if the restore time demands it (Decision 6). The
+  `.header` index landed in **Stage 17** (compacted memfile) and COW diff layers in **Stage 18** (rootfs);
+  the cross-node NFS cache is still **deferred** (§11).
+  > **Correction (Stage 18 source audit):** this once said E2B stores "**compressed**, chunked, …". That is
+  > **false** — `e2b-dev/infra` stores **raw** blocks (no compression lib in its storage/build/orchestrator
+  > paths; its diff writer writes raw bytes). Compression is **not** an E2B mechanism — it would be our own
+  > optional extension, not a fidelity gap. The "compressed" wording is dropped here and throughout this doc.
 - **No auth / TLS / multi-host.** MinIO runs with throwaway root creds on loopback, like
   Redis/Postgres in Stage 14. **Not** safe to expose — same standing caveat as the whole repo.
 - **A latency claim.** See the honesty note above.

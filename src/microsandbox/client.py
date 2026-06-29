@@ -359,6 +359,7 @@ def build_template(
     name: str,
     dockerfile: str,
     *,
+    base: str | None = None,
     with_snapshot: bool = True,
     api_key: str | None = None,
     base_url: str | None = None,
@@ -381,6 +382,10 @@ def build_template(
         name: the template name to publish (an existing one is replaced); "default" is
             rejected (it is the baked stock image).
         dockerfile: the recipe contents.
+        base: an existing template to build on top of (Stage 18 copy-on-write layering). When
+            given, the new image's rootfs is stored as a diff over `base`'s -- only its changed
+            blocks -- so a derived template costs roughly its delta, not a whole rootfs. The
+            child is pinned to the base's size for a small diff. Absent = a flat (whole) build.
         api_key: the X-API-Key for the build (defaults to MICROSANDBOX_API_KEY); the build is
             recorded against the resolved team (Stage 16).
         base_url: where the api is reachable (defaults to MICROSANDBOX_URL, then :8080).
@@ -392,12 +397,10 @@ def build_template(
     ).rstrip("/")
     key = api_key or os.environ.get("MICROSANDBOX_API_KEY")
 
-    created = _api_request(
-        "POST",
-        api + "/templates",
-        {"name": name, "dockerfile": dockerfile, "with_snapshot": with_snapshot},
-        api_key=key,
-    )
+    body = {"name": name, "dockerfile": dockerfile, "with_snapshot": with_snapshot}
+    if base:
+        body["from"] = base
+    created = _api_request("POST", api + "/templates", body, api_key=key)
     build_id = created["build_id"]
 
     deadline = time.monotonic() + timeout

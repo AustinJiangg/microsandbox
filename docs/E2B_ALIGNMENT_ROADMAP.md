@@ -21,10 +21,14 @@
 > team-scoped resources, and a per-sandbox data-plane access token)**, and **17 (the first
 > storage-mechanism-depth item: the streamed memfile stored compacted behind a per-block
 > `pkg/storage/header` index — zero/gap pages served without a fetch)** are **done** — see their design
-> docs and the "Done" list in `CLAUDE.md`. The remainder (production fidelity — multi-host / a TS SDK;
-> plus the rest of the storage-mechanism depth — NBD-served rootfs over the same header, chunk
-> compression, COW layers, a cross-node cache; and auth depth — a key-management API, token
-> expiry/rotation, TLS) is the **deferred** forward plan.
+> docs and the "Done" list in `CLAUDE.md`. **Stage 18** (storage depth (2): COW **layered rootfs** builds — the
+> header's per-entry build owner + `MergeMappings`, a rootfs diff over a base, assembled at boot) is also done.
+> The remainder (production fidelity — multi-host / a TS SDK; plus the rest of the storage-mechanism depth —
+> NBD-served rootfs over the same header, **block-layout preservation** for the rootfs diff, **memfile COW** via
+> live-VM re-snapshot (Stage 19), a cross-node cache; and auth depth — a key-management API, token
+> expiry/rotation, TLS) is the **deferred** forward plan. (Note: memfile/rootfs **compression** is **not** an E2B
+> mechanism — Stage 18's source audit confirmed E2B stores raw blocks — so it is our own optional extension, not a
+> fidelity gap.)
 
 ## 1. Why this document
 
@@ -231,14 +235,32 @@ per-entry `BuildId` (the COW owner) and chunk compression are deferred. **Measur
 default memfile → 228.6 MiB compacted (2.2×), 6,560-byte header; e2e 43/43 in s3 mode; no isolated
 single-box latency win (net setup dominates). See `docs/STAGE17_DESIGN.md`.
 
+### Stage 18 — storage depth (2): COW layered rootfs builds ✅
+E2B's **copy-on-write layering**, banked on the rootfs. `pkg/storage/header` gained the COW algebra (a per-entry
+**build owner** as a header-local build-table index — zero new deps; `MergeMappings`/`NormalizeMappings`/`BuildDiff`/
+`Locate`; format v2 alongside the v1 memfile); `pkg/storage` got `PublishRootfsDiff` (store only the child's changed
+blocks + `{B}/rootfs.ext4.header`) and `MaterializeLayered` (assemble the full rootfs from each run's owning build,
+whole-object fallback when there is no header); the build/boot/API/SDK path carries an optional `base`/`from`.
+**Honest:** the mechanism is faithful and boots a real layered VM (e2e 44/44), but the size win is **bounded (~2.07×,
+576 → 278.8 MiB), not the lab ~40×** — `docker build … RUN` + `docker export | mkfs.ext4 -d` reshuffles the ext4
+block layout when a layer is added (a same-image re-mkfs differs only ~3%; a `RUN`-layer child differs ~48%), so the
+size-pin (Decision 8) is necessary but **not sufficient**: **block-layout preservation** (E2B mutates a persisted
+block device in place) is the missing piece. See `docs/STAGE18_DESIGN.md`.
+
 ### Still deferred
 - **More storage-mechanism depth (deeper E2B fidelity behind the same seam).** Verified against
-  `e2b-dev/infra`, and now building on the Stage-17 `pkg/storage/header`: E2B serves the **rootfs lazily
-  over a userspace NBD block device** (not materialized whole, as we do — over the *same* header), stores
-  rootfs+memfile **chunked + compressed** (the header gains per-block stored lengths), builds templates as
-  **copy-on-write diff layers** (the header's per-entry build owner), and shares chunks via a **cross-node
-  cache**. Each deepens the *mechanism* behind the `StorageProvider` / `PageSource` / `header` interfaces
-  without changing the seam — candidate future stages (`docs/STAGE15_DESIGN.md` §11, `docs/STAGE17_DESIGN.md` §10).
+  `e2b-dev/infra`, and building on the Stage-17/18 `pkg/storage/header` + COW algebra: E2B serves the **rootfs
+  lazily over a userspace NBD block device** (not materialized/assembled whole, as we do — over the *same* layered
+  header), preserves **block layout across layers** via an in-place/overlay block device (the gap that caps Stage
+  18's size win), layers the **memfile** too via live-VM re-snapshot (**Stage 19** — a build-time memfile diff is
+  meaningless: two independent boot snapshots differ everywhere), and shares chunks via a **cross-node cache**. Each
+  deepens the *mechanism* behind the `StorageProvider` / `PageSource` / `header` interfaces without changing the seam
+  (`docs/STAGE15_DESIGN.md` §11, `docs/STAGE17_DESIGN.md` §10, `docs/STAGE18_DESIGN.md` §10–11).
+  > **Correction (Stage 18 source audit):** earlier wording here and in STAGE15/STAGE17 called E2B's storage
+  > "chunked + **compressed**". That is **false** — `e2b-dev/infra` stores **raw** blocks (no non-test Go file imports
+  > a compression lib in the storage/build/orchestrator paths; the diff writer writes raw bytes). Compression is
+  > therefore **not an E2B-fidelity item** — it would be our own optional extension, not a gap. Treat any
+  > "compressed" mention below as superseded by this note.
 - **Later — production fidelity.** Auth landed in Stage 16 (above); what remains: multi-host
   scheduling (real node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource
   limits and start/ready commands, plus auth depth (a key-management API, token expiry/rotation, TLS).

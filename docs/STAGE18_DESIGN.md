@@ -1,6 +1,30 @@
 # Stage 18 design: storage-mechanism depth (2) — COW layered builds (the rootfs diff)
 
-> Status: **design (proposed).** Second of the deferred "storage-mechanism depth" items the roadmap
+> Status: **done (18a–18d shipped).** The full COW mechanism is live and the real-VM e2e is green: a
+> layered template (`derived`, base `default`) builds through SDK(`base=`) → api(`from`) → orchestrator →
+> `pkg/build`, is stored as a rootfs **diff** with a flattened v2 header, then a sandbox cold-starts from it,
+> carries the child's added content, and runs code (`tests/test_template.py::test_layered_template_via_api`).
+>
+> **Honest measured outcome (the headline finding of this stage).** The mechanism is faithful, but the
+> *size win on our pipeline is modest* — and understanding **why** is the real lesson:
+> - The real `derived` build (default image + one `RUN` layer, pinned to the base's 576 MiB) stored a
+>   **278.8 MiB** diff over the 576 MiB base — only **2.07×**, with 178 present runs. Not the ~2.9% Decision 8's
+>   lab table predicted.
+> - **Root cause (measured, not guessed):** `mkfs.ext4 -d` *is* deterministic at a fixed size — two fresh
+>   builds of the **same image** at 576 MiB differ by only **~4,375 / 147,456 blocks (~3%)**, matching
+>   Decision 8. But running `docker build FROM agent + RUN …` and then `docker export | mkfs.ext4 -d` reshuffles
+>   the ext4 block layout: the same content+marker vs the base differs by **71,364 blocks (~278 MiB)**. Adding
+>   even a trivial layer changes `docker export`'s file ordering, so mkfs lays ~half the content at new offsets —
+>   spurious relocations, not real delta.
+> - **So the size-pin (Decision 8) is necessary but *not sufficient*.** The deeper precondition is that base and
+>   child share **block layout**, which E2B gets for free by mutating a **persisted block device in place**; our
+>   re-create-the-filesystem-each-build pipeline cannot preserve layout across a content change. Closing this gap
+>   (an in-place / overlay block device, or NBD over the layered header) is itemized as a known divergence (§10)
+>   and a follow-on — it is *not* a defect in the COW algebra this stage banks, which is correct for any layout
+>   (it just stores a bigger diff when the layout diverges). The "store less" win is real but bounded here
+>   (576 → 278.8 MiB, ~2×) until layout is preserved.
+
+> (Original) Status: **design (proposed).** Second of the deferred "storage-mechanism depth" items the roadmap
 > parked behind the Stage-15 `StorageProvider` / `PageSource` seams and the Stage-17 `pkg/storage/header`
 > index (`docs/E2B_ALIGNMENT_ROADMAP.md` §5 "Still deferred"; `docs/STAGE17_DESIGN.md` §10 item 3). Stage 17
 > compacted a **single flat** build's memfile behind a per-block mapping with **no build owner** — every
@@ -234,6 +258,17 @@ with more margin). The storage **mechanism** (18b) stays correct for *any* sizes
 when sizes differ — so the size-pin is an efficiency precondition, not a correctness one. **Honest:** without the
 size-pin the diff is ~31% (still less than a full image, but far from the 2.9% the pin buys).
 
+> **18d amendment — the size-pin is necessary but NOT sufficient (measured on the real e2e).** The table above was
+> measured by mutating *one* mkfs input (size or a single appended file). The real layered build adds a Docker
+> **layer** (`RUN …`) and re-exports: `docker export | mkfs.ext4 -d` then lays the filesystem out differently than
+> the base's export did, so ~half the *content* blocks move even at the pinned size. Measured here: two fresh mkfs
+> of the **same image** at 576 MiB differ by ~3% (~4,375 blocks — mkfs is deterministic), but the real
+> `derived` (default + a `RUN` layer) differs from the base by **71,364 blocks (~278 MiB, ~48%)**, so its stored
+> diff is 278.8 MiB (2.07×), not ~3%. The missing precondition is **block-layout preservation across a content
+> change**, which E2B gets by mutating a persisted block device in place; our re-create-each-build pipeline does
+> not. This is a known divergence (§10, "layout preservation"), not a defect in the merge algebra — which stays
+> correct for any layout. The honest win banked is the *mechanism* + a real (if bounded ~2×) byte reduction.
+
 ## 5. Code "from → to" map
 
 | concern | from (Stage 17) | to (Stage 18) |
@@ -280,7 +315,7 @@ the whole object; the stored `{child}/rootfs.ext4` holds only the changed non-ze
 Nothing in `pkg/build`/orchestrator/api changes; `go test ./services/...` green. (The 17a/15a discipline: bank
 the mechanism, unit-tested, before any VM/build path.)
 
-### Stage 18c — wire the producer + boot path (build/orchestrator), incl. the size-pin
+### Stage 18c — wire the producer + boot path (build/orchestrator), incl. the size-pin ✅ done
 `build-rootfs.sh` learns a fixed-size argument; `pkg/build` for a `base`-set build resolves the base alias,
 materializes the base rootfs, builds the child **pinned to the base's size** (Decision 8), and publishes via
 `PublishRootfsDiff` (no `base` → today's whole upload, unchanged). The orchestrator's `prepareSpawn`/
@@ -288,7 +323,7 @@ materializes the base rootfs, builds the child **pinned to the base's size** (De
 `TemplateService` carries an optional `base`. Unit-test the build command sequence (the size-pin arg) with the
 injectable executor; the assemble path is already covered by 18b.
 
-### Stage 18d — wire the layered template API/SDK + docs + honest review
+### Stage 18d — wire the layered template API/SDK + docs + honest review ✅ done
 `TemplateCreate` carries an optional `base`; api `POST /templates` gains `from`; SDK `build_template(base=…)`.
 A new Python e2e: build `derived` with `base=default` + a `RUN pip install <small pkg>`, create a sandbox on it,
 assert the package imports (content carried) **and** that the stored rootfs diff is materially smaller than a
@@ -342,6 +377,7 @@ flatten + multi-build read + empty→zero), deliberately simpler or improved on 
 | flatten | `MergeMappings` at snapshot time | `MergeMappings` at build time | 🟢 faithful |
 | empty blocks | `empty` bitset → `uuid.Nil`, served as zeros | gap/zero owner (index 0), served as zeros | 🟢 faithful |
 | compression | **none** (myth corrected — see header) | none | 🟢 faithful (E2B doesn't compress) |
+| **layout preservation** | base+child share a **persisted block device** mutated in place, so a child's diff is only the genuinely-changed blocks | child is **re-created** by `docker export \| mkfs.ext4 -d` each build, which reshuffles the layout when a layer is added → ~half the content reads as "changed" | 🔴 **the size win's main gap** — measured 2.07× not ~40×; needs an in-place/overlay block device or NBD (a follow-on, see status block) |
 | cross-node cache | NFS-wrapped shared chunks | per-build local object cache | 🟡 multi-host — deferred |
 
 ## 11. Deferred follow-on — Stage 19 (memfile COW via live-VM snapshot), sketched

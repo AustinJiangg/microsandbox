@@ -305,18 +305,25 @@ compaction), deliberately simpler on what the next items add. Verified against `
 | mapping entry | `BuildMap{Offset,Length,BuildId,BuildStorageOffset}` | `{Offset,Length,BuildStorageOffset}` | 🟡 drop `BuildId` until COW |
 | gaps | `BuildId == Nil` → zeros, never read | unmapped range → zeros, never read | ✅ faithful |
 | compaction | store only present/delta blocks | store only present blocks | ✅ faithful (single build) |
-| compression | LZ4/zstd frames per chunk | raw blocks | 🟡 **deferred** (item 2b) |
-| build model | COW diff layers; header resolves a byte to its owning build | one flat build per memfile | 🟡 **deferred** (item 3) |
-| rootfs | same header, served lazily over **NBD** | rootfs still materialized whole (memfile-only header) | 🔴 **deferred** (item 1) |
+| compression | ~~LZ4/zstd frames per chunk~~ **none (E2B stores raw)** | raw blocks | ✅ faithful (correction below) |
+| build model | COW diff layers; header resolves a byte to its owning build | one flat build per memfile | ✅ **done for rootfs in Stage 18** (memfile = Stage 19) |
+| rootfs | same header, served lazily over **NBD** | rootfs still materialized whole (memfile-only header) | 🔴 **deferred** (item 1; Stage 18 assembles, NBD streams) |
 | cross-node cache | NFS-wrapped shared chunks | per-VM local chunk cache | 🟡 multi-host — **deferred** (item 4) |
+
+> **Correction (Stage 18 source audit):** the "compression" row above claimed E2B stores LZ4/zstd frames.
+> That is **false** — `e2b-dev/infra` stores **raw** blocks (no compression lib in its storage/build/
+> orchestrator paths; its diff writer writes raw bytes). Compression is **not** an E2B mechanism — it would
+> be our own optional extension, not a fidelity gap. Item 2b below is superseded by this note.
 
 **Deferred follow-ons (candidate later stages), in rough priority:**
 1. **NBD-streamed rootfs** — give the rootfs the same header + a userspace NBD device, so it streams like
-   the memfile and the baked-absolute-path problem dissolves. A whole subsystem; its own stage.
-2b. **Compression** — LZ4/zstd frames behind the same mapping (`BuildStorageOffset` already addresses
-   variable-size stored blocks), with the header recording each block's stored length.
-3. **COW layered builds** — restore the per-entry `BuildId`/`BaseBuildId`; a child build stores only its
-   diff and points unchanged ranges at the parent's storage (E2B's `BuildMap`).
+   the memfile and the baked-absolute-path problem dissolves. A whole subsystem; its own stage. (Stage 18
+   assembles the layered rootfs whole; NBD would serve that *same* header lazily.)
+2b. ~~**Compression**~~ — **not an E2B mechanism** (see the correction above); an optional non-E2B extension only.
+3. **COW layered builds** — ✅ **done for the rootfs in Stage 18** (the per-entry `BuildId`/`BaseBuildId` +
+   build-table owner; a child stores only its diff and points unchanged ranges at the parent — E2B's `BuildMap`).
+   The **memfile** half is Stage 19 (it needs live-VM re-snapshotting). Honest caveat: on our re-export pipeline
+   the rootfs diff is bounded (~2×) until block-layout preservation lands — see `docs/STAGE18_DESIGN.md`.
 4. **Cross-node chunk cache** — once multi-host lands, share fetched chunks between orchestrators (E2B's
    NFS wrap).
 

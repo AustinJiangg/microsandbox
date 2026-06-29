@@ -221,7 +221,9 @@ lazy snapshot restore behind `--uffd` (Stage 13) → the routing catalog and met
 swapped onto Redis + Postgres (Stage 14) → template artifacts moved to S3 object storage
 (Stage 15) → auth: `X-API-Key`→team + a per-sandbox data-plane access token (Stage 16, the
 first production-fidelity stage) → the streamed memfile stored compacted behind a per-block
-`pkg/storage/header` index (Stage 17, the first storage-mechanism-depth item). Through Stage 10
+`pkg/storage/header` index (Stage 17, the first storage-mechanism-depth item) → that header
+carrying a copy-on-write **build owner** so a template `from` a base stores its **rootfs as a diff**,
+assembled at boot (Stage 18, COW layered builds). Through Stage 10
 every step followed one discipline: **add a new backend/transport implementation, keep the
 protocol byte-stable, and keep the changes out of the client as much as possible** — proven
 each time by a byte-for-byte e2e oracle. **Stage 11 deliberately broke the byte-stable rule**
@@ -244,6 +246,6 @@ staged code lives on in the git history if you want to study the progression.
 | services/pkg/build + TemplateService | `template-manager` (in E2B's orchestrator) | async template builds, polled for status (Stage 10) |
 | services/pkg/store (Postgres; SQLite selectable) | the api's Postgres | durable sandbox + build metadata, team-scoped, + teams/api_keys (keys hashed) for auth (E2B uses Postgres + sqlc; Stage 14b / 16) |
 | services/pkg/catalog (Redis) | the `sandbox-catalog` (Redis) | sandbox → `{node, access-token}` routing the client-proxy reads (E2B uses Redis; Stage 14a / 16) |
-| services/pkg/storage (S3 via minio-go; Local dir = test double) | object storage (GCS/S3) | where template artifacts live, buildID-keyed + an `aliases/<name>` pointer (Stage 15); rootfs/snapfile materialized locally, memfile streamed page-by-page over UFFD. Stage 17: the memfile is stored **compacted** (non-zero blocks only) behind a per-block index (`pkg/storage/header`); the boot path serves zero/gap pages without a fetch. (E2B serves the rootfs lazily over NBD + compresses chunks too — deferred) |
+| services/pkg/storage (S3 via minio-go; Local dir = test double) | object storage (GCS/S3) | where template artifacts live, buildID-keyed + an `aliases/<name>` pointer (Stage 15); rootfs/snapfile materialized locally, memfile streamed page-by-page over UFFD. Stage 17: the memfile is stored **compacted** (non-zero blocks only) behind a per-block index (`pkg/storage/header`); the boot path serves zero/gap pages without a fetch. Stage 18: that header gained a COW **build owner**, so a layered template stores its **rootfs as a diff** over its base (`MaterializeLayered` assembles it at boot). (E2B serves the rootfs lazily over NBD — deferred; it does **not** compress — that myth was corrected in Stage 18) |
 | (firecracker config in services/pkg/fc) | Firecracker orchestration / jailer | microVM creation and isolation |
 | services/pkg/network | E2B's per-sandbox TAP/netns + DNAT | the per-sandbox network slot: TAP in its own netns, veth, DNAT (inbound only, no MASQUERADE) (Stage 12) |
