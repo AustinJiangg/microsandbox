@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 
 	"microsandbox/services/pkg/storage"
 )
@@ -51,16 +52,40 @@ func runCmd(name string, args ...string) (string, error) {
 }
 
 // Build builds template `name` from the given Dockerfile contents into its published
-// artifact dir, optionally including the warm snapshot. It is synchronous (the caller --
-// the orchestrator's TemplateService -- runs it in a goroutine). On a step's failure it
-// returns an error carrying that command's output tail, and later steps do not run.
-func (b *Builder) Build(buildID, name, dockerfile string, withSnapshot bool) error {
+// artifact dir, optionally including the warm snapshot. When base is non-empty the build is
+// LAYERED: its rootfs is pinned to the base's size and published as a copy-on-write diff over
+// it (Stage 18). It is synchronous (the caller -- the orchestrator's TemplateService -- runs it
+// in a goroutine). On a step's failure it returns an error carrying that command's output tail,
+// and later steps do not run.
+func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot bool) error {
 	dir, err := storage.LocalTemplateDir(b.localRoot, name)
 	if err != nil {
 		return err // rejects "default" / invalid names before running anything
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create template dir: %w", err)
+	}
+
+	// 0) A layered build (base set) diffs+pins against the base, so resolve the base build and its
+	//    exact size up front -- before the slow docker build -- and fail early if anything is off.
+	//    The size pin makes the child share the base's ext4 layout so the block diff stays small
+	//    (Decision 8 in docs/STAGE18_DESIGN.md).
+	var baseBuildID string
+	var sizePinMB int64
+	if base != "" {
+		if b.storage == nil {
+			return fmt.Errorf("layered build of %q over base %q needs object storage (s3 mode)", name, base)
+		}
+		ctx := context.Background()
+		baseBuildID, err = storage.ResolveAlias(ctx, b.storage, base)
+		if err != nil {
+			return fmt.Errorf("resolve base template %q: %w", base, err)
+		}
+		sz, err := storage.RootfsLogicalSize(ctx, b.storage, baseBuildID)
+		if err != nil {
+			return fmt.Errorf("size base rootfs %q: %w", baseBuildID, err)
+		}
+		sizePinMB = sz / (1 << 20) // the base is always built at an integer-MiB size by build-rootfs.sh
 	}
 
 	// 1) Write the recipe to a temp build context and docker build it. The context is the
@@ -80,9 +105,15 @@ func (b *Builder) Build(buildID, name, dockerfile string, withSnapshot bool) err
 		return fmt.Errorf("docker build: %w\n%s", err, tail(out))
 	}
 
-	// 2) Export the image to the template's rootfs (build-rootfs.sh injects the daemon).
+	// 2) Export the image to the template's rootfs (build-rootfs.sh injects the daemon). A layered
+	//    build pins the child to the base's size (extra args: <margin> <fixed_size_MB>); a non-layered
+	//    build keeps the bare two-arg call so build-rootfs.sh sizes it from content + its own margin.
 	rootfs := filepath.Join(dir, "rootfs.ext4")
-	if out, err := b.run(filepath.Join(b.scriptsDir, "build-rootfs.sh"), image, rootfs); err != nil {
+	rootfsArgs := []string{image, rootfs}
+	if base != "" {
+		rootfsArgs = append(rootfsArgs, "300", strconv.FormatInt(sizePinMB, 10))
+	}
+	if out, err := b.run(filepath.Join(b.scriptsDir, "build-rootfs.sh"), rootfsArgs...); err != nil {
 		return fmt.Errorf("build-rootfs: %w\n%s", err, tail(out))
 	}
 
@@ -101,7 +132,7 @@ func (b *Builder) Build(buildID, name, dockerfile string, withSnapshot bool) err
 	//    orchestrator boots from the local dir we just wrote, which in s3 mode doubles as the
 	//    materialize cache (a same-box boot is a cache hit). See docs/STAGE15_DESIGN.md.
 	if b.storage != nil {
-		if err := b.publish(buildID, name, dir, withSnapshot); err != nil {
+		if err := b.publish(buildID, name, dir, baseBuildID, withSnapshot); err != nil {
 			return err
 		}
 	}
@@ -112,26 +143,29 @@ func (b *Builder) Build(buildID, name, dockerfile string, withSnapshot bool) err
 // points aliases/<name> at this build. The local file names map to E2B's object names (the local
 // snapshot's "vmstate" is uploaded as "snapfile"). The alias is flipped only after every artifact is
 // up, so a resolver never sees a half-published build.
-func (b *Builder) publish(buildID, name, dir string, withSnapshot bool) error {
+//
+// The rootfs is stored differently depending on baseBuildID: a layered build (baseBuildID set) stores
+// only its copy-on-write diff over the base + a flattened {buildID}/rootfs.ext4.header (Stage 18); a
+// non-layered build uploads the whole rootfs (Stage 15). The snapshot/memfile stay single-build
+// regardless (memfile COW is Stage 19).
+func (b *Builder) publish(buildID, name, dir, baseBuildID string, withSnapshot bool) error {
 	ctx := context.Background()
-	uploads := []struct{ local, key string }{
-		{filepath.Join(dir, "rootfs.ext4"), storage.ArtifactKey(buildID, storage.RootfsName)},
+	rootfsLocal := filepath.Join(dir, "rootfs.ext4")
+	if baseBuildID != "" {
+		if err := storage.PublishRootfsDiff(ctx, b.storage, baseBuildID, rootfsLocal, buildID); err != nil {
+			return fmt.Errorf("publish rootfs diff over %s: %w", baseBuildID, err)
+		}
+	} else if err := uploadFile(ctx, b.storage, rootfsLocal, storage.ArtifactKey(buildID, storage.RootfsName)); err != nil {
+		return fmt.Errorf("upload %s: %w", storage.ArtifactKey(buildID, storage.RootfsName), err)
 	}
 	if withSnapshot {
 		snap := filepath.Join(dir, "snapshot")
-		uploads = append(uploads,
-			struct{ local, key string }{filepath.Join(snap, "vmstate"), storage.ArtifactKey(buildID, storage.SnapfileName)},
-		)
-	}
-	for _, u := range uploads {
-		if err := uploadFile(ctx, b.storage, u.local, u.key); err != nil {
-			return fmt.Errorf("upload %s: %w", u.key, err)
+		if err := uploadFile(ctx, b.storage, filepath.Join(snap, "vmstate"), storage.ArtifactKey(buildID, storage.SnapfileName)); err != nil {
+			return fmt.Errorf("upload %s: %w", storage.ArtifactKey(buildID, storage.SnapfileName), err)
 		}
-	}
-	// The memfile is compacted + indexed, not uploaded raw (Stage 17): PublishMemfile uploads
-	// {buildID}/memfile (present blocks only) and {buildID}/memfile.header. See docs/STAGE17_DESIGN.md.
-	if withSnapshot {
-		if err := storage.PublishMemfile(ctx, b.storage, filepath.Join(dir, "snapshot", "memfile"), buildID); err != nil {
+		// The memfile is compacted + indexed, not uploaded raw (Stage 17): PublishMemfile uploads
+		// {buildID}/memfile (present blocks only) and {buildID}/memfile.header. See docs/STAGE17_DESIGN.md.
+		if err := storage.PublishMemfile(ctx, b.storage, filepath.Join(snap, "memfile"), buildID); err != nil {
 			return err
 		}
 	}

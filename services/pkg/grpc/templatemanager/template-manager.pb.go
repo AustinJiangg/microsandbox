@@ -86,6 +86,7 @@ type TemplateCreateRequest struct {
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`                                      // template name (validated; "default" is rejected -- it is the stock image)
 	Dockerfile    string                 `protobuf:"bytes,2,opt,name=dockerfile,proto3" json:"dockerfile,omitempty"`                          // the recipe contents (FROM microsandbox-agent + RUN ...)
 	WithSnapshot  bool                   `protobuf:"varint,3,opt,name=with_snapshot,json=withSnapshot,proto3" json:"with_snapshot,omitempty"` // also build the warm snapshot (for from_snapshot starts)
+	Base          string                 `protobuf:"bytes,4,opt,name=base,proto3" json:"base,omitempty"`                                      // Stage 18 (COW): build this rootfs as a diff over base template's; empty = a flat build
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -139,6 +140,13 @@ func (x *TemplateCreateRequest) GetWithSnapshot() bool {
 		return x.WithSnapshot
 	}
 	return false
+}
+
+func (x *TemplateCreateRequest) GetBase() string {
+	if x != nil {
+		return x.Base
+	}
+	return ""
 }
 
 type TemplateCreateResponse struct {
@@ -285,13 +293,14 @@ var File_templatemanager_template_manager_proto protoreflect.FileDescriptor
 
 const file_templatemanager_template_manager_proto_rawDesc = "" +
 	"\n" +
-	"&templatemanager/template-manager.proto\x12\x0ftemplatemanager\"p\n" +
+	"&templatemanager/template-manager.proto\x12\x0ftemplatemanager\"\x84\x01\n" +
 	"\x15TemplateCreateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1e\n" +
 	"\n" +
 	"dockerfile\x18\x02 \x01(\tR\n" +
 	"dockerfile\x12#\n" +
-	"\rwith_snapshot\x18\x03 \x01(\bR\fwithSnapshot\"3\n" +
+	"\rwith_snapshot\x18\x03 \x01(\bR\fwithSnapshot\x12\x12\n" +
+	"\x04base\x18\x04 \x01(\tR\x04base\"3\n" +
 	"\x16TemplateCreateResponse\x12\x19\n" +
 	"\bbuild_id\x18\x01 \x01(\tR\abuildId\"7\n" +
 	"\x1aTemplateBuildStatusRequest\x12\x19\n" +

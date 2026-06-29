@@ -20,6 +20,30 @@ func OpenRootfsHeader(ctx context.Context, sp StorageProvider, buildID string) (
 	return openHeader(ctx, sp, ArtifactKey(buildID, RootfsHeaderName))
 }
 
+// RootfsLogicalSize returns buildID's full (logical) rootfs size in bytes without downloading the whole
+// object: a layered build's size is its header's Metadata.Size; a non-layered build's is the size of its
+// whole rootfs object, obtained by seeking to the end (an fstat for Local, a HEAD/Stat for S3's
+// *minio.Object) rather than reading it. The build pipeline uses it to pin a layered child to the base's
+// exact size so the block diff stays small (Decision 8 in docs/STAGE18_DESIGN.md).
+func RootfsLogicalSize(ctx context.Context, sp StorageProvider, buildID string) (int64, error) {
+	h, err := OpenRootfsHeader(ctx, sp, buildID)
+	if err != nil {
+		return 0, err
+	}
+	if h != nil {
+		return int64(h.Metadata.Size), nil
+	}
+	rc, err := sp.Open(ctx, ArtifactKey(buildID, RootfsName))
+	if err != nil {
+		return 0, fmt.Errorf("open rootfs of %q for sizing: %w", buildID, err)
+	}
+	defer rc.Close()
+	if s, ok := rc.(io.Seeker); ok {
+		return s.Seek(0, io.SeekEnd) // os.File / *minio.Object both stat rather than read the object
+	}
+	return io.Copy(io.Discard, rc) // fallback: a reader with no Seeker -- count the bytes
+}
+
 // PublishRootfsDiff stores childRootfsPath as a copy-on-write diff over the base build's rootfs: it
 // uploads {childBuildID}/rootfs.ext4 holding only the child's changed (non-zero) blocks and
 // {childBuildID}/rootfs.ext4.header carrying the flattened mapping that points unchanged ranges at the

@@ -7,11 +7,13 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "microsandbox/services/pkg/grpc/templatemanager"
 )
@@ -22,10 +24,17 @@ import (
 type fakeBuilder struct {
 	validateErr error
 	buildErr    error
+
+	mu       sync.Mutex
+	gotBase  string // the base passed to the last Build (asserts the layered field is plumbed through)
+	gotBuilt bool
 }
 
 func (f *fakeBuilder) ValidateName(name string) error { return f.validateErr }
-func (f *fakeBuilder) Build(buildID, name, dockerfile string, withSnapshot bool) error {
+func (f *fakeBuilder) Build(buildID, name, dockerfile, base string, withSnapshot bool) error {
+	f.mu.Lock()
+	f.gotBase, f.gotBuilt = base, true
+	f.mu.Unlock()
 	return f.buildErr
 }
 
@@ -56,6 +65,40 @@ func TestTemplateCreateSuccess(t *testing.T) {
 		t.Fatal("TemplateCreate returned an empty build id")
 	}
 	waitState(t, ts, resp.GetBuildId(), pb.TemplateBuildStatusResponse_SUCCESS)
+}
+
+// TestTemplateCreatePlumbsBase asserts a layered request's `base` reaches the builder unchanged --
+// the orchestrator-side half of the Stage 18 API (the api fills `from` in 18d).
+func TestTemplateCreatePlumbsBase(t *testing.T) {
+	fb := &fakeBuilder{}
+	ts := newTemplateService(fb)
+	resp, err := ts.TemplateCreate(context.Background(), &pb.TemplateCreateRequest{Name: "derived", Dockerfile: "FROM x", Base: "default"})
+	if err != nil {
+		t.Fatalf("TemplateCreate: %v", err)
+	}
+	waitState(t, ts, resp.GetBuildId(), pb.TemplateBuildStatusResponse_SUCCESS)
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if !fb.gotBuilt || fb.gotBase != "default" {
+		t.Fatalf("builder got base=%q built=%v, want base=default built=true", fb.gotBase, fb.gotBuilt)
+	}
+}
+
+// TestTemplateCreateRequestBaseWire round-trips the hand-edited descriptor over the wire: the new
+// `base` field (number 4) must serialize and deserialize, since the api->orchestrator call is real gRPC.
+func TestTemplateCreateRequestBaseWire(t *testing.T) {
+	in := &pb.TemplateCreateRequest{Name: "derived", Dockerfile: "FROM x", WithSnapshot: true, Base: "default"}
+	b, err := proto.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var out pb.TemplateCreateRequest
+	if err := proto.Unmarshal(b, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.GetBase() != "default" || out.GetName() != "derived" || !out.GetWithSnapshot() {
+		t.Fatalf("round-trip lost fields: %+v", &out)
+	}
 }
 
 func TestTemplateCreateBuildFails(t *testing.T) {

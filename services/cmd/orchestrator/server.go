@@ -248,7 +248,10 @@ func (s *server) prepareRestore(tmpl template.Template) (uffd.PageSource, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := storage.Materialize(ctx, s.storage, storage.ArtifactKey(buildID, storage.RootfsName), tmpl.Rootfs); err != nil {
+	// MaterializeLayered assembles a layered (COW) rootfs from each run's owning build (Stage 18) or,
+	// when the build carries no rootfs header, downloads it whole -- so it is a safe drop-in for the
+	// non-layered default and old buckets too.
+	if err := storage.MaterializeLayered(ctx, s.storage, buildID, tmpl.Rootfs); err != nil {
 		return nil, err
 	}
 	vmstate := filepath.Join(tmpl.SnapshotDir, "vmstate")
@@ -293,7 +296,7 @@ func (s *server) prepareSpawn(tmpl template.Template) error {
 	if err != nil {
 		return err
 	}
-	return storage.Materialize(ctx, s.storage, storage.ArtifactKey(buildID, storage.RootfsName), tmpl.Rootfs)
+	return storage.MaterializeLayered(ctx, s.storage, buildID, tmpl.Rootfs) // layered (COW) or whole, per the build's header
 }
 
 // destroyAll terminates every running VM -- the warm pools' idle VMs first, then the

@@ -5,6 +5,7 @@ package build
 // artifact paths -- without docker, firecracker, or KVM.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"microsandbox/services/pkg/storage"
+	"microsandbox/services/pkg/storage/header"
 )
 
 // recorder is an injectable exec that records calls instead of running them. If fail is set,
@@ -46,7 +48,7 @@ func newTestBuilder(t *testing.T, rec *recorder) (*Builder, string) {
 func TestBuildWithSnapshot(t *testing.T) {
 	rec := &recorder{}
 	b, root := newTestBuilder(t, rec)
-	if err := b.Build("bld_1", "demo", "FROM microsandbox-agent\nRUN true", true); err != nil {
+	if err := b.Build("bld_1", "demo", "FROM microsandbox-agent\nRUN true", "", true); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 	dir := filepath.Join(root, "templates", "demo")
@@ -70,7 +72,7 @@ func TestBuildWithSnapshot(t *testing.T) {
 func TestBuildNoSnapshot(t *testing.T) {
 	rec := &recorder{}
 	b, _ := newTestBuilder(t, rec)
-	if err := b.Build("bld_2", "demo", "FROM x", false); err != nil {
+	if err := b.Build("bld_2", "demo", "FROM x", "", false); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 	if len(rec.calls) != 2 {
@@ -84,7 +86,7 @@ func TestBuildNoSnapshot(t *testing.T) {
 func TestBuildRejectsDefault(t *testing.T) {
 	rec := &recorder{}
 	b, _ := newTestBuilder(t, rec)
-	if err := b.Build("bld_3", "default", "FROM x", true); err == nil {
+	if err := b.Build("bld_3", "default", "FROM x", "", true); err == nil {
 		t.Fatal("Build(\"default\") should error (the stock image is not API-buildable)")
 	}
 	if len(rec.calls) != 0 {
@@ -95,7 +97,7 @@ func TestBuildRejectsDefault(t *testing.T) {
 func TestBuildStopsOnFailure(t *testing.T) {
 	rec := &recorder{fail: "build-rootfs"}
 	b, _ := newTestBuilder(t, rec)
-	if err := b.Build("bld_4", "demo", "FROM x", true); err == nil {
+	if err := b.Build("bld_4", "demo", "FROM x", "", true); err == nil {
 		t.Fatal("Build should fail when build-rootfs.sh fails")
 	}
 	// docker build + build-rootfs ran; build-snapshot did not (the failure stopped it).
@@ -123,7 +125,7 @@ func TestBuildPublishesToBucket(t *testing.T) {
 		return "", nil
 	}
 	b := &Builder{storage: bucket, localRoot: t.TempDir(), scriptsDir: "/repo/scripts", run: run}
-	if err := b.Build("bld_pub", "demo", "FROM x", true); err != nil {
+	if err := b.Build("bld_pub", "demo", "FROM x", "", true); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
@@ -139,6 +141,57 @@ func TestBuildPublishesToBucket(t *testing.T) {
 	}
 	if got, err := storage.ResolveAlias(ctx, bucket, "demo"); err != nil || got != "bld_pub" {
 		t.Errorf("ResolveAlias(demo) = %q, %v; want bld_pub", got, err)
+	}
+}
+
+// TestBuildLayeredSizePin covers the Stage 18 layered path: a build with a `base` resolves the base,
+// pins the child rootfs to the base's exact size (the build-rootfs.sh size arg), and publishes the
+// rootfs as a v2 COW diff over the base rather than a whole upload. Hermetic: a Local dir-as-bucket
+// seeded with a non-layered base, a fake exec that writes a base-sized child rootfs.
+func TestBuildLayeredSizePin(t *testing.T) {
+	ctx := context.Background()
+	const mib = 1 << 20
+	bucket := storage.NewLocal(t.TempDir())
+	// A non-layered base of exactly 2 MiB (like the seeded default: whole object, no header) -> pin "2".
+	base := bytes.Repeat([]byte{1}, 2*mib)
+	if err := bucket.Upload(ctx, storage.ArtifactKey("bld_base", storage.RootfsName), bytes.NewReader(base), int64(len(base))); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetAlias(ctx, bucket, "base", "bld_base"); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls [][]string
+	run := func(name string, args ...string) (string, error) {
+		calls = append(calls, append([]string{name}, args...))
+		if strings.Contains(name, "build-rootfs") { // build-rootfs.sh <image> <out> <margin> <fixed_size_MB>
+			_ = os.WriteFile(args[1], make([]byte, 2*mib), 0o644) // the child rootfs, at the pinned size
+		}
+		return "", nil
+	}
+	b := &Builder{storage: bucket, localRoot: t.TempDir(), scriptsDir: "/repo/scripts", run: run}
+	if err := b.Build("bld_d", "derived", "FROM base", "base", false); err != nil {
+		t.Fatalf("layered Build: %v", err)
+	}
+
+	// build-rootfs.sh was pinned to the base's size: <image> <out> <margin> "2".
+	var rootfsCall []string
+	for _, c := range calls {
+		if strings.Contains(c[0], "build-rootfs") {
+			rootfsCall = c
+		}
+	}
+	if len(rootfsCall) != 5 || rootfsCall[4] != "2" {
+		t.Fatalf("build-rootfs call = %v, want a 5-arg call ending in the size pin \"2\"", rootfsCall)
+	}
+
+	// The rootfs was published as a v2 COW diff over the base (a header present), not a whole upload.
+	h, err := storage.OpenRootfsHeader(ctx, bucket, "bld_d")
+	if err != nil || h == nil {
+		t.Fatalf("OpenRootfsHeader(bld_d): err=%v nil=%v", err, h == nil)
+	}
+	if h.Metadata.Version != header.VersionLayered || h.Metadata.BaseBuildId != "bld_base" || h.Metadata.Generation != 1 {
+		t.Fatalf("layered metadata = %+v, want v%d base=bld_base gen=1", h.Metadata, header.VersionLayered)
 	}
 }
 

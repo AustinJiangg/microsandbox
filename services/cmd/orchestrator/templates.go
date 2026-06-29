@@ -16,7 +16,7 @@ import (
 // the async state machine here can be unit-tested with a fake build outcome (no docker/KVM).
 type builder interface {
 	ValidateName(name string) error
-	Build(buildID, name, dockerfile string, withSnapshot bool) error
+	Build(buildID, name, dockerfile, base string, withSnapshot bool) error
 }
 
 // templateService implements the gRPC TemplateService: it kicks asynchronous template builds
@@ -59,7 +59,7 @@ func (t *templateService) TemplateCreate(ctx context.Context, req *pb.TemplateCr
 	id := newBuildID()
 	t.set(id, pb.TemplateBuildStatusResponse_BUILDING, "")
 	go func() {
-		if err := t.builder.Build(id, req.GetName(), req.GetDockerfile(), req.GetWithSnapshot()); err != nil {
+		if err := t.builder.Build(id, req.GetName(), req.GetDockerfile(), req.GetBase(), req.GetWithSnapshot()); err != nil {
 			t.set(id, pb.TemplateBuildStatusResponse_FAILED, err.Error())
 			return
 		}

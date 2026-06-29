@@ -30,6 +30,7 @@ message TemplateCreateRequest {
   string name = 1;          // template name (validated; "default" is rejected -- it is the stock image)
   string dockerfile = 2;    // the recipe contents (FROM microsandbox-agent + RUN ...)
   bool with_snapshot = 3;   // also build the warm snapshot (for from_snapshot starts)
+  string base = 4;          // Stage 18 (COW): build this rootfs as a diff over base template's; empty = a flat (non-layered) build
 }
 message TemplateCreateResponse { string build_id = 1; } // "bld_..."; poll status with it
 

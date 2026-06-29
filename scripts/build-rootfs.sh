@@ -12,13 +12,18 @@
 # keeps the whole pipeline unprivileged (files in the image are owned by the build user, but the daemon inside the guest runs as root,
 # and root can read everything, so it is fine).
 #
-# Usage: scripts/build-rootfs.sh [image] [output_path] [extra_margin_MB]
+# Usage: scripts/build-rootfs.sh [image] [output_path] [extra_margin_MB] [fixed_size_MB]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${1:-microsandbox-agent:latest}"
 OUT="${2:-$REPO_ROOT/vendor/rootfs.ext4}"
 MARGIN_MB="${3:-300}"   # writable margin reserved on top of the actual size of the exported content
+# Stage 18 (COW): pin the image to an exact size in MB instead of sizing it from content + margin.
+# A layered child built at the *base's* exact size shares the base's ext4 block-group layout, so a
+# block diff of the two images is tiny (Decision 8 in docs/STAGE18_DESIGN.md); resizing reshuffles the
+# layout and inflates the diff. Empty (the default) = the legacy content + margin sizing.
+FIXED_SIZE_MB="${4:-}"
 
 command -v mkfs.ext4 >/dev/null || { echo "missing mkfs.ext4 (apt install e2fsprogs)" >&2; exit 1; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || {
@@ -73,7 +78,19 @@ exec /usr/local/bin/microsandbox-daemon
 INIT
 chmod +x "$STAGING/init"
 
-size_mb=$(( $(du -sm "$STAGING" | cut -f1) + MARGIN_MB ))
+content_mb=$(du -sm "$STAGING" | cut -f1)
+if [ -n "$FIXED_SIZE_MB" ]; then
+  # A layered build pins the child to the base's exact size; if the child's content no longer fits, fail
+  # loudly here (the user must rebuild the base with more margin) rather than letting mkfs produce a
+  # differently-sized image whose block diff would be large.
+  if [ "$content_mb" -ge "$FIXED_SIZE_MB" ]; then
+    echo "[build-rootfs] child content ${content_mb}MB exceeds the base-pinned size ${FIXED_SIZE_MB}MB; rebuild the base with more margin" >&2
+    exit 1
+  fi
+  size_mb="$FIXED_SIZE_MB"
+else
+  size_mb=$(( content_mb + MARGIN_MB ))
+fi
 echo "[build-rootfs] packing ext4 (mkfs.ext4 -d, no mount / without root), size ${size_mb}MB ..."
 rm -f "$OUT"
 mkdir -p "$(dirname "$OUT")"
