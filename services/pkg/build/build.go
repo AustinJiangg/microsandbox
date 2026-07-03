@@ -13,7 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"strings"
 
 	"microsandbox/services/pkg/storage"
 )
@@ -53,10 +53,10 @@ func runCmd(name string, args ...string) (string, error) {
 
 // Build builds template `name` from the given Dockerfile contents into its published
 // artifact dir, optionally including the warm snapshot. When base is non-empty the build is
-// LAYERED: its rootfs is pinned to the base's size and published as a copy-on-write diff over
-// it (Stage 18). It is synchronous (the caller -- the orchestrator's TemplateService -- runs it
-// in a goroutine). On a step's failure it returns an error carrying that command's output tail,
-// and later steps do not run.
+// LAYERED: its rootfs is produced by mutating a copy of the base's rootfs in place and published
+// as a copy-on-write diff over it (Stage 19). It is synchronous (the caller -- the orchestrator's
+// TemplateService -- runs it in a goroutine). On a step's failure it returns an error carrying
+// that command's output tail, and later steps do not run.
 func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot bool) error {
 	dir, err := storage.LocalTemplateDir(b.localRoot, name)
 	if err != nil {
@@ -66,26 +66,26 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 		return fmt.Errorf("create template dir: %w", err)
 	}
 
-	// 0) A layered build (base set) diffs+pins against the base, so resolve the base build and its
-	//    exact size up front -- before the slow docker build -- and fail early if anything is off.
-	//    The size pin makes the child share the base's ext4 layout so the block diff stays small
-	//    (Decision 8 in docs/STAGE18_DESIGN.md).
-	var baseBuildID string
-	var sizePinMB int64
+	// 0) A layered build (base set) publishes its rootfs as a COW diff over the base and produces that
+	//    rootfs by mutating a COPY of the base's rootfs in place (Stage 19) -- not by re-mkfs, so there
+	//    is no size-pin (the copy is byte-for-byte the base's size). Resolve the base build and the
+	//    child's FROM image up front -- before the slow docker build -- and fail early if either is off.
+	var baseBuildID, fromImage string
 	if base != "" {
 		if b.storage == nil {
 			return fmt.Errorf("layered build of %q over base %q needs object storage (s3 mode)", name, base)
 		}
-		ctx := context.Background()
-		baseBuildID, err = storage.ResolveAlias(ctx, b.storage, base)
+		baseBuildID, err = storage.ResolveAlias(context.Background(), b.storage, base)
 		if err != nil {
 			return fmt.Errorf("resolve base template %q: %w", base, err)
 		}
-		sz, err := storage.RootfsLogicalSize(ctx, b.storage, baseBuildID)
+		// The layout-preserving builder diffs the child image against the image it was built FROM, so the
+		// child recipe must FROM the base template's image (Decision 3 in docs/STAGE19_DESIGN.md). Parse
+		// the recipe's first FROM to pass that image to build-rootfs-layered.sh.
+		fromImage, err = firstFromImage(dockerfile)
 		if err != nil {
-			return fmt.Errorf("size base rootfs %q: %w", baseBuildID, err)
+			return fmt.Errorf("layered build of %q: %w", name, err)
 		}
-		sizePinMB = sz / (1 << 20) // the base is always built at an integer-MiB size by build-rootfs.sh
 	}
 
 	// 1) Write the recipe to a temp build context and docker build it. The context is the
@@ -105,16 +105,34 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 		return fmt.Errorf("docker build: %w\n%s", err, tail(out))
 	}
 
-	// 2) Export the image to the template's rootfs (build-rootfs.sh injects the daemon). A layered
-	//    build pins the child to the base's size (extra args: <margin> <fixed_size_MB>); a non-layered
-	//    build keeps the bare two-arg call so build-rootfs.sh sizes it from content + its own margin.
+	// 2) Produce the template's rootfs. A non-layered build exports the image afresh (build-rootfs.sh
+	//    injects the daemon + sizes from content). A LAYERED build (Stage 19) instead materializes the
+	//    base's rootfs and produces the child as a layout-preserving in-place edit of a COPY of it
+	//    (build-rootfs-layered.sh: cp base -> debugfs-apply the child's file delta), so every unchanged
+	//    file keeps its exact blocks and the published diff (step 4) is ~the genuine delta rather than
+	//    ~half the disk -- the Stage-18 re-mkfs reshuffled the ext4 layout (see docs/STAGE19_DESIGN.md).
 	rootfs := filepath.Join(dir, "rootfs.ext4")
-	rootfsArgs := []string{image, rootfs}
-	if base != "" {
-		rootfsArgs = append(rootfsArgs, "300", strconv.FormatInt(sizePinMB, 10))
-	}
-	if out, err := b.run(filepath.Join(b.scriptsDir, "build-rootfs.sh"), rootfsArgs...); err != nil {
-		return fmt.Errorf("build-rootfs: %w\n%s", err, tail(out))
+	if base == "" {
+		if out, err := b.run(filepath.Join(b.scriptsDir, "build-rootfs.sh"), image, rootfs); err != nil {
+			return fmt.Errorf("build-rootfs: %w\n%s", err, tail(out))
+		}
+	} else {
+		baseDir, err := os.MkdirTemp("", "msb-layered-base-"+buildID+"-")
+		if err != nil {
+			return fmt.Errorf("create base rootfs dir: %w", err)
+		}
+		defer os.RemoveAll(baseDir)
+		// Materialize the base's full rootfs (assembling it if the base is itself layered) for the layered
+		// builder to copy. PublishRootfsDiff (step 4) materializes it again to diff against; the two copies
+		// are byte-identical (deterministic assembly), which is exactly what makes the diff come out as the
+		// genuine delta. The extra materialize is a build-time cost, not a hot path.
+		baseRootfs := filepath.Join(baseDir, "rootfs.ext4")
+		if err := storage.MaterializeLayered(context.Background(), b.storage, baseBuildID, baseRootfs); err != nil {
+			return fmt.Errorf("materialize base rootfs %q: %w", baseBuildID, err)
+		}
+		if out, err := b.run(filepath.Join(b.scriptsDir, "build-rootfs-layered.sh"), image, fromImage, baseRootfs, rootfs); err != nil {
+			return fmt.Errorf("build-rootfs-layered: %w\n%s", err, tail(out))
+		}
 	}
 
 	// 3) Optionally build the warm snapshot in place. It must be built at the rootfs's final
@@ -147,7 +165,7 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 // The rootfs is stored differently depending on baseBuildID: a layered build (baseBuildID set) stores
 // only its copy-on-write diff over the base + a flattened {buildID}/rootfs.ext4.header (Stage 18); a
 // non-layered build uploads the whole rootfs (Stage 15). The snapshot/memfile stay single-build
-// regardless (memfile COW is Stage 19).
+// regardless (memfile COW is Stage 20).
 func (b *Builder) publish(buildID, name, dir, baseBuildID string, withSnapshot bool) error {
 	ctx := context.Background()
 	rootfsLocal := filepath.Join(dir, "rootfs.ext4")
@@ -187,6 +205,33 @@ func uploadFile(ctx context.Context, sp storage.StorageProvider, localPath, key 
 		return err
 	}
 	return sp.Upload(ctx, key, f, fi.Size())
+}
+
+// firstFromImage returns the image named by the recipe's first FROM instruction -- the image the
+// layout-preserving layered builder diffs the child against, which must be the base template's image
+// (Decision 3 in docs/STAGE19_DESIGN.md). It skips blank/comment lines and any leading ARG, is
+// case-insensitive on FROM, and ignores --flag=... options and a trailing "AS <stage>". A recipe with
+// no FROM is an error (a layered build has nowhere to diff from). This assumes a single-stage recipe,
+// which Decision 3 already constrains.
+func firstFromImage(dockerfile string) (string, error) {
+	for _, line := range strings.Split(dockerfile, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if !strings.EqualFold(fields[0], "FROM") {
+			continue // e.g. a leading ARG before the first FROM
+		}
+		for _, tok := range fields[1:] {
+			if strings.HasPrefix(tok, "--") {
+				continue // --platform=... and friends
+			}
+			return tok, nil // the image reference (the token before any "AS <stage>")
+		}
+		return "", fmt.Errorf("FROM with no image: %q", line)
+	}
+	return "", fmt.Errorf("recipe has no FROM instruction")
 }
 
 // tail returns the trailing portion of s -- the useful end of a long build log.

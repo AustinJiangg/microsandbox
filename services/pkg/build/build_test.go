@@ -144,15 +144,16 @@ func TestBuildPublishesToBucket(t *testing.T) {
 	}
 }
 
-// TestBuildLayeredSizePin covers the Stage 18 layered path: a build with a `base` resolves the base,
-// pins the child rootfs to the base's exact size (the build-rootfs.sh size arg), and publishes the
-// rootfs as a v2 COW diff over the base rather than a whole upload. Hermetic: a Local dir-as-bucket
-// seeded with a non-layered base, a fake exec that writes a base-sized child rootfs.
-func TestBuildLayeredSizePin(t *testing.T) {
+// TestBuildLayeredInPlace covers the Stage 19 layered path: a build with a `base` resolves + materializes
+// the base, produces the child rootfs via the layout-preserving in-place builder (build-rootfs-layered.sh,
+// NOT the re-mkfs build-rootfs.sh + size-pin), and publishes the rootfs as a v2 COW diff over the base
+// rather than a whole upload. Hermetic: a Local dir-as-bucket seeded with a non-layered base (which
+// MaterializeLayered downloads whole), a fake exec that writes the child rootfs at the output path.
+func TestBuildLayeredInPlace(t *testing.T) {
 	ctx := context.Background()
 	const mib = 1 << 20
 	bucket := storage.NewLocal(t.TempDir())
-	// A non-layered base of exactly 2 MiB (like the seeded default: whole object, no header) -> pin "2".
+	// A non-layered base of 2 MiB (like the seeded default: whole object, no header).
 	base := bytes.Repeat([]byte{1}, 2*mib)
 	if err := bucket.Upload(ctx, storage.ArtifactKey("bld_base", storage.RootfsName), bytes.NewReader(base), int64(len(base))); err != nil {
 		t.Fatal(err)
@@ -164,25 +165,31 @@ func TestBuildLayeredSizePin(t *testing.T) {
 	var calls [][]string
 	run := func(name string, args ...string) (string, error) {
 		calls = append(calls, append([]string{name}, args...))
-		if strings.Contains(name, "build-rootfs") { // build-rootfs.sh <image> <out> <margin> <fixed_size_MB>
-			_ = os.WriteFile(args[1], make([]byte, 2*mib), 0o644) // the child rootfs, at the pinned size
+		if strings.Contains(name, "build-rootfs-layered") { // <child_img> <from_img> <base_rootfs> <out>
+			_ = os.WriteFile(args[3], make([]byte, 2*mib), 0o644) // the child rootfs at the output path
 		}
 		return "", nil
 	}
 	b := &Builder{storage: bucket, localRoot: t.TempDir(), scriptsDir: "/repo/scripts", run: run}
-	if err := b.Build("bld_d", "derived", "FROM base", "base", false); err != nil {
+	if err := b.Build("bld_d", "derived", "FROM base\nRUN true", "base", false); err != nil {
 		t.Fatalf("layered Build: %v", err)
 	}
 
-	// build-rootfs.sh was pinned to the base's size: <image> <out> <margin> "2".
-	var rootfsCall []string
+	// The layered path ran build-rootfs-layered.sh -- NOT the re-mkfs build-rootfs.sh -- with the child
+	// image, the FROM image parsed from the recipe, the materialized base, and the output path (no size-pin).
+	var layeredCall []string
 	for _, c := range calls {
-		if strings.Contains(c[0], "build-rootfs") {
-			rootfsCall = c
+		if strings.Contains(c[0], "build-rootfs-layered") {
+			layeredCall = c
+		} else if strings.HasSuffix(c[0], "build-rootfs.sh") {
+			t.Errorf("layered build must not run the re-mkfs build-rootfs.sh: %v", c)
 		}
 	}
-	if len(rootfsCall) != 5 || rootfsCall[4] != "2" {
-		t.Fatalf("build-rootfs call = %v, want a 5-arg call ending in the size pin \"2\"", rootfsCall)
+	if len(layeredCall) != 5 {
+		t.Fatalf("build-rootfs-layered call = %v, want [script child from base out]", layeredCall)
+	}
+	if layeredCall[1] != "microsandbox-tmpl-derived" || layeredCall[2] != "base" {
+		t.Errorf("layered child/from = %q/%q, want microsandbox-tmpl-derived/base", layeredCall[1], layeredCall[2])
 	}
 
 	// The rootfs was published as a v2 COW diff over the base (a header present), not a whole upload.
@@ -192,6 +199,31 @@ func TestBuildLayeredSizePin(t *testing.T) {
 	}
 	if h.Metadata.Version != header.VersionLayered || h.Metadata.BaseBuildId != "bld_base" || h.Metadata.Generation != 1 {
 		t.Fatalf("layered metadata = %+v, want v%d base=bld_base gen=1", h.Metadata, header.VersionLayered)
+	}
+}
+
+// TestFirstFromImage covers the recipe FROM parser that wires the layered builder's diff base
+// (Decision 3): case-insensitive FROM, skipped comments/leading ARG, ignored --flags and "AS <stage>",
+// and an error when a recipe has no FROM (a layered build would have nowhere to diff from).
+func TestFirstFromImage(t *testing.T) {
+	ok := []struct{ recipe, want string }{
+		{"FROM base", "base"},
+		{"FROM microsandbox-agent\nRUN true", "microsandbox-agent"},
+		{"# a comment\nFROM x:1.2 AS build\nRUN y", "x:1.2"},
+		{"FROM --platform=linux/amd64 img", "img"},
+		{"ARG V=1\nFROM base:latest", "base:latest"}, // a leading ARG before the first FROM is skipped
+		{"from lowercase-ok", "lowercase-ok"},        // FROM is case-insensitive
+	}
+	for _, c := range ok {
+		got, err := firstFromImage(c.recipe)
+		if err != nil || got != c.want {
+			t.Errorf("firstFromImage(%q) = %q, %v; want %q", c.recipe, got, err, c.want)
+		}
+	}
+	for _, recipe := range []string{"", "RUN true\n# no FROM here"} {
+		if _, err := firstFromImage(recipe); err == nil {
+			t.Errorf("firstFromImage(%q) = nil error; want an error (no FROM)", recipe)
+		}
 	}
 }
 
