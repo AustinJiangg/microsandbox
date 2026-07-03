@@ -56,20 +56,27 @@ needs metadata fidelity debugfs can't express.
 
 ## 3. Where the delta comes from
 
-The child's filesystem delta over its base is exactly what its Docker `RUN` layers changed. `docker diff` of a
-container created from the child image emits it as `A <path>` (added), `C <path>` (changed), `D <path>` (deleted),
-relative to the image's `FROM` base. Mapping to a `debugfs` command file:
+The child's filesystem delta over its base is exactly what its Docker `RUN` layers changed. **Implementation note
+(corrected during 19a):** `docker diff` is the *wrong* tool — it reports a running container's writable-layer
+changes, not the image's build-time layers (a freshly `docker create`d container shows nothing). The delta is
+instead computed by **`docker export`-ing both the child image and its `FROM` image to trees and diffing them with
+`rsync -rlcni --delete CHILD/ FROM/`** (content checksum, symlinks included via `-l`). rsync's itemized output
+maps to a `debugfs` command file (applied in one `debugfs -w -f` pass):
 
-- `A`/`C` regular file → `rm <path>` (if `C`) then `write <staging><path> <path>`; `sif` mode/uid/gid from the staged file's stat.
-- `A` directory → `mkdir <path>` (+ `sif` mode).
-- `A`/`C` symlink → `symlink <target> <path>`.
-- `D` → `rm <path>` (or `rmdir`).
+- regular file, new/changed (`>f`/`cf`) → `rm <path>` if it already exists in FROM, then `write <child-tree><path> <path>` (`debugfs write` preserves the source mode).
+- new directory (`cd`) → `mkdir <path>` (rsync lists parents before children, so ordering is correct).
+- symlink (`cL`, itemized as `linkpath -> target`) → `symlink <linkpath> <target>` (`rm` first if it existed).
+- deletion (`*deleting <path>`) → `rm` (file) / `rmdir` (trailing-slash dir).
+
+Because neither docker tree contains the injected daemon/`init` (build-rootfs.sh adds those, not the Dockerfile),
+they never appear in the delta and the base copy keeps them untouched — no exclusion needed.
 
 **Constraint (Decision 3):** the delta is meaningful only if the child image's `FROM` is the **base template's
-image**, so `docker diff`'s "changes vs `FROM`" equals "changes vs the base rootfs". For `base="default"` the
-recipe is `FROM microsandbox-agent` (default's own source), which holds. We **document and validate** this
-coupling rather than auto-rewrite the recipe's `FROM` (a later refinement); a mismatch is still *correct* (it just
-falls back to a larger diff — the Stage-18 mechanism tolerates any delta) but loses the size win.
+image**, so "changes vs `FROM`" equals "changes vs the base rootfs". For `base="default"` the recipe is
+`FROM microsandbox-agent` (default's own source), which holds. We **document and validate** this coupling rather
+than auto-rewrite the recipe's `FROM` (a later refinement); a mismatch is still *correct* (it just falls back to a
+larger diff — the Stage-18 mechanism tolerates any delta) but loses the size win. `pkg/build` parses the recipe's
+first `FROM` to pass the from-image to the builder (19b).
 
 ## 4. Target architecture (what moves)
 
@@ -77,8 +84,8 @@ falls back to a larger diff — the Stage-18 mechanism tolerates any delta) but 
   Stage 18 (today) — layered child:                Stage 19 — layout-preserving layered child:
     docker build (FROM base-img + RUN)               docker build (FROM base-img + RUN)
     build-rootfs.sh, size-pinned to base             materialize base template's rootfs -> copy to OUT  (OUT == base, 0 diff)
-      = docker export | mkfs.ext4 -d  (FRESH FS)     docker diff <child container>  -> A/C/D delta
-    PublishRootfsDiff(base, child)                   apply delta into OUT in place via debugfs (write/rm/mkdir/sif)
+      = docker export | mkfs.ext4 -d  (FRESH FS)     docker export FROM & child trees; rsync -rlcni CHILD/ FROM/ -> delta
+    PublishRootfsDiff(base, child)                   apply delta into OUT in place via debugfs (write/rm/mkdir/symlink)
       -> diff ~= half the content (layout moved)     PublishRootfsDiff(base, OUT, child)
                                                        -> diff ~= the genuine delta (layout preserved)
 
@@ -118,7 +125,7 @@ logging it (or a Go probe in the e2e harness); the behavioral assertions (packag
 
 ## 6. Independently verifiable sub-steps (KVM-free first, the house discipline)
 
-### Stage 19a — the layout-preserving layered rootfs builder (no pkg/build/VM wiring)
+### Stage 19a — the layout-preserving layered rootfs builder (no pkg/build/VM wiring) ✅ done
 Add the layered build path in `scripts/` (copy base image → `docker diff` child → `debugfs` apply). Validate it
 **standalone**, KVM-free, with a synthetic fixture: build a tiny base ext4 image, a child = base + a known
 file/dir/symlink (+ a deletion), run the new path, and assert (a) the child contains the expected files with the
