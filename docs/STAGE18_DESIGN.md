@@ -23,6 +23,12 @@
 >   and a follow-on — it is *not* a defect in the COW algebra this stage banks, which is correct for any layout
 >   (it just stores a bigger diff when the layout diverges). The "store less" win is real but bounded here
 >   (576 → 278.8 MiB, ~2×) until layout is preserved.
+>
+> **Update — closed by Stage 19.** The "layout preservation" gap (§10) was exactly what Stage 19 fixed: a layered
+> child is now produced by mutating a **copy of the base's rootfs in place** (`debugfs`) rather than re-mkfs, so
+> the same `derived` build stores a **28,672-byte (28 KiB)** diff — **0.0047%**, down from the 278.8 MiB / 48%
+> measured here (~10,000× smaller, ~the genuine delta). The COW algebra this stage banked was correct all along;
+> only the child's *production* changed. See `docs/STAGE19_DESIGN.md`.
 
 > (Original) Status: **design (proposed).** Second of the deferred "storage-mechanism depth" items the roadmap
 > parked behind the Stage-15 `StorageProvider` / `PageSource` seams and the Stage-17 `pkg/storage/header`
@@ -377,7 +383,7 @@ flatten + multi-build read + empty→zero), deliberately simpler or improved on 
 | flatten | `MergeMappings` at snapshot time | `MergeMappings` at build time | 🟢 faithful |
 | empty blocks | `empty` bitset → `uuid.Nil`, served as zeros | gap/zero owner (index 0), served as zeros | 🟢 faithful |
 | compression | **none** (myth corrected — see header) | none | 🟢 faithful (E2B doesn't compress) |
-| **layout preservation** | base+child share a **persisted block device** mutated in place, so a child's diff is only the genuinely-changed blocks | child is **re-created** by `docker export \| mkfs.ext4 -d` each build, which reshuffles the layout when a layer is added → ~half the content reads as "changed" | 🔴 **the size win's main gap** — measured 2.07× not ~40×; needs an in-place/overlay block device or NBD (a follow-on, see status block) |
+| **layout preservation** | base+child share a **persisted block device** mutated in place, so a child's diff is only the genuinely-changed blocks | **Stage 19:** a layered child copies the base's rootfs image and applies only its delta in place via `debugfs` (no re-mkfs), so unchanged files keep their blocks | 🟢 **closed in Stage 19** — the same `derived` diff dropped from 278.8 MiB (2.07×) to 28 KiB (0.0047%); see `docs/STAGE19_DESIGN.md` |
 | cross-node cache | NFS-wrapped shared chunks | per-build local object cache | 🟡 multi-host — deferred |
 
 ## 11. Deferred follow-on — Stage 19 (memfile COW via live-VM snapshot), sketched

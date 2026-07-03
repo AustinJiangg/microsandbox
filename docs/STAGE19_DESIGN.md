@@ -1,12 +1,20 @@
 # Stage 19 design: the rootfs COW payoff — layout-preserving layered builds
 
-> Status: **design (proposed).** A direct follow-on to Stage 18, which banked E2B's COW *mechanism* (the
-> per-entry build owner, `MergeMappings`, the multi-build assemble) but measured a **bounded** size win: a real
-> `derived` build (default + one `RUN` layer) stored a **278.8 MiB** diff over its 576 MiB base — only ~2.07×,
-> not the ~40× the lab table predicted. Stage 18d root-caused that honestly (`docs/STAGE18_DESIGN.md` status
-> block + Decision 8 amendment): `docker build … RUN` then `docker export | mkfs.ext4 -d` **re-creates the
-> filesystem from scratch**, and adding a layer reshuffles the ext4 block layout, so ~half the *content* blocks
-> move — spurious relocations, not real delta. This stage closes that gap so the COW machinery actually pays off.
+> Status: **done** — 19a (the layout-preserving builder), 19b (build-pipeline wiring), 19c (real-VM e2e +
+> measured win + docs). A direct follow-on to Stage 18, which banked E2B's COW *mechanism* (the per-entry build
+> owner, `MergeMappings`, the multi-build assemble) but measured a **bounded** size win: a real `derived` build
+> (default + one `RUN` layer) stored a **278.8 MiB** diff over its 576 MiB base — only ~2.07×, not the ~40× the
+> lab table predicted. Stage 18d root-caused that honestly (`docs/STAGE18_DESIGN.md` status block + Decision 8
+> amendment): `docker build … RUN` then `docker export | mkfs.ext4 -d` **re-creates the filesystem from
+> scratch**, and adding a layer reshuffles the ext4 block layout, so ~half the *content* blocks move — spurious
+> relocations, not real delta. This stage closed that gap by producing the layered child as a **copy of the
+> base's rootfs mutated in place** (`debugfs`) rather than re-mkfs.
+>
+> **Measured (real VM, s3 mode):** the same `derived` (default + one `RUN`) now stores a **28,672-byte (28 KiB)**
+> rootfs diff over the 576.0 MiB base — **0.0047%**, down from Stage 18's **278.8 MiB / 48%**, i.e. **~10,000×
+> smaller** and essentially the genuine delta (7 × 4 KiB blocks: the marker's data block + a little ext4
+> metadata; cf. the §1 prediction of ~6 blocks). The e2e now **asserts** this (a Go probe, `msb-rootfs-stat`,
+> reads the bucket's stored-vs-logical bytes), not just records it out-of-band. e2e **44/44** in s3 mode.
 >
 > Read `docs/STAGE18_DESIGN.md` (the COW mechanism this completes) and `docs/STAGE17_DESIGN.md` (the header)
 > first. This stage changes **only how a layered child's rootfs image is produced** — the header format, the
@@ -132,17 +140,26 @@ file/dir/symlink (+ a deletion), run the new path, and assert (a) the child cont
 right modes (via `debugfs stat`/`cat`), and (b) the block diff vs the base is small (the genuine delta, not the
 whole content). Nothing in `pkg/build`/orchestrator changes.
 
-### Stage 19b — wire `pkg/build` to use it for layered builds
-A `base`-set `Build` materializes the base rootfs and runs the **layered** builder against it instead of the
-re-mkfs + size-pin path; `PublishRootfsDiff` unchanged. Retire/short-circuit the Stage-18 size-pin for layered
-builds (the copy guarantees the size). Unit-test the command sequence (the injectable executor asserts the layered
-path is taken for `base != ""`, the whole-upload path for `base == ""`). `go test ./services/...` green.
+### Stage 19b — wire `pkg/build` to use it for layered builds ✅ done
+A `base`-set `Build` materializes the base rootfs (`storage.MaterializeLayered`) and runs the **layered** builder
+against it instead of the re-mkfs + size-pin path; `PublishRootfsDiff` unchanged. **Done:** the Stage-18 size-pin
+was retired for layered builds (the copy guarantees the size) — dropped the `RootfsLogicalSize` call *and* the
+now-orphaned `storage.RootfsLogicalSize` helper it existed for. The child recipe's first `FROM` is parsed
+(`firstFromImage`) and passed to the layered builder as the diff base (Decision 3). Unit tests assert the command
+sequence: `TestBuildLayeredInPlace` (layered path runs `build-rootfs-layered.sh`, *not* re-mkfs; the FROM image is
+wired; the rootfs is published as a v2 COW diff) and `TestFirstFromImage`; the non-layered tests are unchanged.
+`go test ./services/...` green. (commit `79f0568`)
 
-### Stage 19c — real-VM e2e + measured win + docs + honest review
-Re-run `test_layered_template_via_api` (build `derived` over `default`, boot, content carried, code runs) and add
-the **measured size assertion** (the stored `derived` rootfs diff is now a small fraction of the base, vs Stage
-18's 48%). Report the real bytes. Update `docs/STAGE18_DESIGN.md` (the gap is now closed), this doc's status, the
-roadmap (the "layout preservation" divergence → done), CLAUDE.md, ARCHITECTURE.md. Full e2e re-run; 🟢 review.
+### Stage 19c — real-VM e2e + measured win + docs + honest review ✅ done
+Re-ran `test_layered_template_via_api` (build `derived` over `default`, boot, content carried, code runs) and
+added the **measured size assertion**. Because the e2e has no S3 client, a small dev/test command
+`services/cmd/msb-rootfs-stat` (a "Go probe in the e2e harness", Decision 4) reports the bucket's
+`<stored> <full>` bytes for a template; the test shells out to it (mirroring the fixture's `go run msb-seed`) and
+asserts `stored < full/50` — a ceiling far below Stage 18's 48% yet far above the real 0.0047%, so a regression to
+the re-mkfs path fails loudly. The test skips in `local-fs` mode (layered builds need object storage). **Measured:
+`derived` stored 28,672 B over the 576.0 MiB base (0.0047%), vs Stage 18's 278.8 MiB.** Full e2e **44/44** in s3
+mode. Docs updated: this doc's status, `docs/STAGE18_DESIGN.md` (gap closed), the roadmap, `CLAUDE.md`,
+`docs/ARCHITECTURE.md`.
 
 ## 7. Keeping tests green (honest trade-offs)
 

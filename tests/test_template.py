@@ -10,7 +10,11 @@ Stage 10 adds test_build_template_via_api: the same image, but built through the
 async TemplateService (POST /templates + status polling) instead of build-template.sh.
 """
 
+import os
 import pathlib
+import subprocess
+
+import pytest
 
 from microsandbox import Sandbox, build_template
 
@@ -49,21 +53,26 @@ DERIVED_MARKER = "/etc/microsandbox-derived"
 
 
 def test_layered_template_via_api(api_template_build):
-    """Stage 18: build a copy-on-write LAYERED template (base="default") through the api, then boot it.
+    """Stage 18/19: build a copy-on-write LAYERED template (base="default") through the api, boot it,
+    and assert the layering win is real.
 
     `derived` is the default image plus a marker file, but its rootfs is stored as a DIFF over the
-    default's (only its changed blocks + a flattened header), pinned to the default's size so the
-    diff stays small. This exercises the full SDK(base=) -> api(from) -> orchestrator -> pkg/build
-    layered path on a real VM: a sandbox cold-starts from the layered build, carries the child's
-    added content, and runs code -- proving the layered rootfs is a valid, bootable image.
+    default's (only its changed blocks + a flattened header). This exercises the full SDK(base=) ->
+    api(from) -> orchestrator -> pkg/build layered path on a real VM: a sandbox cold-starts from the
+    layered build, carries the child's added content, and runs code -- proving the layered rootfs is a
+    valid, bootable image.
 
-    The "stores only the diff" win is asserted hermetically in services/pkg/storage
-    (TestPublishAndMaterializeRootfsDiff: the diff object holds only the changed blocks); the
-    measured real bytes are recorded in docs/STAGE18_DESIGN.md. On one box the boot may cache-hit
-    the orchestrator's local build output, so the bucket-assemble path (default + derived objects)
-    is the one covered hermetically by the storage unit tests.
+    Stage 19 also asserts the SIZE win directly: the layout-preserving builder (build-rootfs-layered.sh
+    mutates a copy of the base's rootfs in place, rather than re-mkfs-ing it) makes `derived`'s stored
+    rootfs object ~its genuine delta (measured ~28 KiB over the 576 MiB base, ~0.005%), vs Stage 18's
+    re-mkfs ~48%. The e2e has no S3 client, so a small Go probe (msb-rootfs-stat) reports the bucket's
+    "<stored> <full>" bytes -- the "Go probe in the e2e harness" of docs/STAGE19_DESIGN.md Decision 4.
     """
+    if "--storage local-fs" in os.environ.get("MSB_ORCH_FLAGS", ""):
+        pytest.skip("layered COW builds need object storage (s3 mode)")
+
     base_url = api_template_build
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
     dockerfile = f'FROM microsandbox-agent\nRUN echo "derived COW layer" > {DERIVED_MARKER}\n'
 
     build_template("derived", dockerfile, base="default", with_snapshot=False, base_url=base_url)
@@ -71,3 +80,13 @@ def test_layered_template_via_api(api_template_build):
     with Sandbox(template="derived", base_url=base_url) as sb:
         assert "derived COW layer" in sb.files.read(DERIVED_MARKER)
         assert sb.run_code("print(6 * 7)").stdout.strip() == "42"
+
+    # The COW win is now asserted, not just recorded out-of-band: `derived`'s stored rootfs must be a
+    # tiny fraction of the base's full size. A regression to the Stage-18 re-mkfs path (~48%) would fail
+    # this; the real layout-preserving delta is ~0.005%, so a 2% (full/50) ceiling is decisive yet loose.
+    stat = subprocess.run(
+        ["go", "run", "./services/cmd/msb-rootfs-stat", "--name", "derived"],
+        cwd=str(repo_root), capture_output=True, text=True, check=True,
+    )
+    stored, full = map(int, stat.stdout.strip().splitlines()[-1].split())
+    assert stored < full // 50, f"layered rootfs stored {stored}B is not << full {full}B (layout not preserved?)"

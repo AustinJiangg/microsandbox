@@ -274,13 +274,28 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   differs from the base ~48%), so ~half the content reads as "changed". The size-pin (Decision 8) is
   **necessary but not sufficient**; the missing piece is **block-layout preservation** (E2B mutates a persisted
   block device in place; we re-create the FS each build) — a known divergence, *not* a defect in the merge
-  algebra (correct for any layout). e2e **44/44** in s3 mode. See `docs/STAGE18_DESIGN.md`.
+  algebra (correct for any layout). e2e **44/44** in s3 mode. **Stage 19 (next bullet) closed the block-layout
+  gap.** See `docs/STAGE18_DESIGN.md`.
+- **Done (Stage 19 — storage depth (3): layout-preserving layered rootfs, the COW payoff)**: closes Stage 18's one
+  gap (**block-layout preservation**) so the COW machinery actually pays off. A layered child's rootfs is no longer
+  re-`mkfs.ext4 -d`'d from a fresh `docker export` (which reshuffles the ext4 layout when a layer is added); instead
+  `scripts/build-rootfs-layered.sh` (19a) **copies the base template's rootfs image and applies only the child's
+  file delta in place via `debugfs`** (unprivileged, no mount/loop/root — the single-box analogue of E2B's in-place
+  block-device layer; the delta is `docker export` child-vs-`FROM` trees diffed by `rsync -c` → debugfs
+  `write`/`rm`/`mkdir`/`symlink`). 19b wired it into `pkg/build` for `base`-set builds (materialize the base via
+  `MaterializeLayered` → run the layered builder → unchanged `PublishRootfsDiff`), **retiring the Stage-18 size-pin**
+  (dropped the now-orphaned `RootfsLogicalSize`) and parsing the recipe's first `FROM` (`firstFromImage`, Decision
+  3). 19c re-ran the real-VM e2e + added a **measured size assertion**: a Go probe `services/cmd/msb-rootfs-stat`
+  reports the bucket's stored-vs-logical bytes and the e2e asserts `stored < full/50`. Header / merge /
+  `MaterializeLayered` / boot / api / SDK all **unchanged**. **Measured: the same `derived` (default + one `RUN`) now
+  stores a 28 KiB rootfs diff over the 576 MiB base — 0.0047%, down from Stage 18's 278.8 MiB / 48%, ~10,000×
+  smaller (≈ the genuine delta).** e2e **44/44** in s3 mode. See `docs/STAGE19_DESIGN.md`.
 - **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): production fidelity —
   multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript
-  SDK; plus the rest of the storage-mechanism depth now that Stages 17–18 banked the `pkg/storage/header`
-  index + COW algebra (the **memfile COW** via live-VM re-snapshot = Stage 19; **block-layout preservation**
-  for the rootfs diff — an in-place/overlay block device or NBD over the same layered header, the gap that
-  caps Stage 18's size win; a cross-node chunk cache) and auth depth (a key-management API, token
+  SDK; plus the rest of the storage-mechanism depth now that Stages 17–19 banked the `pkg/storage/header`
+  index + COW algebra (the **memfile COW** via live-VM re-snapshot = Stage 20; **NBD-served rootfs** — serve the
+  layered header lazily instead of assembling the whole rootfs at boot; a cross-node chunk cache) and auth depth
+  (a key-management API, token
   expiry/rotation, TLS). Note: memfile/rootfs **compression is NOT an E2B mechanism** (verified against
   `e2b-dev/infra` in Stage 18 — E2B stores raw blocks) — it would be our own optional extension, not a fidelity gap.
 

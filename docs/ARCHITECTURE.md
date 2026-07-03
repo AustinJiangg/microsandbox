@@ -155,7 +155,7 @@ the template builder:
   pipes bytes, and it runs the `/health` probe so a sandbox is healthy by the time Create
   returns ("ready on delivery"). It also serves a gRPC
   **`TemplateService`** (Stage 10): `TemplateCreate` kicks an async build (`pkg/build`
-  wrapping `docker build` → `build-rootfs.sh` → `build-snapshot.sh`, publishing artifacts via
+  wrapping `docker build` → `build-rootfs.sh` (or `build-rootfs-layered.sh` for a COW `base` build, Stage 19) → `build-snapshot.sh`, publishing artifacts via
   `pkg/storage` to S3 object storage since Stage 15); the api polls `TemplateBuildStatus`. Like E2B, the builder lives here
   because it needs the same docker + KVM + firecracker the VM fleet does.
 
@@ -223,7 +223,9 @@ swapped onto Redis + Postgres (Stage 14) → template artifacts moved to S3 obje
 first production-fidelity stage) → the streamed memfile stored compacted behind a per-block
 `pkg/storage/header` index (Stage 17, the first storage-mechanism-depth item) → that header
 carrying a copy-on-write **build owner** so a template `from` a base stores its **rootfs as a diff**,
-assembled at boot (Stage 18, COW layered builds). Through Stage 10
+assembled at boot (Stage 18, COW layered builds) → the layered child produced by a **layout-preserving in-place
+edit** of a copy of the base's rootfs (`debugfs`, no re-mkfs) so that diff is ~its genuine delta (Stage 19: the
+same `derived` dropped from 278.8 MiB to **28 KiB**). Through Stage 10
 every step followed one discipline: **add a new backend/transport implementation, keep the
 protocol byte-stable, and keep the changes out of the client as much as possible** — proven
 each time by a byte-for-byte e2e oracle. **Stage 11 deliberately broke the byte-stable rule**
@@ -246,6 +248,6 @@ staged code lives on in the git history if you want to study the progression.
 | services/pkg/build + TemplateService | `template-manager` (in E2B's orchestrator) | async template builds, polled for status (Stage 10) |
 | services/pkg/store (Postgres; SQLite selectable) | the api's Postgres | durable sandbox + build metadata, team-scoped, + teams/api_keys (keys hashed) for auth (E2B uses Postgres + sqlc; Stage 14b / 16) |
 | services/pkg/catalog (Redis) | the `sandbox-catalog` (Redis) | sandbox → `{node, access-token}` routing the client-proxy reads (E2B uses Redis; Stage 14a / 16) |
-| services/pkg/storage (S3 via minio-go; Local dir = test double) | object storage (GCS/S3) | where template artifacts live, buildID-keyed + an `aliases/<name>` pointer (Stage 15); rootfs/snapfile materialized locally, memfile streamed page-by-page over UFFD. Stage 17: the memfile is stored **compacted** (non-zero blocks only) behind a per-block index (`pkg/storage/header`); the boot path serves zero/gap pages without a fetch. Stage 18: that header gained a COW **build owner**, so a layered template stores its **rootfs as a diff** over its base (`MaterializeLayered` assembles it at boot). (E2B serves the rootfs lazily over NBD — deferred; it does **not** compress — that myth was corrected in Stage 18) |
+| services/pkg/storage (S3 via minio-go; Local dir = test double) | object storage (GCS/S3) | where template artifacts live, buildID-keyed + an `aliases/<name>` pointer (Stage 15); rootfs/snapfile materialized locally, memfile streamed page-by-page over UFFD. Stage 17: the memfile is stored **compacted** (non-zero blocks only) behind a per-block index (`pkg/storage/header`); the boot path serves zero/gap pages without a fetch. Stage 18: that header gained a COW **build owner**, so a layered template stores its **rootfs as a diff** over its base (`MaterializeLayered` assembles it at boot). Stage 19: the layered child is produced by an in-place `debugfs` edit of a copy of the base's rootfs (not re-mkfs), so the diff is ~the genuine delta (`derived`: 278.8 MiB → 28 KiB). (E2B serves the rootfs lazily over NBD — deferred; it does **not** compress — that myth was corrected in Stage 18) |
 | (firecracker config in services/pkg/fc) | Firecracker orchestration / jailer | microVM creation and isolation |
 | services/pkg/network | E2B's per-sandbox TAP/netns + DNAT | the per-sandbox network slot: TAP in its own netns, veth, DNAT (inbound only, no MASQUERADE) (Stage 12) |
