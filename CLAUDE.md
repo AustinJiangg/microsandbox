@@ -212,8 +212,9 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   mode** (memfile streamed from MinIO; `local-fs` + `local-fs --uffd` escape hatches green too). The
   fidelity gaps deliberately deferred — **NBD-streamed rootfs** (E2B serves the rootfs lazily too, not
   materialized), chunk/header, COW layer diffs (the header+merge done in Stage 18; rootfs), a cross-node
-  cache — are itemized in `docs/STAGE15_DESIGN.md` §11. (Compression was listed here too but is **not** an E2B
-  mechanism — Stage 18's source audit confirmed E2B stores raw blocks; it would be our own extension.)
+  cache — are itemized in `docs/STAGE15_DESIGN.md` §11. (Compression was listed here too; current E2B **does**
+  optionally compress — V4/V5 headers, zstd/lz4 in 2 MiB frames, raw V3 still supported — but it is orthogonal to
+  COW and we still store raw, so it stays deferred optional depth. See `docs/STAGE20_DESIGN.md` §2.)
   See `docs/STAGE15_DESIGN.md`.
 - **Done (Stage 16 — auth: `X-API-Key`→team + a data-plane access token)**: the first
   production-fidelity stage gives the system **identity** (every prior stage was "one box, no
@@ -296,8 +297,9 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   index + COW algebra (the **memfile COW** via live-VM re-snapshot = Stage 20; **NBD-served rootfs** — serve the
   layered header lazily instead of assembling the whole rootfs at boot; a cross-node chunk cache) and auth depth
   (a key-management API, token
-  expiry/rotation, TLS). Note: memfile/rootfs **compression is NOT an E2B mechanism** (verified against
-  `e2b-dev/infra` in Stage 18 — E2B stores raw blocks) — it would be our own optional extension, not a fidelity gap.
+  expiry/rotation, TLS). Note: memfile/rootfs **compression IS an optional E2B mechanism** (verified against
+  `e2b-dev/infra` @ main in Stage 20 — V4/V5 headers, zstd/lz4 in 2 MiB frames, raw V3 still supported, orthogonal
+  to COW); we still store raw, so it stays deferred optional depth. See `docs/STAGE20_DESIGN.md` §2.
 
 ## Development conventions
 

@@ -47,19 +47,17 @@
 > run; `MergeMappings(parent, diff)` flattens a layer chain into one mapping; at boot each faulting offset
 > resolves to a `(buildOwner, storageOffset)` and is read from **that** build's object.
 >
-> ### Correction banked by this stage's source audit (important)
+> ### Correction banked by this stage's source audit — later superseded by Stage 20 research
 > While verifying E2B for this stage I checked the long-standing claim — repeated in `docs/STAGE15_DESIGN.md`
 > §11, `docs/STAGE17_DESIGN.md` §10, and `docs/E2B_ALIGNMENT_ROADMAP.md` §5 — that **E2B stores the
-> memfile/rootfs "chunked + compressed" (LZ4/zstd frames)**. That is **false**: E2B does **not** compress its
-> memfile/rootfs storage objects. Evidence in the real tree: no non-generated, non-test Go file imports any
-> compression package (`klauspost/compress`, `pierrec/lz4`, `compress/*` are absent from the storage/build/
-> orchestrator paths; the two compression libs are `// indirect` in `go.mod`, pulled transitively by
-> minio/grpc/otel), the diff writer writes **raw** blocks (`header/diff.go` `writeDiff` → `diff.Write(b)`),
-> and `BuildStorageOffset += m.Length` advances by the **uncompressed** length (`mapping.go` `CreateMapping`).
-> So **compression was never an E2B-fidelity item** — it would be our own extension. This corrected the user's
-> first pick (compression) to COW, the genuinely E2B-faithful depth. **17c follow-up:** the three docs above
-> are edited in 18c to drop the "compressed" wording (compression re-listed as an *optional non-E2B extension*,
-> not a fidelity gap).
+> memfile/rootfs "chunked + compressed" (LZ4/zstd frames)**, and (reading a partial tree) concluded E2B does
+> **not** compress and that compression is "not an E2B mechanism." **That conclusion was wrong.** Stage 20
+> research against `e2b-dev/infra` @ main found E2B **does** optionally compress: V4/V5 header formats store 2
+> MiB frames, optionally zstd/lz4 (`shared/pkg/storage/compress_encode.go`, per-build `FrameTable`), flag-gated,
+> with raw **V3 still supported**. Compression is **orthogonal to COW** and off its critical path — so this
+> stage's pick (**COW**, the genuinely E2B-faithful depth) was right regardless — but it is a genuine,
+> **optional** E2B mechanism. We still store raw (our v1/v2 headers ≈ E2B's V3), so framed compression is
+> **deferred optional depth**, not "not-E2B." See `docs/STAGE20_DESIGN.md` §2.
 
 ## 1. Goal & non-goals
 
@@ -94,7 +92,7 @@
 - **The rootfs is still materialized whole (assembled), not NBD-streamed.** Lazy rootfs streaming over the
   same header is the **NBD stage** (`docs/STAGE17_DESIGN.md` §10 item 1). This stage exercises the multi-build
   read at *materialize* time; NBD would later serve the same layered header *lazily*.
-- **No compression** (it is not an E2B mechanism — see the correction above), **no cross-node cache**, **no
+- **No compression** (a genuine but **optional** E2B mechanism, orthogonal to COW — deferred here; see the correction above), **no cross-node cache**, **no
   auth/TLS/perf claim.** Same standing caveats as the whole repo; still a learning implementation, **not
   security-audited**, never safe for untrusted input.
 
@@ -382,7 +380,7 @@ flatten + multi-build read + empty→zero), deliberately simpler or improved on 
 | boot read | multi-build read, **lazy** (UFFD memfile / NBD rootfs) | multi-build read at **materialize** (assemble whole rootfs) | 🟡 lazy streaming = NBD stage |
 | flatten | `MergeMappings` at snapshot time | `MergeMappings` at build time | 🟢 faithful |
 | empty blocks | `empty` bitset → `uuid.Nil`, served as zeros | gap/zero owner (index 0), served as zeros | 🟢 faithful |
-| compression | **none** (myth corrected — see header) | none | 🟢 faithful (E2B doesn't compress) |
+| compression | optional zstd/lz4 in 2 MiB frames (V4/V5); raw V3 still supported | none (we store raw) | 🟡 orthogonal to COW — deferred optional depth (see header) |
 | **layout preservation** | base+child share a **persisted block device** mutated in place, so a child's diff is only the genuinely-changed blocks | **Stage 19:** a layered child copies the base's rootfs image and applies only its delta in place via `debugfs` (no re-mkfs), so unchanged files keep their blocks | 🟢 **closed in Stage 19** — the same `derived` diff dropped from 278.8 MiB (2.07×) to 28 KiB (0.0047%); see `docs/STAGE19_DESIGN.md` |
 | cross-node cache | NFS-wrapped shared chunks | per-build local object cache | 🟡 multi-host — deferred |
 

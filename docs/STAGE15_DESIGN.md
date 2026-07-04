@@ -16,7 +16,7 @@
 > The short version: the **core seam is faithful** (object storage as the source of truth, a
 > `StorageProvider` with range reads, the memfile served lazily over UFFD from storage with a
 > local cache, providers GCS/**S3**/Local), and the deliberate **single-machine simplifications**
-> (we materialize the rootfs instead of NBD-streaming it; per-page instead of chunked+compressed;
+> (we materialize the rootfs instead of NBD-streaming it; per-page instead of chunked + optionally compressed;
 > no COW layer diffs; no cross-node NFS cache) are named and deferred in §11 rather than papered
 > over. This honors the roadmap's stated method — "reproduce E2B's *seams* with
 > single-machine-appropriate implementations behind E2B-shaped interfaces" (§3) — with the lines
@@ -99,10 +99,12 @@ truth, and teach the **non-isomorphic** boot path that follows:
   artifact set; chunked prefetch is measured-in only if the restore time demands it (Decision 6). The
   `.header` index landed in **Stage 17** (compacted memfile) and COW diff layers in **Stage 18** (rootfs);
   the cross-node NFS cache is still **deferred** (§11).
-  > **Correction (Stage 18 source audit):** this once said E2B stores "**compressed**, chunked, …". That is
-  > **false** — `e2b-dev/infra` stores **raw** blocks (no compression lib in its storage/build/orchestrator
-  > paths; its diff writer writes raw bytes). Compression is **not** an E2B mechanism — it would be our own
-  > optional extension, not a fidelity gap. The "compressed" wording is dropped here and throughout this doc.
+  > **Correction (superseded by Stage 20 research):** the Stage-18 audit here concluded E2B stores only **raw**
+  > blocks and that compression is "not an E2B mechanism." That read a partial tree. Current `e2b-dev/infra` @ main
+  > **does** optionally compress — V4/V5 header formats store 2 MiB frames, optionally zstd/lz4
+  > (`shared/pkg/storage/compress_encode.go`, per-build `FrameTable`), flag-gated, raw V3 still supported. It is
+  > **orthogonal to COW**; we still store raw (our v1/v2 headers ≈ E2B's V3), so it is **deferred optional E2B
+  > depth**, not "not-E2B." See `docs/STAGE20_DESIGN.md` §2.
 - **No auth / TLS / multi-host.** MinIO runs with throwaway root creds on loopback, like
   Redis/Postgres in Stage 14. **Not** safe to expose — same standing caveat as the whole repo.
 - **A latency claim.** See the honesty note above.
@@ -383,7 +385,7 @@ doc neither overclaims fidelity nor hides the gaps:
 | interface | `StorageProvider{OpenBlob, OpenSeekable, GetDetails, UploadSignedURL, DeleteObjectsWithPrefix}` | `Upload/Open/ReadAt/Exists` | ✅ faithful in spirit (`OpenSeekable` ≙ our range read); simplified surface |
 | key layout | immutable `{buildID}/{file}` | immutable `{buildID}/{file}` + bucket alias | ✅ faithful (alias = single-machine stand-in for DB resolution, Decision 8) |
 | snapfile (VM state) | fetched whole (small, no header) | materialized whole | ✅ faithful |
-| memfile | lazy via UFFD from storage, **chunked + compressed + `.header` page-state index + NFS cache** | lazy via UFFD, **per-page Range + simple local cache** | 🟡 same seam, simpler mechanism — **deferred** (item 2) |
+| memfile | lazy via UFFD from storage, **chunked + optionally compressed + `.header` page-state index + NFS cache** | lazy via UFFD, **per-page Range + simple local cache** | 🟡 same seam, simpler mechanism — **deferred** (item 2) |
 | **rootfs** | lazy, **NBD userspace block device** over the same chunked storage (+ OverlayFS/squashfs base sharing) | **materialized whole** to the baked local path | 🔴 different mechanism — **deferred** (item 1) |
 | build model | layered **copy-on-write** diffs; the `.header` maps each block to the build that owns it; storage holds only deltas | one flat artifact set per build | 🟡 **deferred** (item 3) |
 | cross-node cache | `WrapInNFSCache` shares chunks between orchestrators | per-VM local cache only | 🟡 single-box — **deferred** (item 4) |
@@ -392,8 +394,8 @@ doc neither overclaims fidelity nor hides the gaps:
 1. **NBD-streamed rootfs.** Serve `rootfs.ext4` as a userspace NBD (or FUSE block) device backed by
    the bucket, so the rootfs streams like the memfile and the baked-path problem dissolves (the
    rootfs stops being a baked host file). This is a whole subsystem — its own stage.
-2. **Chunked + compressed memfile/rootfs with a `.header` index** (E2B's `pkg/storage/header`):
-   per-block `NotPresent/Dirty/Zero` state, larger-than-page chunks, LZ4/zstd frames, prefetch.
+2. **Chunked + optionally compressed memfile/rootfs with a `.header` index** (E2B's `pkg/storage/header`):
+   per-block `NotPresent/Dirty/Zero` state, larger-than-page chunks, optional LZ4/zstd frames, prefetch.
 3. **Copy-on-write layered builds**: each build a diff layer over its parent; the header resolves a
    byte to the owning build; storage holds only deltas (E2B's `BuildMap`/`Mapping`).
 4. **Cross-node chunk cache** (E2B's NFS wrap) — only meaningful once multi-host lands.

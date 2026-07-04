@@ -29,8 +29,9 @@
 > The remainder (production fidelity — multi-host / a TS SDK; plus the rest of the storage-mechanism depth —
 > NBD-served rootfs over the same header, **memfile COW** via live-VM re-snapshot (**Stage 20**), a cross-node
 > cache; and auth depth — a key-management API, token expiry/rotation, TLS) is the **deferred** forward plan.
-> (Note: memfile/rootfs **compression** is **not** an E2B mechanism — Stage 18's source audit confirmed E2B
-> stores raw blocks — so it is our own optional extension, not a fidelity gap.)
+> (Note: memfile/rootfs **compression** **is** an optional E2B mechanism — Stage 20 research (`e2b-dev/infra` @ main)
+> found V4/V5 headers with zstd/lz4 in 2 MiB frames, raw V3 still supported, orthogonal to COW — but we still store
+> raw, so it stays deferred optional depth, not a required fidelity gap. See `docs/STAGE20_DESIGN.md` §2.)
 
 ## 1. Why this document
 
@@ -269,11 +270,12 @@ e2e via a Go probe (`msb-rootfs-stat`). e2e **44/44** in s3 mode. See `docs/STAG
   deepens the *mechanism* behind the `StorageProvider` / `PageSource` / `header` interfaces without changing the seam
   (`docs/STAGE15_DESIGN.md` §11, `docs/STAGE17_DESIGN.md` §10, `docs/STAGE18_DESIGN.md` §10–11). (**Block-layout
   preservation** for the rootfs diff — the gap that capped Stage 18's size win — was **done in Stage 19**.)
-  > **Correction (Stage 18 source audit):** earlier wording here and in STAGE15/STAGE17 called E2B's storage
-  > "chunked + **compressed**". That is **false** — `e2b-dev/infra` stores **raw** blocks (no non-test Go file imports
-  > a compression lib in the storage/build/orchestrator paths; the diff writer writes raw bytes). Compression is
-  > therefore **not an E2B-fidelity item** — it would be our own optional extension, not a gap. Treat any
-  > "compressed" mention below as superseded by this note.
+  > **Correction (superseded by Stage 20 research):** an earlier Stage-18 audit called E2B's "chunked +
+  > **compressed**" storage a myth and concluded E2B stores only raw blocks. That read a partial tree. Current
+  > `e2b-dev/infra` @ main **does** optionally compress — V4/V5 header formats store 2 MiB frames, optionally
+  > zstd/lz4 (`shared/pkg/storage/compress_encode.go`, per-build `FrameTable`), flag-gated, with raw V3 still
+  > supported. Compression is **orthogonal to COW** and off its critical path; we still store raw (our v1/v2
+  > headers ≈ E2B's V3), so it is **deferred optional E2B depth**, not "not-E2B." See `docs/STAGE20_DESIGN.md` §2.
 - **Later — production fidelity.** Auth landed in Stage 16 (above); what remains: multi-host
   scheduling (real node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource
   limits and start/ready commands, plus auth depth (a key-management API, token expiry/rotation, TLS).

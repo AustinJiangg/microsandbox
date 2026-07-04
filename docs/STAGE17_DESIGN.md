@@ -305,21 +305,23 @@ compaction), deliberately simpler on what the next items add. Verified against `
 | mapping entry | `BuildMap{Offset,Length,BuildId,BuildStorageOffset}` | `{Offset,Length,BuildStorageOffset}` | 🟡 drop `BuildId` until COW |
 | gaps | `BuildId == Nil` → zeros, never read | unmapped range → zeros, never read | ✅ faithful |
 | compaction | store only present/delta blocks | store only present blocks | ✅ faithful (single build) |
-| compression | ~~LZ4/zstd frames per chunk~~ **none (E2B stores raw)** | raw blocks | ✅ faithful (correction below) |
+| compression | optional zstd/lz4 in 2 MiB frames (V4/V5); raw V3 still supported | raw blocks (we don't compress) | 🟡 orthogonal to COW — deferred optional depth (note below) |
 | build model | COW diff layers; header resolves a byte to its owning build | one flat build per memfile | ✅ **done for rootfs in Stage 18** (memfile = Stage 19) |
 | rootfs | same header, served lazily over **NBD** | rootfs still materialized whole (memfile-only header) | 🔴 **deferred** (item 1; Stage 18 assembles, NBD streams) |
 | cross-node cache | NFS-wrapped shared chunks | per-VM local chunk cache | 🟡 multi-host — **deferred** (item 4) |
 
-> **Correction (Stage 18 source audit):** the "compression" row above claimed E2B stores LZ4/zstd frames.
-> That is **false** — `e2b-dev/infra` stores **raw** blocks (no compression lib in its storage/build/
-> orchestrator paths; its diff writer writes raw bytes). Compression is **not** an E2B mechanism — it would
-> be our own optional extension, not a fidelity gap. Item 2b below is superseded by this note.
+> **Correction (superseded by Stage 20 research):** a Stage-18 audit claimed E2B stores only raw blocks and that
+> compression is "not an E2B mechanism." That read a partial tree. Current `e2b-dev/infra` @ main **does**
+> optionally compress — V4/V5 header formats store 2 MiB frames, optionally zstd/lz4
+> (`shared/pkg/storage/compress_encode.go`, per-build `FrameTable`), flag-gated, raw V3 still supported. It is
+> **orthogonal to COW**; we still store raw (v1/v2 header ≈ E2B's V3), so it is **deferred optional E2B depth**,
+> not "not-E2B." See `docs/STAGE20_DESIGN.md` §2. Item 2b below is that deferred depth.
 
 **Deferred follow-ons (candidate later stages), in rough priority:**
 1. **NBD-streamed rootfs** — give the rootfs the same header + a userspace NBD device, so it streams like
    the memfile and the baked-absolute-path problem dissolves. A whole subsystem; its own stage. (Stage 18
    assembles the layered rootfs whole; NBD would serve that *same* header lazily.)
-2b. ~~**Compression**~~ — **not an E2B mechanism** (see the correction above); an optional non-E2B extension only.
+2b. **Compression** — a genuine but **optional** E2B mechanism (V4/V5 2 MiB frames, zstd/lz4; raw V3 still supported), orthogonal to COW and deferred here; see the correction above.
 3. **COW layered builds** — ✅ **done for the rootfs in Stage 18** (the per-entry `BuildId`/`BaseBuildId` +
    build-table owner; a child stores only its diff and points unchanged ranges at the parent — E2B's `BuildMap`).
    The **memfile** half is Stage 19 (it needs live-VM re-snapshotting). Honest caveat: on our re-export pipeline
