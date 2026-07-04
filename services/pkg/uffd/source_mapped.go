@@ -15,7 +15,10 @@ import (
 type Extent struct {
 	Logical  int64 // logical byte offset in the (uncompacted) memfile
 	Length   int64 // run length in bytes
-	Physical int64 // byte offset of this run in the compacted object
+	Physical int64 // byte offset of this run inside Owner's compacted object
+	// Owner is the build that owns this run ("" = zero-owner, served as zeros). Stage 20: ignored by the
+	// single-build mappedSource (which reads its one object); set + used by the layered source (COW memfile).
+	Owner string
 }
 
 // mappedSource is the Stage 17 PageSource: a chunked reader over a COMPACTED memfile (only the present
