@@ -30,6 +30,22 @@ func (s *server) buildRootfsBacking(tmpl template.Template) (fc.RootfsBacking, e
 	if err != nil {
 		return fc.RootfsBacking{}, err
 	}
+	// A Stage-20 layered child's snapshot is a re-snapshot of its base, so it bakes the base template's
+	// rootfs path (recorded at {buildID}/rootfs.path). Bind the device over THAT path, not tmpl.Rootfs, so
+	// firecracker opens what the vmstate references. Absent (non-layered / pre-Stage-20) => empty => Restore
+	// binds over tmpl.Rootfs as before.
+	bakedPath, err := storage.OpenRootfsBakedPath(ctx, s.storage, buildID)
+	if err != nil {
+		return fc.RootfsBacking{}, err
+	}
+	// The bind target must exist as a file for `mount --bind` (prepareRestore only ensures tmpl.Rootfs,
+	// which for a layered child is NOT the baked path the device binds over). In --nbd mode the base's
+	// rootfs is never materialized there, so create an empty placeholder the bind then shadows.
+	if bakedPath != "" {
+		if err := ensureFile(bakedPath); err != nil {
+			return fc.RootfsBacking{}, err
+		}
+	}
 	base, err := s.openRootfsBase(ctx, buildID)
 	if err != nil {
 		return fc.RootfsBacking{}, err
@@ -50,7 +66,8 @@ func (s *server) buildRootfsBacking(tmpl template.Template) (fc.RootfsBacking, e
 		return fc.RootfsBacking{}, fmt.Errorf("bind nbd%d: %w", idx, err)
 	}
 	return fc.RootfsBacking{
-		Device: nbd.DevicePath(idx),
+		Device:    nbd.DevicePath(idx),
+		BakedPath: bakedPath, // "" for non-layered builds -> Restore binds over tmpl.Rootfs
 		Close: func() error {
 			derr := exp.Close()      // disconnect + stop the Dispatch goroutines (no more reads of provider)
 			cerr := provider.Close() // close the base's per-owner bucket readers

@@ -88,7 +88,9 @@ func main() {
 	if sd == "" {
 		sd = filepath.Join(filepath.Dir(*vendorDir), "scripts")
 	}
-	tmplBuilder := build.New(provider, *vendorDir, sd)
+	// srv is the Stage-20 live-VM snapshot producer (it owns firecracker + the network manager); the
+	// builder calls it for a layered template's snapshot.
+	tmplBuilder := build.New(provider, *vendorDir, sd, srv)
 
 	// 1) gRPC SandboxService -- the lifecycle seam.
 	lis, err := net.Listen("tcp", *grpcAddr)

@@ -202,6 +202,77 @@ func TestBuildLayeredInPlace(t *testing.T) {
 	}
 }
 
+// fakeSnapshotter records LayeredSnapshot calls (and can fail) so the build wiring is testable without
+// firecracker/KVM -- the real producer lives in the orchestrator (it resumes a base VM).
+type fakeSnapshotter struct {
+	calls [][3]string // {baseName, baseBuildID, childBuildID}
+	err   error
+}
+
+func (f *fakeSnapshotter) LayeredSnapshot(_ context.Context, baseName, baseBuildID, childBuildID string) error {
+	f.calls = append(f.calls, [3]string{baseName, baseBuildID, childBuildID})
+	return f.err
+}
+
+// seedLayeredBase seeds a Local bucket with a non-layered 2 MiB base (like the default) under alias
+// `base`, and returns a fake exec that writes the child rootfs the layered builder would produce.
+func seedLayeredBase(t *testing.T, bucket *storage.Local) func(string, ...string) (string, error) {
+	t.Helper()
+	ctx := context.Background()
+	const mib = 1 << 20
+	base := bytes.Repeat([]byte{1}, 2*mib)
+	if err := bucket.Upload(ctx, storage.ArtifactKey("bld_base", storage.RootfsName), bytes.NewReader(base), int64(len(base))); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetAlias(ctx, bucket, "base", "bld_base"); err != nil {
+		t.Fatal(err)
+	}
+	return func(name string, args ...string) (string, error) {
+		if strings.Contains(name, "build-snapshot") {
+			t.Errorf("a layered build must not run build-snapshot.sh (the live-VM producer replaces it): %v", args)
+		}
+		if strings.Contains(name, "build-rootfs-layered") { // <child_img> <from_img> <base_rootfs> <out>
+			_ = os.WriteFile(args[3], make([]byte, 2*mib), 0o644)
+		}
+		return "", nil
+	}
+}
+
+// TestBuildLayeredWithSnapshot: a layered build WITH a snapshot skips build-snapshot.sh and instead
+// invokes the injected live-VM producer with (baseName, baseBuildID, childBuildID) (Stage 20), still
+// publishing the rootfs as a COW diff.
+func TestBuildLayeredWithSnapshot(t *testing.T) {
+	bucket := storage.NewLocal(t.TempDir())
+	run := seedLayeredBase(t, bucket)
+	snap := &fakeSnapshotter{}
+	b := &Builder{storage: bucket, localRoot: t.TempDir(), scriptsDir: "/repo/scripts", snapshotter: snap, run: run}
+	if err := b.Build("bld_ds", "derived", "FROM base\nRUN true", "base", true); err != nil {
+		t.Fatalf("layered Build with snapshot: %v", err)
+	}
+	if len(snap.calls) != 1 || snap.calls[0] != [3]string{"base", "bld_base", "bld_ds"} {
+		t.Fatalf("LayeredSnapshot calls = %v, want one {base bld_base bld_ds}", snap.calls)
+	}
+	if h, err := storage.OpenRootfsHeader(context.Background(), bucket, "bld_ds"); err != nil || h == nil {
+		t.Fatalf("rootfs still published as a COW diff: err=%v nil=%v", err, h == nil)
+	}
+}
+
+// TestBuildLayeredSnapshotNeedsProducer: a layered build asking for a snapshot with no producer wired is
+// rejected up front (before docker build), not run without a snapshot.
+func TestBuildLayeredSnapshotNeedsProducer(t *testing.T) {
+	bucket := storage.NewLocal(t.TempDir())
+	var calls int
+	b := &Builder{storage: bucket, localRoot: t.TempDir(), scriptsDir: "/repo/scripts", snapshotter: nil,
+		run: func(string, ...string) (string, error) { calls++; return "", nil }}
+	err := b.Build("bld_np", "derived", "FROM base\nRUN true", "base", true)
+	if err == nil || !strings.Contains(err.Error(), "live-VM producer") {
+		t.Fatalf("err = %v, want a 'live-VM producer' rejection", err)
+	}
+	if calls != 0 {
+		t.Errorf("no commands should run for a rejected layered snapshot, got %d", calls)
+	}
+}
+
 // TestFirstFromImage covers the recipe FROM parser that wires the layered builder's diff base
 // (Decision 3): case-insensitive FROM, skipped comments/leading ARG, ignored --flags and "AS <stage>",
 // and an error when a recipe has no FROM (a layered build would have nowhere to diff from).

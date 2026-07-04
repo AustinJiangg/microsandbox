@@ -377,3 +377,43 @@ func PublishMemfileDiff(ctx context.Context, sp StorageProvider, baseBuildID, ch
 	}
 	return nil
 }
+
+// RootfsPathName records the absolute host rootfs path a build's snapshot bakes into its drive config
+// (Stage 20). A layered child's vmstate is a re-snapshot of its BASE, so Firecracker bakes the base
+// template's rootfs path, not the child's; the restore reads this to bind the child's NBD device over
+// exactly the path FC will open. Absent for non-layered builds (the restore binds over the template's
+// own path).
+const RootfsPathName = "rootfs.path"
+
+// PublishSnapfile uploads a local Firecracker vmstate file as {buildID}/snapfile (E2B's name for the VM
+// device/CPU state). The Stage-20 live-VM producer uses it for a layered child's re-snapshotted vmstate;
+// the non-layered path uploads the snapfile inline in pkg/build.
+func PublishSnapfile(ctx context.Context, sp StorageProvider, vmstatePath, buildID string) error {
+	return uploadLocalFile(ctx, sp, vmstatePath, ArtifactKey(buildID, SnapfileName))
+}
+
+// PublishRootfsBakedPath records path (the absolute host rootfs path buildID's snapshot bakes) as
+// {buildID}/rootfs.path, so a restore can bind the NBD device over it (Stage 20). See RootfsPathName.
+func PublishRootfsBakedPath(ctx context.Context, sp StorageProvider, buildID, path string) error {
+	return sp.Upload(ctx, ArtifactKey(buildID, RootfsPathName), bytes.NewReader([]byte(path)), int64(len(path)))
+}
+
+// OpenRootfsBakedPath returns the baked rootfs path recorded for buildID, or "" if none (a non-layered
+// build or a pre-Stage-20 bucket -- the restore then binds over the template's own tmpl.Rootfs).
+func OpenRootfsBakedPath(ctx context.Context, sp StorageProvider, buildID string) (string, error) {
+	key := ArtifactKey(buildID, RootfsPathName)
+	ok, err := sp.Exists(ctx, key)
+	if err != nil || !ok {
+		return "", err
+	}
+	rc, err := sp.Open(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}

@@ -77,7 +77,13 @@ type MicroVM struct {
 // Close tears the backing down on Destroy (disconnect + return the device + close the base); nil = no-op.
 type RootfsBacking struct {
 	Device string
-	Close  func() error
+	// BakedPath overrides the Restore bind target -- the path the snapshot's drive was baked at. It is
+	// normally tmpl.Rootfs (a template restored from its own snapshot), but a Stage-20 layered child's
+	// snapshot is a re-snapshot of its BASE, so it bakes the base template's rootfs path, not the child's;
+	// the orchestrator sets this to that recorded path so the child's device binds over what FC will open.
+	// Empty => bind over tmpl.Rootfs (the default). Ignored by Spawn (a fresh cold-start config).
+	BakedPath string
+	Close     func() error
 }
 
 // bindMount, when set, bind-mounts Device over Target in a per-VM mount namespace before exec'ing
@@ -293,7 +299,11 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 	// binds the device over the snapshot's baked rootfs path, so /snapshot/load opens this VM's device.
 	var bind *bindMount
 	if rootfs.Device != "" {
-		bind = &bindMount{device: rootfs.Device, target: tmpl.Rootfs}
+		target := tmpl.Rootfs
+		if rootfs.BakedPath != "" { // a layered child bakes its base's path, not tmpl.Rootfs (Stage 20)
+			target = rootfs.BakedPath
+		}
+		bind = &bindMount{device: rootfs.Device, target: target}
 	}
 	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns, bind, "--api-sock", apiSock)
 	if err != nil {
@@ -440,6 +450,33 @@ func (vm *MicroVM) Destroy() {
 	if vm.Slot != nil && vm.netMgr != nil {
 		vm.netMgr.Free(vm.Slot)
 	}
+}
+
+// Snapshot pauses the VM and writes a Full Firecracker snapshot -- device/CPU state to vmstatePath and
+// guest RAM to memfilePath. It is the live-VM re-snapshot capability the Stage-20 memfile-COW producer
+// needs: the orchestrator restores a base template self-consistently, calls Snapshot, then diffs the
+// resulting memfile against the base (docs/STAGE20_DESIGN.md). Ported from build-snapshot.sh's PATCH /vm
+// + PUT /snapshot/create, which until now lived only in shell (fc.Restore only *loaded* snapshots).
+//
+// A Full snapshot reads ALL guest memory, so a VM restored over UFFD faults every page in through our
+// handler while the snapshot is written -- the produced memfile is therefore complete, and its unchanged
+// pages match the base byte-for-byte (the small-diff precondition COW relies on). The VM is left Paused;
+// the caller Destroys it. The create timeout is generous: writing ~512 MiB (and faulting it in from the
+// bucket over UFFD in s3 mode) is slower than a control call.
+func (vm *MicroVM) Snapshot(vmstatePath, memfilePath string) error {
+	apiSock := filepath.Join(vm.workdir, "api.sock")
+	if status, err := firecrackerAPI(apiSock, "PATCH", "/vm",
+		map[string]any{"state": "Paused"}, 15*time.Second); err != nil || (status != 200 && status != 204) {
+		return fmt.Errorf("pause VM for snapshot: status=%d err=%v", status, err)
+	}
+	if status, err := firecrackerAPI(apiSock, "PUT", "/snapshot/create", map[string]any{
+		"snapshot_type": "Full",
+		"snapshot_path": vmstatePath,
+		"mem_file_path": memfilePath,
+	}, 120*time.Second); err != nil || (status != 200 && status != 204) {
+		return fmt.Errorf("create snapshot: status=%d err=%v", status, err)
+	}
+	return nil
 }
 
 // ConsoleTail grabs the tail of the guest serial log, for startup-failure

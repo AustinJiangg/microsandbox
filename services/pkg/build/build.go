@@ -18,20 +18,32 @@ import (
 	"microsandbox/services/pkg/storage"
 )
 
+// Snapshotter produces a layered template's snapshot by a live-VM re-snapshot (Stage 20): resume the
+// base self-consistently, re-snapshot, and publish the child's snapfile + COW memfile diff over the base.
+// It is implemented by the orchestrator (which owns firecracker + the network manager); the builder
+// depends only on this interface so it stays docker/KVM-free and unit-testable with a fake. nil => no
+// live-VM producer, so a layered build that also asks for a snapshot is rejected (a Stage-17 single-build
+// memfile is meaningless for a layer -- two independently-booted RAM images differ everywhere).
+type Snapshotter interface {
+	LayeredSnapshot(ctx context.Context, baseName, baseBuildID, childBuildID string) error
+}
+
 // Builder runs the build pipeline for one template at a time. run is the command executor,
 // injectable so tests can assert the command sequence without running anything.
 type Builder struct {
-	storage    storage.StorageProvider // bucket to publish to; nil in local-fs mode (no upload)
-	localRoot  string                  // local output/cache root (the orchestrator's vendorDir)
-	scriptsDir string                  // the repo's scripts/; build-rootfs.sh / build-snapshot.sh self-locate REPO_ROOT
-	run        func(name string, args ...string) (string, error)
+	storage     storage.StorageProvider // bucket to publish to; nil in local-fs mode (no upload)
+	localRoot   string                  // local output/cache root (the orchestrator's vendorDir)
+	scriptsDir  string                  // the repo's scripts/; build-rootfs.sh / build-snapshot.sh self-locate REPO_ROOT
+	snapshotter Snapshotter             // Stage 20: live-VM producer for a LAYERED snapshot; nil = unavailable
+	run         func(name string, args ...string) (string, error)
 }
 
 // New returns a Builder that shells out for real: it writes a template's artifacts locally under
 // localRoot and, when sp is non-nil (s3 mode), publishes them to the bucket. A nil sp is local-fs
-// mode (build locally only -- the orchestrator then boots from the local dir).
-func New(sp storage.StorageProvider, localRoot, scriptsDir string) *Builder {
-	return &Builder{storage: sp, localRoot: localRoot, scriptsDir: scriptsDir, run: runCmd}
+// mode (build locally only -- the orchestrator then boots from the local dir). snapshotter is the
+// Stage-20 live-VM producer for layered snapshots (the orchestrator passes itself); nil disables it.
+func New(sp storage.StorageProvider, localRoot, scriptsDir string, snapshotter Snapshotter) *Builder {
+	return &Builder{storage: sp, localRoot: localRoot, scriptsDir: scriptsDir, snapshotter: snapshotter, run: runCmd}
 }
 
 // ValidateName reports whether name is a buildable template name (rejects "default" and invalid
@@ -74,6 +86,9 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 	if base != "" {
 		if b.storage == nil {
 			return fmt.Errorf("layered build of %q over base %q needs object storage (s3 mode)", name, base)
+		}
+		if withSnapshot && b.snapshotter == nil {
+			return fmt.Errorf("layered snapshot of %q needs the live-VM producer (Stage 20); none configured", name)
 		}
 		baseBuildID, err = storage.ResolveAlias(context.Background(), b.storage, base)
 		if err != nil {
@@ -135,10 +150,12 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 		}
 	}
 
-	// 3) Optionally build the warm snapshot in place. It must be built at the rootfs's final
-	//    path -- the snapshot bakes that absolute path in (see storage's package doc) -- so
-	//    this writes straight into the published dir, not a staging area.
-	if withSnapshot {
+	// 3) Optionally build the warm snapshot. A NON-layered build boots the fresh rootfs and snapshots it in
+	//    place (build-snapshot.sh; it bakes the rootfs's absolute path, so it writes into the published dir,
+	//    not a staging area). A LAYERED build does NOT boot its own rootfs here: a fresh-boot memfile would
+	//    differ from the base everywhere (no COW win). Instead the publish step's live-VM producer (Stage 20)
+	//    resumes the base and re-snapshots, storing the memfile as a COW diff over the base.
+	if withSnapshot && base == "" {
 		snap := filepath.Join(dir, "snapshot")
 		if out, err := b.run(filepath.Join(b.scriptsDir, "build-snapshot.sh"), rootfs, snap); err != nil {
 			return fmt.Errorf("build-snapshot: %w\n%s", err, tail(out))
@@ -150,7 +167,7 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 	//    orchestrator boots from the local dir we just wrote, which in s3 mode doubles as the
 	//    materialize cache (a same-box boot is a cache hit). See docs/STAGE15_DESIGN.md.
 	if b.storage != nil {
-		if err := b.publish(buildID, name, dir, baseBuildID, withSnapshot); err != nil {
+		if err := b.publish(buildID, name, base, dir, baseBuildID, withSnapshot); err != nil {
 			return err
 		}
 	}
@@ -164,9 +181,11 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 //
 // The rootfs is stored differently depending on baseBuildID: a layered build (baseBuildID set) stores
 // only its copy-on-write diff over the base + a flattened {buildID}/rootfs.ext4.header (Stage 18); a
-// non-layered build uploads the whole rootfs (Stage 15). The snapshot/memfile stay single-build
-// regardless (memfile COW is Stage 20).
-func (b *Builder) publish(buildID, name, dir, baseBuildID string, withSnapshot bool) error {
+// non-layered build uploads the whole rootfs (Stage 15). The SNAPSHOT diverges the same way (Stage 20): a
+// non-layered build uploads its fresh-boot vmstate + compacted memfile whole; a layered build has no local
+// snapshot (step 3 skipped it) and instead invokes the live-VM producer, which resumes the base, re-snapshots,
+// and stores the memfile as a COW diff over the base. The base name identifies the template to resume.
+func (b *Builder) publish(buildID, name, base, dir, baseBuildID string, withSnapshot bool) error {
 	ctx := context.Background()
 	rootfsLocal := filepath.Join(dir, "rootfs.ext4")
 	if baseBuildID != "" {
@@ -177,14 +196,23 @@ func (b *Builder) publish(buildID, name, dir, baseBuildID string, withSnapshot b
 		return fmt.Errorf("upload %s: %w", storage.ArtifactKey(buildID, storage.RootfsName), err)
 	}
 	if withSnapshot {
-		snap := filepath.Join(dir, "snapshot")
-		if err := uploadFile(ctx, b.storage, filepath.Join(snap, "vmstate"), storage.ArtifactKey(buildID, storage.SnapfileName)); err != nil {
-			return fmt.Errorf("upload %s: %w", storage.ArtifactKey(buildID, storage.SnapfileName), err)
-		}
-		// The memfile is compacted + indexed, not uploaded raw (Stage 17): PublishMemfile uploads
-		// {buildID}/memfile (present blocks only) and {buildID}/memfile.header. See docs/STAGE17_DESIGN.md.
-		if err := storage.PublishMemfile(ctx, b.storage, filepath.Join(snap, "memfile"), buildID); err != nil {
-			return err
+		if baseBuildID == "" {
+			// Non-layered: upload the fresh-boot snapshot whole -- vmstate as {buildID}/snapfile, and the
+			// memfile compacted + indexed (Stage 17: present blocks only + {buildID}/memfile.header).
+			snap := filepath.Join(dir, "snapshot")
+			if err := uploadFile(ctx, b.storage, filepath.Join(snap, "vmstate"), storage.ArtifactKey(buildID, storage.SnapfileName)); err != nil {
+				return fmt.Errorf("upload %s: %w", storage.ArtifactKey(buildID, storage.SnapfileName), err)
+			}
+			if err := storage.PublishMemfile(ctx, b.storage, filepath.Join(snap, "memfile"), buildID); err != nil {
+				return err
+			}
+		} else {
+			// Layered: the live-VM producer resumes the base and re-snapshots, publishing {buildID}/snapfile
+			// + the COW memfile diff ({buildID}/memfile + .header) + the baked rootfs path (Stage 20). It runs
+			// before SetAlias, so a resolver never sees a half-published layered build.
+			if err := b.snapshotter.LayeredSnapshot(ctx, base, baseBuildID, buildID); err != nil {
+				return fmt.Errorf("layered snapshot over %s: %w", baseBuildID, err)
+			}
 		}
 	}
 	if err := storage.SetAlias(ctx, b.storage, name, buildID); err != nil {

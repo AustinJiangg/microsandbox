@@ -251,6 +251,79 @@ func (s *server) spawnHealthy(tmpl template.Template) (*fc.MicroVM, error) {
 	return healthyOrDestroy(fc.Spawn(fc.NewID(), s.vendorDir, tmpl, s.net, rootfs))
 }
 
+// LayeredSnapshot produces a layered template's snapshot by a self-consistent live-VM re-snapshot -- the
+// Stage-20 memfile-COW producer (chosen over grafting / in-guest-command; see docs/STAGE20_DESIGN.md). It
+// resumes the BASE build exactly as a normal restore does (base RAM over UFFD + base rootfs at the base's
+// own baked path -- the self-consistent snapshot E2B resumes), takes a fresh Full snapshot, and stores the
+// child's memfile as a COW diff over the base ({childBuildID}/memfile + .header) plus its re-snapshotted
+// vmstate ({childBuildID}/snapfile) and the baked rootfs path (so the child's restore binds its NBD device
+// over exactly what the vmstate references -- the re-snapshot bakes the BASE's rootfs path, not the child's).
+//
+// Honest divergence from E2B: we do NOT run the layer's build command in-guest (that needs a
+// start/ready-command subsystem we lack), and the rootfs diff is produced separately by docker+debugfs
+// (Stage 19). So the child's RAM is the base's warm RAM plus only the small delta of
+// resume -> health -> re-snapshot -- a maximal COW win, not a per-child warm working set. The produced
+// layered snapshot is restorable only under --nbd (the child's rootfs must be served at the base's baked
+// path without clobbering the base's own rootfs there). Implemented on *server so it can reach fc + the
+// network manager; injected into pkg/build as a build.Snapshotter.
+func (s *server) LayeredSnapshot(ctx context.Context, baseName, baseBuildID, childBuildID string) error {
+	if s.storage == nil {
+		return fmt.Errorf("layered snapshot needs object storage (s3 mode)")
+	}
+	// The child bakes its base's rootfs path (below); only NBD can then serve the child's OWN rootfs at
+	// that path at restore (via the per-VM bind) without clobbering the base's rootfs there. Without --nbd
+	// the child would restore against the base's rootfs -- silently wrong -- so refuse to produce one.
+	if !s.useNBD {
+		return fmt.Errorf("layered snapshot requires --nbd (the child's rootfs is served over NBD at the base's baked path)")
+	}
+	baseTmpl, err := template.Resolve(s.vendorDir, baseName)
+	if err != nil {
+		return fmt.Errorf("resolve base template %q: %w", baseName, err)
+	}
+	// The child's rootfs was diffed against baseBuildID (build.Build); the memfile must diff against the
+	// same base. restoreHealthy resumes by template name (the alias), so guard that the base's alias still
+	// points at that build -- a concurrent base rebuild mid-child-build is unsupported, not silently wrong.
+	if cur, err := storage.ResolveAlias(ctx, s.storage, baseName); err != nil {
+		return fmt.Errorf("resolve base %q: %w", baseName, err)
+	} else if cur != baseBuildID {
+		return fmt.Errorf("base %q moved from %s to %s during the layered build (unsupported concurrent rebuild)", baseName, baseBuildID, cur)
+	}
+
+	// Resume the base self-consistently and wait for health, reusing the exact restore path a user create
+	// takes. The producer VM is unregistered -- we own its lifecycle and Destroy it below.
+	vm, err := s.restoreHealthy(baseTmpl)
+	if err != nil {
+		return fmt.Errorf("resume base %q for re-snapshot: %w", baseName, err)
+	}
+	defer vm.Destroy()
+
+	// Re-snapshot the running base to temp files. A Full snapshot faults all base RAM in over UFFD, so the
+	// memfile is complete and mostly identical to the base -- the COW diff (below) is then small.
+	tmp, err := os.MkdirTemp("", "msb-resnap-"+childBuildID+"-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	newVmstate := filepath.Join(tmp, "vmstate")
+	newMemfile := filepath.Join(tmp, "memfile")
+	if err := vm.Snapshot(newVmstate, newMemfile); err != nil {
+		return fmt.Errorf("re-snapshot base for %q: %w", childBuildID, err)
+	}
+
+	// Publish the child's snapshot artifacts: the memfile as a COW diff over the base, the vmstate as the
+	// snapfile, and the baked rootfs path the vmstate references (so the child's restore binds over it).
+	if err := storage.PublishMemfileDiff(ctx, s.storage, baseBuildID, newMemfile, childBuildID); err != nil {
+		return fmt.Errorf("publish memfile diff for %q: %w", childBuildID, err)
+	}
+	if err := storage.PublishSnapfile(ctx, s.storage, newVmstate, childBuildID); err != nil {
+		return fmt.Errorf("publish snapfile for %q: %w", childBuildID, err)
+	}
+	if err := storage.PublishRootfsBakedPath(ctx, s.storage, childBuildID, baseTmpl.Rootfs); err != nil {
+		return fmt.Errorf("record baked rootfs path for %q: %w", childBuildID, err)
+	}
+	return nil
+}
+
 // ensureFile makes sure path exists as a file (creating an empty one + its parent dirs if absent), so it
 // can be the target of the Restore-over-NBD bind mount (Stage 21c). An existing file -- a placeholder or
 // a real rootfs left from a non-NBD run -- is left as-is; the bind shadows whatever is there.
