@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"microsandbox/services/pkg/fc"
+	"microsandbox/services/pkg/nbd"
 	"microsandbox/services/pkg/network"
 	"microsandbox/services/pkg/pool"
 	"microsandbox/services/pkg/proxy"
@@ -31,10 +32,16 @@ type server struct {
 	pools     map[string]*pool.Pool   // template name -> its warm pool; empty when no --pool/--pool-size
 	net       *network.Manager        // Stage 12: per-sandbox netns/TAP/veth/DNAT slots (cold-start + restore paths)
 	useUffd   bool                    // Stage 13b: in local-fs mode, restore over Uffd (--uffd) instead of File
+	useNBD    bool                    // Stage 21c: serve the rootfs over NBD (nbdPool != nil; s3 mode only)
+	nbdPool   *nbd.Pool               // Stage 21c: /dev/nbdX device pool; nil unless --nbd (s3 mode)
 
 	mu        sync.Mutex             // guards sandboxes
 	sandboxes map[string]*fc.MicroVM // sandbox id -> running VM
 }
+
+// nbdDevices sizes the NBD device pool (Stage 21c): the max rootfs devices live at once, like the
+// network slot cap. 64 is ample for one box; modprobe honors it on a fresh load (see pkg/nbd caveat).
+const nbdDevices = 64
 
 // networkSlots caps concurrent per-sandbox network slots (Stage 12a). 256 is the third-octet
 // limit in pkg/network's 10.0.<i>.0/30 scheme -- ample for one machine.
@@ -45,7 +52,7 @@ const networkSlots = 256
 // a from_snapshot create for that template is served in ~ms. An empty poolSpecs keeps
 // the original behavior of restoring on the request path. The pool's "make one VM"
 // step is restoreHealthy -- the same one the unpooled from_snapshot path uses.
-func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool, sp storage.StorageProvider) *server {
+func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool, sp storage.StorageProvider, nbdPool *nbd.Pool) *server {
 	s := &server{
 		vendorDir: vendorDir,
 		storage:   sp,
@@ -53,6 +60,8 @@ func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool, sp stor
 		pools:     map[string]*pool.Pool{},
 		net:       network.NewManager(networkSlots),
 		useUffd:   useUffd,
+		useNBD:    nbdPool != nil, // --nbd is on iff main built a device pool (s3 mode only)
+		nbdPool:   nbdPool,
 	}
 	for name, k := range poolSpecs {
 		// name was validated by parsePoolSpecs, so resolve cannot fail. tmpl is a
@@ -219,14 +228,42 @@ func (s *server) restoreHealthy(tmpl template.Template) (*fc.MicroVM, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare restore artifacts for %q: %w", tmpl.Name, err)
 	}
-	return healthyOrDestroy(fc.Restore(fc.NewID(), s.vendorDir, tmpl, s.net, memSource))
+	rootfs, err := s.buildRootfsBacking(tmpl) // NBD device (Stage 21c), or a zero backing (legacy file)
+	if err != nil {
+		if memSource != nil {
+			_ = memSource.Close() // fc.Restore would have owned it; we bailed before calling it
+		}
+		return nil, fmt.Errorf("prepare rootfs backing for %q: %w", tmpl.Name, err)
+	}
+	return healthyOrDestroy(fc.Restore(fc.NewID(), s.vendorDir, tmpl, s.net, memSource, rootfs))
 }
 
 func (s *server) spawnHealthy(tmpl template.Template) (*fc.MicroVM, error) {
 	if err := s.prepareSpawn(tmpl); err != nil {
 		return nil, fmt.Errorf("prepare spawn artifacts for %q: %w", tmpl.Name, err)
 	}
-	return healthyOrDestroy(fc.Spawn(fc.NewID(), s.vendorDir, tmpl, s.net))
+	rootfs, err := s.buildRootfsBacking(tmpl)
+	if err != nil {
+		return nil, fmt.Errorf("prepare rootfs backing for %q: %w", tmpl.Name, err)
+	}
+	return healthyOrDestroy(fc.Spawn(fc.NewID(), s.vendorDir, tmpl, s.net, rootfs))
+}
+
+// ensureFile makes sure path exists as a file (creating an empty one + its parent dirs if absent), so it
+// can be the target of the Restore-over-NBD bind mount (Stage 21c). An existing file -- a placeholder or
+// a real rootfs left from a non-NBD run -- is left as-is; the bind shadows whatever is there.
+func ensureFile(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // prepareRestore makes a restore's artifacts available and returns the memfile page source for it:
@@ -248,10 +285,18 @@ func (s *server) prepareRestore(tmpl template.Template) (uffd.PageSource, error)
 	if err != nil {
 		return nil, err
 	}
-	// MaterializeLayered assembles a layered (COW) rootfs from each run's owning build (Stage 18) or,
-	// when the build carries no rootfs header, downloads it whole -- so it is a safe drop-in for the
-	// non-layered default and old buckets too.
-	if err := storage.MaterializeLayered(ctx, s.storage, buildID, tmpl.Rootfs); err != nil {
+	if s.useNBD {
+		// NBD serves the rootfs lazily (buildRootfsBacking binds it to a device); we do NOT assemble it
+		// whole. But the snapshot bakes tmpl.Rootfs as the drive path, and Restore bind-mounts the device
+		// over it, so that path must exist as a file for `mount --bind` -- ensure a placeholder (the bind
+		// shadows it; a real materialized rootfs left from a non-NBD run works as the target too).
+		if err := ensureFile(tmpl.Rootfs); err != nil {
+			return nil, err
+		}
+	} else if err := storage.MaterializeLayered(ctx, s.storage, buildID, tmpl.Rootfs); err != nil {
+		// MaterializeLayered assembles a layered (COW) rootfs from each run's owning build (Stage 18) or,
+		// when the build carries no rootfs header, downloads it whole -- a safe drop-in for the non-layered
+		// default and old buckets too.
 		return nil, err
 	}
 	vmstate := filepath.Join(tmpl.SnapshotDir, "vmstate")
@@ -287,6 +332,9 @@ func (s *server) prepareRestore(tmpl template.Template) (uffd.PageSource, error)
 func (s *server) prepareSpawn(tmpl template.Template) error {
 	if s.storage == nil {
 		return nil // local-fs: the rootfs is already at its local path
+	}
+	if s.useNBD {
+		return nil // NBD serves the rootfs lazily (buildRootfsBacking); the drive points at the device
 	}
 	if _, err := os.Stat(tmpl.Rootfs); err == nil {
 		return nil // cache hit: no need to resolve the alias or download

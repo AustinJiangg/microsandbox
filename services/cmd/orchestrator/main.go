@@ -29,6 +29,7 @@ import (
 	"microsandbox/services/pkg/build"
 	pb "microsandbox/services/pkg/grpc/orchestrator"
 	pbtmpl "microsandbox/services/pkg/grpc/templatemanager"
+	"microsandbox/services/pkg/nbd"
 	"microsandbox/services/pkg/storage"
 )
 
@@ -45,6 +46,8 @@ func main() {
 		"dir with build-rootfs.sh / build-snapshot.sh for template builds (default: sibling of --vendor-dir)")
 	useUffd := flag.Bool("uffd", false,
 		"in local-fs mode, restore snapshots over a userfaultfd page-fault handler (pkg/uffd) instead of the File backend (Stage 13). In s3 mode the memfile always streams over UFFD, so this is ignored")
+	useNBD := flag.Bool("nbd", false,
+		"serve the rootfs over an NBD block device streamed from object storage (Stage 21) instead of materializing it whole. s3 mode only; needs the nbd kernel module + root")
 	storageMode := flag.String("storage", "s3",
 		"artifact source (Stage 15): s3 (object storage, the default) or local-fs (read artifacts from --vendor-dir directly)")
 	s3Endpoint := flag.String("s3-endpoint", "127.0.0.1:9000", "S3/MinIO endpoint host:port (no scheme), for --storage s3")
@@ -65,7 +68,18 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := newServer(*vendorDir, poolSpecs, *useUffd, provider)
+	// Stage 21c: build the NBD device pool when --nbd is set. It is an s3-mode feature (it streams the
+	// rootfs from the bucket); in local-fs mode the rootfs is already a local file, so --nbd is ignored
+	// with a warning. NewPool modprobes nbd and needs root -- a failure is loud, like the storage flip.
+	var nbdPool *nbd.Pool
+	if *useNBD {
+		if provider == nil {
+			log.Printf("orchestrator: --nbd ignored in local-fs mode (NBD streams the rootfs from object storage)")
+		} else if nbdPool, err = nbd.NewPool(nbdDevices); err != nil {
+			log.Fatalf("orchestrator: --nbd: %v", err)
+		}
+	}
+	srv := newServer(*vendorDir, poolSpecs, *useUffd, provider, nbdPool)
 
 	// Template builder (Stage 10): the scripts dir defaults to the sibling of vendor (their
 	// repo layout), overridable by flag. The builder writes artifacts in place under
@@ -105,8 +119,8 @@ func main() {
 			log.Fatalf("data proxy serve: %v", err)
 		}
 	}()
-	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, scripts=%s, pools=%v, storage=%s, uffd=%v)",
-		*grpcAddr, *proxyAddr, *vendorDir, sd, poolSpecs, *storageMode, *useUffd)
+	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, scripts=%s, pools=%v, storage=%s, uffd=%v, nbd=%v)",
+		*grpcAddr, *proxyAddr, *vendorDir, sd, poolSpecs, *storageMode, *useUffd, nbdPool != nil)
 
 	// Graceful shutdown: stop accepting, then destroy every VM so we never leak
 	// firecracker processes (killing the process destroys the whole VM).

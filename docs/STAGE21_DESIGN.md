@@ -1,19 +1,38 @@
 # Stage 21 design — NBD-served rootfs (lazy block streaming + portable snapshots)
 
-> Status: **design, pending user go-ahead on 21a.** This is a **re-sequencing**: Stage 20 (memfile COW)
-> is paused mid-flight (20a landed, 20b-1 done but uncommitted) because its faithful live-VM producer
-> needs a **stable rootfs device path**, which vanilla Firecracker does not give a materialized rootfs
-> file (a snapshot bakes the rootfs's *absolute path* and `snapshot/load` cannot override it — verified
-> against the Firecracker docs). E2B solves this by serving the rootfs over a **userspace NBD block
-> device** at a constant logical path. So NBD lands first, as its own stage; Stage 20 resumes after.
+> Status: **DONE (21a/21b/21c). Real-VM e2e 44/44 in `--nbd` s3 mode.** This was a **re-sequencing**:
+> Stage 20 (memfile COW) is paused mid-flight (20a landed, 20b-1 done but uncommitted) because its
+> faithful live-VM producer needs a **stable rootfs device path**, which vanilla Firecracker does not give
+> a materialized rootfs file (a snapshot bakes the rootfs's *absolute path* and `snapshot/load` cannot
+> override it — verified against the Firecracker docs). E2B solves this by serving the rootfs over a
+> **userspace NBD block device**. So NBD landed first, as its own stage; Stage 20 resumes after.
 >
 > **Honest headline:** this stage stops materializing the whole rootfs at boot (Stage 15/18/19 assembled
 > it to a baked local path) and instead **streams it lazily, block by block, from object storage** over a
 > kernel NBD device backed by our existing `pkg/storage/header` COW mapping + chunked bucket reader — the
-> disk-side analogue of the Stage-13/15 UFFD memfile. The second payoff is **portable snapshots**: because
-> the snapshot bakes a *constant* path (not the rootfs file), a snapshot restores on any host/device slot.
-> On one box this is fidelity + a real streaming mechanism, not a latency win (net setup still dominates
-> restore); the measurable claim is "the rootfs is no longer copied whole to a local file before boot."
+> disk-side analogue of the Stage-13/15 UFFD memfile. On one box this is fidelity + a real streaming
+> mechanism, not a latency win: unpooled restore is in fact *slower* (~3.5s vs ~1.6s) because the guest
+> now faults its working set over NBD from the bucket on first access; the warm pool hides it. The
+> measurable claim is "the rootfs is no longer copied whole to a local file before boot."
+>
+> **Two decisions changed when the design met reality (both toward simpler + more E2B-faithful sequencing):**
+>
+> 1. **Read-only, not the writable overlay of D2 (deferred to Stage 20).** D2 wanted the guest to mount
+>    root `rw` over a writable overlay from the start. But our snapshots are built by a *fresh cold boot →
+>    warm → snapshot* (`build-snapshot.sh`), not E2B's *resume-and-re-snapshot*. Making the guest write to
+>    root then requires the snapshot's captured RAM to stay consistent with the served base across the
+>    boundary — which is exactly what E2B's resume-based producer guarantees and ours (Stage 20) does not
+>    yet. So Stage 21c serves the rootfs **read-only** (guest root `ro`, unchanged behavior): provably
+>    consistent (served bytes == snapshot-time bytes), zero ext4 risk, and it needs **no `build-snapshot`
+>    change and no snapshot rebuild**. The writable `Overlay`/`Cache`/`ExportToDiff` (21b) are built and
+>    unit-tested, wired the same way, waiting for Stage 20 to capture the overlay diff *with* the snapshot.
+> 2. **Bind-mount the device over the *existing* baked path, not a new constant `/fc-vm/rootfs.ext4`.**
+>    The design (following E2B's tmpfs-symlink) proposed baking a constant path into every snapshot and
+>    rebuilding them all. We avoid that entirely: the snapshot already bakes `tmpl.Rootfs` (constant per
+>    template), so Restore just `mount --bind`s the VM's `/dev/nbdX` over that path **inside a per-VM mount
+>    namespace** — firecracker opens the baked path and gets the device. N VMs restoring one snapshot each
+>    bind a different device over the same path in their own mount ns (the D3 isolation, verified by
+>    `test_concurrent_restores_are_isolated` over NBD). No path constant, no snapshot migration.
 
 ## 1. Where this sits
 
@@ -201,11 +220,46 @@ and block/overlay stack are all still hand-rolled. No other new deps.
 | device | kernel `/dev/nbdX`, netlink multiconn | same (D1) | 🟢 faithful |
 | dispatch | userspace `Dispatch`, `Provider` | same | 🟢 faithful |
 | read resolution | `GetShiftedMapping` → owning build's chunk | `header.Locate` → owning build's chunk | 🟢 faithful (our owner index vs uuid, Stage 18) |
-| writable rootfs | overlay (RO base + writable cache), root `rw` | same (D2): writable overlay, guest root `rw` | 🟢 faithful |
-| constant path | tmpfs+symlink in a mount ns | same | 🟢 faithful |
+| writable rootfs | overlay (RO base + writable cache), root `rw` | **read-only** this stage (guest root `ro`); writable overlay built + wired, deferred to Stage 20 | 🟡 deferred (see status §1) — E2B's `rw` is producer-coupled, which we lack until Stage 20 |
+| baked path → device | tmpfs symlink to `/dev/nbdX` in a mount ns (constant `/fc-vm` path, rebuilt snapshots) | **`mount --bind` `/dev/nbdX` over the existing baked `tmpl.Rootfs`** in a per-VM mount ns (no path constant, no snapshot rebuild) | 🟢 faithful (same mount-ns isolation; simpler retrofit — see status §2) |
 | Firecracker | stock upstream | stock (v1.16.0) | 🟢 faithful |
 | netlink bind | `Merovius/nbd/nbdnl` | same (D1) | 🟢 faithful (new dep, accepted) |
 | cross-node cache | NFS-wrapped shared chunks | per-VM local cache | 🟡 multi-host — deferred |
 
 None of these change the storage *seam*; they add the NBD *transport* in front of the same
 `StorageProvider`/`header` mechanism, which is why Stages 15/17/18 landed first.
+
+## 11. What shipped
+
+- **21a — `services/pkg/nbd`** (device pool + userspace server + netlink bind). `nbd.go` (`Provider` =
+  `ReadAt`/`WriteAt`/`Size`, wire constants), `dispatch.go` (parse the 28-byte NBD request, serve
+  `Read`/`Write`/`Trim`/`Flush` → `Provider`, 16-byte simple reply), `pool.go` (`modprobe nbd nbds_max=N`
+  + sysfs `/sys/block/nbdN/size` free scan → ready channel), `export.go` (`Bind` = 4 socketpairs to the
+  kernel via `nbdnl.Connect`, a `Dispatch` goroutine per socket). New runtime dep `github.com/Merovius/nbd`
+  (D1). KVM-free unit tests (dispatch over `net.Pipe`, sysfs over a fake tree) + a gated real-device test
+  `TestBindRealDeviceRoundTrip` (`MSB_TEST_NBD=1` + root).
+- **21b — `services/pkg/block`** (the COW block stack). `block.go` (`ReadSource` + `NewLayeredBase` reusing
+  `uffd.NewLayeredSource`), `cache.go` (per-VM sparse writable `Cache` + `ExportToDiff` → dirty non-empty
+  blocks + `{Dirty,Empty}` bitset, the Stage-20 producer's input), `overlay.go` (`Overlay` = read
+  cache-first-then-base, write cache-only), `readonly.go` (`ReadOnly` — the read-only provider Stage 21c
+  binds; the `Overlay` swaps in for Stage 20's `rw`). Storage-free (injected `OpenFunc`), KVM-free tests.
+- **21c — wiring.** fc: `RootfsBacking{Device, Close}`, `Spawn` points the drive at the device, `Restore`
+  wraps firecracker in `ip netns exec … unshare --mount sh -c "mount --bind DEV BAKED && exec firecracker"`,
+  `Destroy` tears the backing down after firecracker dies. orchestrator: `--nbd` flag → an `nbd.Pool`,
+  `buildRootfsBacking` (resolve alias → `openRootfsBase` layered/whole → `block.NewReadOnly` → `nbd.Bind`),
+  `prepareSpawn`/`prepareRestore` skip `MaterializeLayered` in NBD mode (restore ensures a placeholder at
+  the bind target). `storage.ObjectSize` (whole-object size for a non-layered base, no interface widening).
+- **Validated on real VMs (this box, WSL2, firecracker v1.16.0, `nbd.ko`):** cold-start and restore over
+  NBD both boot to a healthy daemon (de-risked with two throwaway spikes first, then the full path);
+  real-VM e2e **44/44** in `--nbd` s3 mode, including `test_concurrent_restores_are_isolated` (concurrent
+  NBD restores in per-VM mount namespaces) and `test_layered_template_via_api` (the multi-owner layered
+  base). `test_restore_is_fast` bound loosened (6s in `--nbd`, 2.5s plain) to reflect the honest unpooled
+  latency; it stays a "restore doesn't hang" sanity check.
+
+## 12. Deferred (unchanged from the design)
+
+- **Writable rootfs / guest `rw`** — the 21b `Overlay` + `ExportToDiff`, wired but not exercised, land with
+  Stage 20's producer (which captures the overlay diff with the snapshot; see status §1).
+- **NBD device pool sizing** — a fixed 64; `nbds_max` is a module-load param, so a pre-loaded smaller `nbd`
+  caps it (documented `pkg/nbd` caveat), fine for one box.
+- **Cross-node chunk cache** — per-VM local cache only (multi-host, deferred with the rest of the roadmap).

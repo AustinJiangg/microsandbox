@@ -58,7 +58,32 @@ type MicroVM struct {
 	// Uffd memory backend (--uffd, Stage 13b); nil for the File backend and for cold starts.
 	// Destroy stops it after firecracker dies, so the memfile mmap + fds don't leak.
 	uffd *uffd.Handler
+
+	// rootfsClose tears down this VM's NBD rootfs backing (disconnect the device, return it to the
+	// pool, close the base) when set (--nbd, Stage 21c); nil for the legacy materialized-file rootfs.
+	// Destroy runs it after firecracker dies, so the device is idle before we disconnect it.
+	rootfsClose func() error
 }
+
+// RootfsBacking selects how a VM's rootfs drive is provided (Stage 21c). The zero value is the legacy
+// path: the drive/snapshot uses the whole rootfs materialized at tmpl.Rootfs. When Device is set, the
+// rootfs is served over that NBD device (streamed from object storage by the orchestrator's block stack,
+// never materialized whole):
+//
+//   - Spawn (cold start) points the drive's path_on_host straight at Device (a fresh config).
+//   - Restore cannot retarget the snapshot's baked rootfs path, so it bind-mounts Device over that path
+//     inside a per-VM mount namespace -- firecracker then opens the baked path and gets this VM's device.
+//
+// Close tears the backing down on Destroy (disconnect + return the device + close the base); nil = no-op.
+type RootfsBacking struct {
+	Device string
+	Close  func() error
+}
+
+// bindMount, when set, bind-mounts Device over Target in a per-VM mount namespace before exec'ing
+// firecracker -- the Restore-over-NBD trick that makes the snapshot's baked rootfs path resolve to this
+// VM's device without rewriting the snapshot (Stage 21c). nil = no mount-namespace wrapping.
+type bindMount struct{ device, target string }
 
 // NewID mints a unique sandbox id (no external uuid dependency).
 func NewID() string {
@@ -94,7 +119,18 @@ func CheckHostArtifacts(vendorDir string) error {
 
 // Spawn cold-starts a Firecracker microVM (from the template's rootfs) with the daemon running
 // inside, reachable over the VM's NIC (TCP). Ported from client.py's _spawn_microvm.
-func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager) (*MicroVM, error) {
+//
+// rootfs selects the rootfs backing (Stage 21c): the zero value uses the materialized file at
+// tmpl.Rootfs; a set Device points the drive straight at that NBD device (served from object storage,
+// never materialized whole). Spawn owns rootfs.Close -- it runs it on any failure before the VM takes
+// ownership, so a half-built VM never leaks the device.
+func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager, rootfs RootfsBacking) (_ *MicroVM, err error) {
+	attached := false // once the VM owns rootfs.Close, Destroy tears it down instead of this defer
+	defer func() {
+		if !attached && rootfs.Close != nil {
+			_ = rootfs.Close()
+		}
+	}()
 	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
 	}
@@ -102,7 +138,12 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 		return nil, fmt.Errorf("/dev/net/tun missing; it is needed for per-sandbox networking" +
 			" (Stage 12). See docs/MICROVM_DESIGN.md")
 	}
-	if _, err := os.Stat(tmpl.Rootfs); err != nil {
+	// The drive points at the NBD device (Stage 21c) or the materialized rootfs file. Only the latter
+	// must exist on disk here -- the device is served by the block stack the orchestrator already bound.
+	rootfsPath := tmpl.Rootfs
+	if rootfs.Device != "" {
+		rootfsPath = rootfs.Device
+	} else if _, err := os.Stat(tmpl.Rootfs); err != nil {
 		return nil, fmt.Errorf("missing rootfs %s for template %q; run scripts/build-rootfs.sh"+
 			" (or scripts/build-template.sh %s) first", tmpl.Rootfs, tmpl.Name, tmpl.Name)
 	}
@@ -132,9 +173,9 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 		},
 		"drives": []any{map[string]any{
 			"drive_id":       "rootfs",
-			"path_on_host":   tmpl.Rootfs,
+			"path_on_host":   rootfsPath, // tmpl.Rootfs, or an NBD device (Stage 21c)
 			"is_root_device": true,
-			"is_read_only":   true, // all writes go to the in-VM tmpfs /tmp
+			"is_read_only":   true, // read-only rootfs; all writes go to the in-VM tmpfs /tmp
 		}},
 		"machine-config": map[string]any{"vcpu_count": vcpus, "mem_size_mib": memMiB},
 		// A virtio-net NIC backed by the netns's TAP -- the daemon's only transport now (Stage 12c
@@ -152,7 +193,7 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 		return nil, err
 	}
 
-	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns,
+	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns, nil,
 		"--api-sock", filepath.Join(workdir, "api.sock"), "--config-file", configPath)
 	if err != nil {
 		os.RemoveAll(workdir)
@@ -161,6 +202,8 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 	}
 	vm.Slot = slot
 	vm.netMgr = netMgr
+	vm.rootfsClose = rootfs.Close // the VM owns the NBD backing now; Destroy tears it down
+	attached = true
 	return vm, nil
 }
 
@@ -181,7 +224,7 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 // supplier, serving each guest page fault from memSource -- a local mmap in local-fs --uffd mode, or a
 // bucket reader streaming pages from object storage in s3 mode). See docs/STAGE13_DESIGN.md +
 // docs/STAGE15_DESIGN.md.
-func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manager, memSource uffd.PageSource) (*MicroVM, error) {
+func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manager, memSource uffd.PageSource, rootfs RootfsBacking) (_ *MicroVM, err error) {
 	// We take ownership of memSource: if we fail before handing it to uffd.Serve, close it so the
 	// caller's mmap / open object doesn't leak. Once Serve is called (served=true) the handler owns it.
 	served := false
@@ -192,6 +235,13 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 			}
 		}()
 	}
+	// Likewise take ownership of the NBD rootfs backing: close it on any failure before the VM owns it.
+	attached := false
+	defer func() {
+		if !attached && rootfs.Close != nil {
+			_ = rootfs.Close()
+		}
+	}()
 	if err := CheckHostArtifacts(vendorDir); err != nil {
 		return nil, err
 	}
@@ -239,16 +289,23 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 
 	// firecracker runs inside the slot's netns so the snapshot's NIC reattaches to that netns's
 	// tap0. The api.sock lives in workdir on the host fs, so the netns doesn't isolate it -- the
-	// orchestrator still reaches it.
-	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns, "--api-sock", apiSock)
+	// orchestrator still reaches it. Over NBD (Stage 21c) it also runs in a per-VM mount namespace that
+	// binds the device over the snapshot's baked rootfs path, so /snapshot/load opens this VM's device.
+	var bind *bindMount
+	if rootfs.Device != "" {
+		bind = &bindMount{device: rootfs.Device, target: tmpl.Rootfs}
+	}
+	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns, bind, "--api-sock", apiSock)
 	if err != nil {
 		os.RemoveAll(workdir)
 		netMgr.Free(slot)
 		return nil, err
 	}
-	// Record the slot now (before the load) so a load failure's vm.Destroy() also frees it.
+	// Record the slot + NBD backing now (before the load) so a load failure's vm.Destroy() frees them.
 	vm.Slot = slot
 	vm.netMgr = netMgr
+	vm.rootfsClose = rootfs.Close
+	attached = true
 
 	// Choose the snapshot memory backend (Stage 15 generalized Stage 13's File/Uffd switch into the
 	// caller's page-source choice). memSource == nil => File: firecracker mmaps the local memfile and
@@ -300,22 +357,31 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 // its stdout/stderr (the guest serial console) to workdir/console.log. We can't
 // use a pipe: the guest console writes continuously and a full pipe buffer would
 // stall the VM, so it lands in a file we can tail for diagnostics.
-func startFirecracker(id, vendorDir, workdir, netns string, args ...string) (*MicroVM, error) {
+//
+// The launch is composed of up to three nested exec-only wrappers, so cmd.Process stays firecracker
+// (SIGTERM/Wait below still target the VM): `ip netns exec <netns>` enters the sandbox's netns (the TAP
+// it opens is that namespace's), then -- over NBD (bind != nil) -- `unshare --mount` gives it a private
+// mount namespace where `mount --bind <device> <baked path>` makes the snapshot's rootfs path resolve to
+// this VM's NBD device, then `exec firecracker`. `ip netns exec` / `unshare` / the bind need CAP_*; the
+// orchestrator runs as root (Stage 12 Decision 7).
+func startFirecracker(id, vendorDir, workdir, netns string, bind *bindMount, args ...string) (*MicroVM, error) {
 	console, err := os.Create(filepath.Join(workdir, "console.log"))
 	if err != nil {
 		return nil, err
 	}
 	fcPath := filepath.Join(vendorDir, "firecracker")
-	var cmd *exec.Cmd
-	if netns != "" {
-		// Launch firecracker inside the sandbox's netns, so the TAP it opens is the one in that
-		// namespace. `ip netns exec` needs CAP_NET_ADMIN -- the orchestrator runs as root (Decision
-		// 7). It execs (no fork) into firecracker, so cmd.Process is the VM and SIGTERM/Wait below
-		// still target it. Both Spawn and Restore pass a netns (every VM has a network slot).
-		cmd = exec.Command("ip", append([]string{"netns", "exec", netns, fcPath}, args...)...)
-	} else {
-		cmd = exec.Command(fcPath, args...)
+	launch := append([]string{fcPath}, args...)
+	if bind != nil {
+		// Bind the device over the baked path in a private mount ns, then exec firecracker in it. sh's
+		// `exec` keeps the PID, so the whole chain remains a single process ending in firecracker.
+		script := "mount --bind " + shellQuote(bind.device) + " " + shellQuote(bind.target) +
+			" && exec " + shellJoin(launch)
+		launch = []string{"unshare", "--mount", "--propagation", "private", "sh", "-c", script}
 	}
+	if netns != "" {
+		launch = append([]string{"ip", "netns", "exec", netns}, launch...)
+	}
+	cmd := exec.Command(launch[0], launch[1:]...)
 	cmd.Stdout = console
 	cmd.Stderr = console
 	err = cmd.Start()
@@ -324,6 +390,18 @@ func startFirecracker(id, vendorDir, workdir, netns string, args ...string) (*Mi
 		return nil, err
 	}
 	return &MicroVM{ID: id, proc: cmd, workdir: workdir}, nil
+}
+
+// shellQuote single-quotes s for safe use inside the `sh -c` script that wraps firecracker over NBD
+// (paths are ours -- tmp dirs, /dev/nbdX -- but quoting is correct hygiene). shellJoin quotes+joins argv.
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+func shellJoin(args []string) string {
+	q := make([]string, len(args))
+	for i, a := range args {
+		q[i] = shellQuote(a)
+	}
+	return strings.Join(q, " ")
 }
 
 // Destroy kills the firecracker process (which destroys the whole VM -- memory
@@ -347,6 +425,12 @@ func (vm *MicroVM) Destroy() {
 	// warm pool's churn (Decision 5). nil (the File backend / cold start) makes this a no-op.
 	if vm.uffd != nil {
 		vm.uffd.Stop()
+	}
+	// Tear down the NBD rootfs backing after firecracker is gone (so the device is idle): disconnect it,
+	// return it to the pool, close the base. nil (legacy materialized rootfs) makes this a no-op. The
+	// per-VM mount ns + its bind vanished when firecracker (its last process) exited, so no unmount.
+	if vm.rootfsClose != nil {
+		_ = vm.rootfsClose()
 	}
 	if vm.workdir != "" {
 		os.RemoveAll(vm.workdir)

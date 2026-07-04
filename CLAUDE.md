@@ -291,15 +291,40 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   `MaterializeLayered` / boot / api / SDK all **unchanged**. **Measured: the same `derived` (default + one `RUN`) now
   stores a 28 KiB rootfs diff over the 576 MiB base — 0.0047%, down from Stage 18's 278.8 MiB / 48%, ~10,000×
   smaller (≈ the genuine delta).** e2e **44/44** in s3 mode. See `docs/STAGE19_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): production fidelity —
-  multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript
-  SDK; plus the rest of the storage-mechanism depth now that Stages 17–19 banked the `pkg/storage/header`
-  index + COW algebra (the **memfile COW** via live-VM re-snapshot = Stage 20; **NBD-served rootfs** — serve the
-  layered header lazily instead of assembling the whole rootfs at boot; a cross-node chunk cache) and auth depth
-  (a key-management API, token
-  expiry/rotation, TLS). Note: memfile/rootfs **compression IS an optional E2B mechanism** (verified against
-  `e2b-dev/infra` @ main in Stage 20 — V4/V5 headers, zstd/lz4 in 2 MiB frames, raw V3 still supported, orthogonal
-  to COW); we still store raw, so it stays deferred optional depth. See `docs/STAGE20_DESIGN.md` §2.
+- **Paused (Stage 20 — memfile COW via live-VM re-snapshot)**: designed + 20a (`34d0a8f`, the multi-owner
+  memfile page source) landed; 20b-1 (the KVM-free memfile COW algebra in `pkg/storage/cow.go`) is done +
+  green but **left uncommitted in the working tree by choice**, to merge into 20b when the live-VM producer
+  lands. It was paused because a faithful producer needs a **stable rootfs device path** (vanilla Firecracker
+  bakes the rootfs's absolute path into the snapshot and cannot override it on load) — so **Stage 21 (NBD)
+  was inserted first**. See `docs/STAGE20_DESIGN.md`.
+- **Done (Stage 21 — NBD-served rootfs: lazy block streaming)**: the last "materialized whole" artifact is now
+  streamed lazily — the rootfs is served to the guest over a **kernel NBD device (`/dev/nbdX`)** whose blocks
+  our userspace server resolves through the same `pkg/storage/header` COW mapping + chunked bucket reader as
+  the memfile (the disk-side analogue of the Stage-13/15 UFFD memfile), instead of assembling the whole rootfs
+  to a baked local path at boot. **21a** `services/pkg/nbd` (device pool `modprobe nbd` + sysfs free scan; a
+  hand-rolled `Dispatch` server for the 28-byte NBD protocol; the kernel bind over **netlink multiconn** via
+  the one new runtime dep `github.com/Merovius/nbd/nbdnl`, Decision D1 — verified on real hardware by a gated
+  `TestBindRealDeviceRoundTrip`). **21b** `services/pkg/block` — E2B's COW block stack: a read-only layered
+  base (reusing `uffd.NewLayeredSource`) under a per-VM writable `Overlay`/`Cache` with `ExportToDiff` (built
+  + unit-tested, the Stage-20 producer's input). **21c** wiring: `fc.RootfsBacking` (Spawn points the drive at
+  the device; **Restore `mount --bind`s the device over the snapshot's existing baked rootfs path inside a
+  per-VM mount namespace** — so no constant path and **no snapshot rebuild**, and N concurrent restores stay
+  isolated); orchestrator `--nbd` flag → an `nbd.Pool` + `buildRootfsBacking` (lazy base → `block.NewReadOnly`
+  → `nbd.Bind`), `prepareSpawn`/`prepareRestore` skip `MaterializeLayered`. **Two honest scope decisions:**
+  (1) **served read-only** — the writable overlay (D2) is deferred to Stage 20 because our
+  cold-boot-to-snapshot model (unlike E2B's resume-and-re-snapshot) needs the producer to keep the snapshot
+  consistent with guest writes; RO is provably consistent and needs no snapshot change. (2) **not a
+  single-box speedup** — unpooled restore is *slower* (~3.5s vs ~1.6s) because the guest faults its working
+  set over NBD on first access; the warm pool hides it. Real-VM e2e **44/44** in `--nbd` s3 mode (cold-start +
+  restore + concurrent restores + layered template all boot over NBD). See `docs/STAGE21_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): **resume Stage 20** (memfile COW; now unblocked by
+  the stable NBD device path — the faithful producer resumes the parent over UFFD+NBD, runs the layer's
+  command in-guest, re-snapshots, and diffs both artifacts, which needs an in-guest command-execution path to
+  build) and with it the writable-overlay `rw` rootfs (Stage 21b, wired + waiting); then production fidelity —
+  multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript SDK; a
+  cross-node chunk cache; and auth depth (a key-management API, token expiry/rotation, TLS). Note:
+  memfile/rootfs **compression IS an optional E2B mechanism** (V4/V5 headers, zstd/lz4 in 2 MiB frames, raw V3
+  still supported, orthogonal to COW); we still store raw, so it stays deferred optional depth.
 
 ## Development conventions
 
@@ -325,7 +350,9 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   bucket, so on a box with **no docker** the VM group now fails loudly rather than silently running
   on in-process state. Since Stage 16 the fixture also exports `MICROSANDBOX_API_KEY=msb_dev_key`
   (the api seeds it) so existing tests authenticate unchanged. The orchestrator defaults to `--storage s3`; `MSB_ORCH_FLAGS="--storage
-  local-fs"` reverts the VM e2e to reading artifacts from `vendor/` directly.
+  local-fs"` reverts the VM e2e to reading artifacts from `vendor/` directly, and `MSB_ORCH_FLAGS="--nbd"` runs the
+  VM e2e with the rootfs served over NBD (Stage 21; needs the `nbd` kernel module + root, so it self-skips
+  otherwise). The Go NBD unit tests are hermetic; the real-device bind is a gated test (`MSB_TEST_NBD=1` + root).
 - **Safety rule**: the microVM is the first isolation strong enough to *discuss*
   untrusted code, but it is a learning implementation, **not security-audited** —
   never imply in docs or code that it is safe to expose as a service or feed
@@ -376,9 +403,10 @@ scripts/build-template.sh example --no-snapshot                 # + each built t
 - Before changing the isolation/transport layer, read `docs/ARCHITECTURE.md` to
   confirm the boundaries, then act.
 - The host control plane lives in `services/` (Go module `microsandbox/services`):
-  `cmd/{api,client-proxy,orchestrator,msb-seed}` are the binaries (`msb-seed` publishes the baked
-  default/script-built templates into the object store — dev/test glue),
-  `pkg/{fc,pool,network,proxy,template,store,catalog,storage,build,uffd}` the libraries, `proto/` the gRPC
+  `cmd/{api,client-proxy,orchestrator,msb-seed,msb-rootfs-stat}` are the binaries (`msb-seed` publishes the
+  baked default/script-built templates into the object store — dev/test glue),
+  `pkg/{fc,pool,network,proxy,template,store,catalog,storage,build,uffd,nbd,block}` the libraries (`nbd` = the
+  Stage-21 NBD device pool + userspace server; `block` = the COW block stack served over it), `proto/` the gRPC
   contract (`orchestrator` + `templatemanager`; generated stubs in `pkg/grpc/`, committed — rerun
   `scripts/gen-proto.sh` only when a `.proto` changes, which needs `protoc`). Host-side
   changes take effect at the next `scripts/build-services.sh`; no rootfs rebuild needed
