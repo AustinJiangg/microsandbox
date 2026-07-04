@@ -128,6 +128,14 @@ func Materialize(ctx context.Context, sp StorageProvider, key, dst string) error
 	if _, err := os.Stat(dst); err == nil {
 		return nil // cache hit: the baked local path already holds this artifact
 	}
+	return downloadObject(ctx, sp, key, dst)
+}
+
+// downloadObject copies the whole object at key to dst, unconditionally (no cache-hit check -- the
+// caller decides whether dst is a cache). The write is atomic (temp + rename). Shared by Materialize
+// (with the cache-hit skip in front) and MaterializeMemfileFull's no-header (raw memfile) fallback,
+// which always (re)writes a fresh temp path.
+func downloadObject(ctx context.Context, sp StorageProvider, key, dst string) error {
 	rc, err := sp.Open(ctx, key)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", key, err)

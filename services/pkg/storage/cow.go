@@ -127,6 +127,15 @@ func MaterializeLayered(ctx context.Context, sp StorageProvider, buildID, dst st
 	if h == nil {
 		return Materialize(ctx, sp, ArtifactKey(buildID, RootfsName), dst) // non-layered: whole-object download
 	}
+	return assembleMapping(ctx, sp, h.Mapping, int64(h.Metadata.Size), dst, RootfsName)
+}
+
+// assembleMapping writes the runs of mapping into a fresh file at dst, sized to size: it truncates to
+// the full logical size (so gaps and zero-owner runs cost nothing -- served by the file's own zero
+// fill) and copies each present run from its owning build's fileName object. The write is atomic (temp +
+// rename), so a concurrent reader never sees a partial file. Shared by MaterializeLayered (fileName =
+// rootfs.ext4) and MaterializeMemfileFull (fileName = memfile) -- Stage 20 keeps the two symmetric.
+func assembleMapping(ctx context.Context, sp StorageProvider, mapping header.Mapping, size int64, dst, fileName string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -137,12 +146,12 @@ func MaterializeLayered(ctx context.Context, sp StorageProvider, buildID, dst st
 	}
 	// Size the file to the full logical size up front; gaps and zero-owner runs are then served by the
 	// file's own zero fill, so only present runs cost a read + write.
-	if err := f.Truncate(int64(h.Metadata.Size)); err != nil {
+	if err := f.Truncate(size); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
 	}
-	if err := assembleRuns(ctx, sp, h.Mapping, f); err != nil {
+	if err := assembleRuns(ctx, sp, mapping, f, fileName); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -155,9 +164,9 @@ func MaterializeLayered(ctx context.Context, sp StorageProvider, buildID, dst st
 }
 
 // assembleRuns copies each present run of mapping into f at its logical offset, reading from the run's
-// owning build's rootfs object. A per-owner reader cache opens each {owner}/rootfs.ext4 once. A
-// zero-owner ("") run is skipped -- the truncated file is already zero there.
-func assembleRuns(ctx context.Context, sp StorageProvider, mapping header.Mapping, f *os.File) error {
+// owning build's fileName object (rootfs.ext4 or memfile). A per-owner reader cache opens each
+// {owner}/{fileName} once. A zero-owner ("") run is skipped -- the truncated file is already zero there.
+func assembleRuns(ctx context.Context, sp StorageProvider, mapping header.Mapping, f *os.File, fileName string) error {
 	cache := map[string]RangeReader{}
 	defer func() {
 		for _, r := range cache {
@@ -168,9 +177,9 @@ func assembleRuns(ctx context.Context, sp StorageProvider, mapping header.Mappin
 		if r, ok := cache[owner]; ok {
 			return r, nil
 		}
-		r, err := sp.OpenReaderAt(ctx, ArtifactKey(owner, RootfsName))
+		r, err := sp.OpenReaderAt(ctx, ArtifactKey(owner, fileName))
 		if err != nil {
-			return nil, fmt.Errorf("open owner %q rootfs: %w", owner, err)
+			return nil, fmt.Errorf("open owner %q %s: %w", owner, fileName, err)
 		}
 		cache[owner] = r
 		return r, nil
@@ -219,6 +228,152 @@ func copyRange(src io.ReaderAt, dst io.WriterAt, srcOff, dstOff, length int64, b
 		if got == 0 {
 			return io.ErrUnexpectedEOF // no progress and no error: a stuck source
 		}
+	}
+	return nil
+}
+
+// --- Stage 20: memfile copy-on-write -------------------------------------------------------------
+//
+// The memfile (guest RAM) mirrors the rootfs COW above, differing only in transport (the boot path
+// serves it lazily over UFFD via uffd.NewLayeredSource, never assembling it whole) and in production
+// (a live-VM re-snapshot, not a docker+debugfs delta -- see docs/STAGE20_DESIGN.md). The algebra is
+// identical: BuildDiff classifies each block vs the base (changed-non-zero -> child-owned, changed-to-
+// zero -> zero-owner override, unchanged -> resolves to base), MergeMappings flattens onto the base,
+// and a v2 header records the flattened owners. MaterializeMemfileFull is the diff-time expander (not a
+// boot path): it exists only so a child's full memfile can be diffed against the base's full memfile.
+
+// memfileOwnedMapping resolves a parsed memfile header's runs to owned runs for COW assembly/merge. A
+// v1 (Stage 17) memfile header lists only present runs with NO owner -- they live in the build's own
+// compacted {buildID}/memfile object, so we stamp buildID as their owner (its gaps stay uncovered and
+// read as zeros). A v2 (layered, Stage 20) header already carries per-run owners across the chain
+// (including "" zero-owner runs), so it is used as-is. This is the one place the memfile diverges from
+// the rootfs, which has no v1 (unowned) header form.
+func memfileOwnedMapping(h *header.Header, buildID string) header.Mapping {
+	if h.Metadata.Version >= header.VersionLayered {
+		return h.Mapping
+	}
+	out := make(header.Mapping, len(h.Mapping))
+	for i, m := range h.Mapping {
+		m.Owner = buildID
+		out[i] = m
+	}
+	return out
+}
+
+// MaterializeMemfileFull writes buildID's FULL (uncompacted) memfile to dst, expanding whatever it is
+// stored as: a Stage-17 compacted single-build memfile (v1 header -- present runs read from
+// {buildID}/memfile, gaps zero), a COW-layered memfile (v2 header -- each run read from its owning
+// build's object, zero-owner runs and gaps zero), or a pre-Stage-17 raw memfile (no header -- copied
+// whole). It is the memfile analogue of MaterializeLayered, but the memfile is never *booted* from a
+// whole file -- this exists only so PublishMemfileDiff can diff a child's full memfile against the
+// base's full memfile at build time. dst is always (re)written (no cache-hit skip): the caller passes a
+// fresh temp path.
+func MaterializeMemfileFull(ctx context.Context, sp StorageProvider, buildID, dst string) error {
+	h, err := OpenMemfileHeader(ctx, sp, buildID)
+	if err != nil {
+		return err
+	}
+	if h == nil {
+		return downloadObject(ctx, sp, ArtifactKey(buildID, MemfileName), dst) // pre-Stage-17 raw memfile
+	}
+	return assembleMapping(ctx, sp, memfileOwnedMapping(h, buildID), int64(h.Metadata.Size), dst, MemfileName)
+}
+
+// PublishMemfileDiff stores childMemfilePath as a copy-on-write diff over the base build's memfile (the
+// memfile analogue of PublishRootfsDiff, Stage 20). It uploads {childBuildID}/memfile holding only the
+// child's changed (non-zero) RAM blocks and {childBuildID}/memfile.header carrying the flattened v2
+// mapping that points unchanged ranges at the base's (and its ancestors') objects. The boot path serves
+// it lazily over UFFD via the multi-owner page source (uffd.NewLayeredSource, Stage 20a).
+//
+// It materializes the base's full memfile to a temp file to diff against (expanding it if the base is
+// itself compacted or layered), so a chain of layers composes -- the child's flattened header references
+// whichever of its ancestors' objects last wrote each range. The child memfile MUST be the SAME logical
+// size as the base: a re-snapshot of the base VM keeps mem_size_mib fixed, so it is (a mismatch is a
+// build-config error, reported rather than silently diffing to ~everything).
+func PublishMemfileDiff(ctx context.Context, sp StorageProvider, baseBuildID, childMemfilePath, childBuildID string) error {
+	// 1) Materialize the base's full memfile and resolve its flattened mapping/metadata.
+	baseDir, err := os.MkdirTemp("", "msb-base-memfile-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(baseDir)
+	baseMemfile := filepath.Join(baseDir, "memfile")
+	if err := MaterializeMemfileFull(ctx, sp, baseBuildID, baseMemfile); err != nil {
+		return fmt.Errorf("materialize base memfile %q: %w", baseBuildID, err)
+	}
+	baseInfo, err := os.Stat(baseMemfile)
+	if err != nil {
+		return err
+	}
+	childInfo, err := os.Stat(childMemfilePath)
+	if err != nil {
+		return err
+	}
+	if baseInfo.Size() != childInfo.Size() {
+		return fmt.Errorf("memfile COW needs equal sizes: base %q is %d bytes, child %q is %d"+
+			" (the re-snapshot must keep mem_size_mib fixed)", baseBuildID, baseInfo.Size(), childBuildID, childInfo.Size())
+	}
+	baseHdr, err := OpenMemfileHeader(ctx, sp, baseBuildID)
+	if err != nil {
+		return err
+	}
+	// A no-header base resolves to one full run owned by itself (a raw whole memfile); a v1 base's
+	// present runs are owned by itself (its compacted object), gen 0 / chain root = itself; a v2 base
+	// contributes its already-flattened mapping and chain root.
+	baseMapping := header.SingleBuildMapping(uint64(baseInfo.Size()), baseBuildID)
+	baseGen, chainRoot := uint64(0), baseBuildID
+	if baseHdr != nil {
+		baseMapping = memfileOwnedMapping(baseHdr, baseBuildID)
+		if baseHdr.Metadata.Version >= header.VersionLayered {
+			baseGen = baseHdr.Metadata.Generation
+			chainRoot = baseHdr.Metadata.BaseBuildId
+		}
+	}
+
+	// 2) Diff the child against the assembled base: only changed (non-zero) blocks are written to the
+	//    diff object; changed-to-zero blocks become zero-owner runs; unchanged blocks resolve to the base.
+	baseF, err := os.Open(baseMemfile)
+	if err != nil {
+		return err
+	}
+	defer baseF.Close()
+	childF, err := os.Open(childMemfilePath)
+	if err != nil {
+		return err
+	}
+	defer childF.Close()
+	diffTmp, err := os.CreateTemp("", "msb-memfile-diff-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(diffTmp.Name())
+	childDiff, derr := header.BuildDiff(baseF, childF, childInfo.Size(), int64(header.DefaultBlockSize), childBuildID, diffTmp)
+	if cerr := diffTmp.Close(); derr == nil {
+		derr = cerr
+	}
+	if derr != nil {
+		return fmt.Errorf("diff child memfile: %w", derr)
+	}
+
+	// 3) Flatten the child's diff onto the base, build the v2 header, upload the diff object + header.
+	flat := header.NormalizeMappings(header.MergeMappings(baseMapping, childDiff))
+	h := header.Header{
+		Metadata: header.Metadata{
+			Version:     header.VersionLayered,
+			BlockSize:   header.DefaultBlockSize,
+			Size:        uint64(childInfo.Size()),
+			Generation:  baseGen + 1,
+			BuildId:     childBuildID,
+			BaseBuildId: chainRoot,
+		},
+		Mapping: flat,
+	}
+	if err := uploadLocalFile(ctx, sp, diffTmp.Name(), ArtifactKey(childBuildID, MemfileName)); err != nil {
+		return fmt.Errorf("upload memfile diff: %w", err)
+	}
+	hb := h.Serialize()
+	if err := sp.Upload(ctx, ArtifactKey(childBuildID, HeaderName), bytes.NewReader(hb), int64(len(hb))); err != nil {
+		return fmt.Errorf("upload memfile header: %w", err)
 	}
 	return nil
 }

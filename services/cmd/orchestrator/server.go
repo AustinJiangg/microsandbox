@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"microsandbox/services/pkg/pool"
 	"microsandbox/services/pkg/proxy"
 	"microsandbox/services/pkg/storage"
+	"microsandbox/services/pkg/storage/header"
 	"microsandbox/services/pkg/template"
 	"microsandbox/services/pkg/uffd"
 )
@@ -303,18 +305,23 @@ func (s *server) prepareRestore(tmpl template.Template) (uffd.PageSource, error)
 	if err := storage.Materialize(ctx, s.storage, storage.ArtifactKey(buildID, storage.SnapfileName), vmstate); err != nil {
 		return nil, err
 	}
+	// Resolve the memfile header first to pick the page source (opening the buildID object is deferred to
+	// after, so a layered memfile -- which opens each owner lazily -- doesn't open a redundant reader):
+	//   - no header   -> a pre-Stage-17 raw full memfile: stream it whole (chunkedSource).
+	//   - v1 header    -> a Stage-17 compacted single-build memfile: remap logical->physical (mappedSource).
+	//   - v2 header    -> a Stage-20 COW-layered memfile: pages resolve to different owning builds
+	//                     ({owner}/memfile), served over the multi-owner layered source.
+	hdr, err := storage.OpenMemfileHeader(ctx, s.storage, buildID)
+	if err != nil {
+		return nil, err
+	}
+	if hdr != nil && hdr.Metadata.Version >= header.VersionLayered {
+		return s.layeredMemSource(hdr), nil
+	}
 	// Stream the memfile page-by-page from the bucket via UFFD -- the Stage-15 payoff. The reader is
 	// owned by the uffd handler from here (closed on Destroy); 0 selects the default chunk size.
 	rr, err := s.storage.OpenReaderAt(ctx, storage.ArtifactKey(buildID, storage.MemfileName))
 	if err != nil {
-		return nil, err
-	}
-	// Stage 17: if the build carries a memfile header, {buildID}/memfile is COMPACTED -- resolve each
-	// faulting logical offset through the header's mapping (gaps served as zeros, no fetch). Without a
-	// header it is the raw full memfile (a pre-Stage-17 bucket) -- stream it whole as before.
-	hdr, err := storage.OpenMemfileHeader(ctx, s.storage, buildID)
-	if err != nil {
-		rr.Close()
 		return nil, err
 	}
 	if hdr == nil {
@@ -325,6 +332,26 @@ func (s *server) prepareRestore(tmpl template.Template) (uffd.PageSource, error)
 		extents[i] = uffd.Extent{Logical: int64(m.Offset), Length: int64(m.Length), Physical: int64(m.BuildStorageOffset)}
 	}
 	return uffd.NewMappedSource(rr, rr.Close, extents, int64(hdr.Metadata.Size), 0), nil
+}
+
+// layeredMemSource builds the multi-owner UFFD page source for a COW-layered (v2) memfile (Stage 20):
+// each run names the build whose {owner}/memfile object holds those bytes, so a faulting page is read
+// from THAT build's object (a zero-owner run or a gap -> zeros, no fetch) -- E2B's fault -> owning build
+// -> that build's diff, over UFFD. The opener maps an owner to its object lazily (opened once per owner
+// actually faulted into, then range-read through its own chunk cache), keeping pkg/uffd storage-free.
+func (s *server) layeredMemSource(hdr *header.Header) uffd.PageSource {
+	extents := make([]uffd.Extent, len(hdr.Mapping))
+	for i, m := range hdr.Mapping {
+		extents[i] = uffd.Extent{Logical: int64(m.Offset), Length: int64(m.Length), Physical: int64(m.BuildStorageOffset), Owner: m.Owner}
+	}
+	open := func(owner string) (io.ReaderAt, func() error, error) {
+		rr, err := s.storage.OpenReaderAt(context.Background(), storage.ArtifactKey(owner, storage.MemfileName))
+		if err != nil {
+			return nil, nil, err
+		}
+		return rr, rr.Close, nil
+	}
+	return uffd.NewLayeredSource(extents, int64(hdr.Metadata.Size), 0, open)
 }
 
 // prepareSpawn ensures a cold start's rootfs is at its baked local path, materializing it from object
