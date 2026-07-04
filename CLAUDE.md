@@ -257,7 +257,7 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   COW layers / chunk cache all consume. See `docs/STAGE17_DESIGN.md`.
 - **Done (Stage 18 — storage depth (2): COW layered rootfs builds)**: E2B's real **copy-on-write layering**,
   banked on the **rootfs** (a build-time block diff is meaningful there; the memfile needs live-VM
-  re-snapshotting → Stage 19). 18a grew `pkg/storage/header` into the full COW algebra — a per-entry **build
+  re-snapshotting → Stage 20). 18a grew `pkg/storage/header` into the full COW algebra — a per-entry **build
   owner** as a header-local **build-table index** (not a uuid → zero new deps), `Metadata`
   `BuildId`/`BaseBuildId`/`Generation`, **format v2** alongside the Stage-17 v1 memfile, and
   `CreateMapping`/`MergeMappings`/`NormalizeMappings`/`BuildDiff`/`Locate`. 18b added the `pkg/storage` mechanism

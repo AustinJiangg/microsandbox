@@ -85,10 +85,10 @@
 
 - **The memfile stays single-build (Stage 17), not layered.** A meaningful memfile diff requires the **same
   VM continuing** (restore base → run → re-snapshot with dirty tracking); two *independent* memfile snapshots
-  differ everywhere (ASLR, timers) so a build-time byte-compare is meaningless. Memfile COW is **Stage 19**
+  differ everywhere (ASLR, timers) so a build-time byte-compare is meaningless. Memfile COW is **Stage 20**
   (§11) — it needs live-VM snapshot creation + the UFFD multi-build read; it *consumes* this stage's header.
 - **No live-VM snapshotting, no Firecracker diff-snapshot/dirty-bitmap.** Our "dirty" is a build-time block
-  compare, not Firecracker's runtime dirty tracking (Decision 2). The live flow is Stage 19.
+  compare, not Firecracker's runtime dirty tracking (Decision 2). The live flow is Stage 20.
 - **The rootfs is still materialized whole (assembled), not NBD-streamed.** Lazy rootfs streaming over the
   same header is the **NBD stage** (`docs/STAGE17_DESIGN.md` §10 item 1). This stage exercises the multi-build
   read at *materialize* time; NBD would later serve the same layered header *lazily*.
@@ -190,14 +190,14 @@ last wrote them — **no recursion at boot**.
 
 ## 4. Key design decisions
 
-### Decision 1 — COW the **rootfs** (build-time block diff), defer the memfile to Stage 19 (with the user)
+### Decision 1 — COW the **rootfs** (build-time block diff), defer the memfile to Stage 20 (with the user)
 A build-time byte/block compare yields a **meaningful** diff only when unchanged blocks are bit-identical
 between base and child. That holds for the **rootfs** (a filesystem image: B = A + installed files shares
 almost all disk blocks) but **not** for the **memfile**: two independent boot snapshots differ across nearly
 every page (ASLR, timers, allocation order), so diffing them would store almost the whole image — defeating
 COW. A meaningful memfile diff needs the **same VM continuing** (restore base → run → re-snapshot), i.e. live-
 VM snapshot creation — a whole lifecycle subsystem. So this stage banks the **full COW header/merge/multi-
-build-read mechanism** on the rootfs (where it pays off and stays KVM-free), and **Stage 19** consumes that
+build-read mechanism** on the rootfs (where it pays off and stays KVM-free), and **Stage 20** consumes that
 mechanism for the memfile once live snapshotting exists. This mirrors Stage 17→18 (bank the index, then the
 owner). The "store less" win is real here: a derived template's rootfs object holds only its changed blocks.
 
@@ -232,8 +232,8 @@ E2B's per-entry uuid.
 ### Decision 6 — format **v2** for the layered (rootfs) header; the memfile stays **v1** this stage
 The owner-bearing format is **Version 2**. The **rootfs** uses v2. The **memfile** keeps emitting the
 Stage-17 **v1** (single-build, no owner) header — its UFFD path is untouched this stage (memfile COW is Stage
-19). The deserializer dispatches on `Version`, so both coexist and an old (v1) memfile bucket still boots.
-Stage 19 migrates the memfile to v2 when it gains a real owner. Touch only what the stage owns.
+20). The deserializer dispatches on `Version`, so both coexist and an old (v1) memfile bucket still boots.
+Stage 20 migrates the memfile to v2 when it gains a real owner. Touch only what the stage owns.
 
 ### Decision 7 — the parity oracle stays behavioral (unchanged since Stage 11)
 Where a rootfs's blocks physically sit and which build owns them are invisible to the wire. The Python e2e
@@ -332,7 +332,7 @@ injectable executor; the assemble path is already covered by 18b.
 A new Python e2e: build `derived` with `base=default` + a `RUN pip install <small pkg>`, create a sandbox on it,
 assert the package imports (content carried) **and** that the stored rootfs diff is materially smaller than a
 full rootfs (the COW win). Finalize this doc's status + measured outcome; update `CLAUDE.md`, `docs/ARCHITECTURE.md`,
-the roadmap (§10 item 3 → done for the rootfs; memfile COW = Stage 19), and **apply the compression
+the roadmap (§10 item 3 → done for the rootfs; memfile COW = Stage 20), and **apply the compression
 correction** (§ "Correction" above) to STAGE15/STAGE17/roadmap. Full e2e re-run; 🟢 self-review.
 
 ## 7. Keeping tests green (honest trade-offs)
@@ -364,7 +364,7 @@ Stage 18 turns the Stage-17 single-build memfile index into E2B's **layered** st
 a build can be a **diff over a base**, the header records **which build owns** each run, `MergeMappings`
 flattens a layer chain, and the boot path **assembles** from the owning builds — so a derived template stores
 only its delta. The `pkg/storage/header` package now holds the full COW algebra (`CreateMapping`/`MergeMappings`/
-`NormalizeMappings`/`Resolve`), the shared substrate the **memfile COW** (Stage 19) and the **NBD-streamed
+`NormalizeMappings`/`Resolve`), the shared substrate the **memfile COW** (Stage 20) and the **NBD-streamed
 rootfs** both consume — the latter would serve *this same layered header* lazily instead of assembling.
 
 ## 10. Known divergences from E2B (verified against `e2b-dev/infra`; deferred or improved)
@@ -376,7 +376,7 @@ flatten + multi-build read + empty→zero), deliberately simpler or improved on 
 |---|---|---|---|
 | owner type | per-entry `uuid.UUID` | per-entry **build-table index** (uint32) | 🟢 improved (zero-dep, smaller) |
 | diff source | runtime **dirty bitset** (Firecracker diff snapshot / page tracking) | build-time **block compare** vs base image | 🟡 analogue (Decision 2) |
-| layered artifact | both **memfile and rootfs** layered | **rootfs only**; memfile single-build | 🔴 memfile COW deferred to Stage 19 (Decision 1) |
+| layered artifact | both **memfile and rootfs** layered | **rootfs only**; memfile single-build | 🔴 memfile COW deferred to Stage 20 (Decision 1) |
 | boot read | multi-build read, **lazy** (UFFD memfile / NBD rootfs) | multi-build read at **materialize** (assemble whole rootfs) | 🟡 lazy streaming = NBD stage |
 | flatten | `MergeMappings` at snapshot time | `MergeMappings` at build time | 🟢 faithful |
 | empty blocks | `empty` bitset → `uuid.Nil`, served as zeros | gap/zero owner (index 0), served as zeros | 🟢 faithful |
@@ -384,7 +384,7 @@ flatten + multi-build read + empty→zero), deliberately simpler or improved on 
 | **layout preservation** | base+child share a **persisted block device** mutated in place, so a child's diff is only the genuinely-changed blocks | **Stage 19:** a layered child copies the base's rootfs image and applies only its delta in place via `debugfs` (no re-mkfs), so unchanged files keep their blocks | 🟢 **closed in Stage 19** — the same `derived` diff dropped from 278.8 MiB (2.07×) to 28 KiB (0.0047%); see `docs/STAGE19_DESIGN.md` |
 | cross-node cache | NFS-wrapped shared chunks | per-build local object cache | 🟡 multi-host — deferred |
 
-## 11. Deferred follow-on — Stage 19 (memfile COW via live-VM snapshot), sketched
+## 11. Deferred follow-on — Stage 20 (memfile COW via live-VM snapshot), sketched (now designed in `docs/STAGE20_DESIGN.md`)
 
 The memfile half needs what this stage deliberately avoids: a **meaningful** memfile diff, which only the
 **same VM continuing** produces. Sketch of the later stage, consuming this stage's header:

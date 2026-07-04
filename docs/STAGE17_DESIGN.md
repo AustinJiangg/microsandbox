@@ -306,7 +306,7 @@ compaction), deliberately simpler on what the next items add. Verified against `
 | gaps | `BuildId == Nil` → zeros, never read | unmapped range → zeros, never read | ✅ faithful |
 | compaction | store only present/delta blocks | store only present blocks | ✅ faithful (single build) |
 | compression | optional zstd/lz4 in 2 MiB frames (V4/V5); raw V3 still supported | raw blocks (we don't compress) | 🟡 orthogonal to COW — deferred optional depth (note below) |
-| build model | COW diff layers; header resolves a byte to its owning build | one flat build per memfile | ✅ **done for rootfs in Stage 18** (memfile = Stage 19) |
+| build model | COW diff layers; header resolves a byte to its owning build | one flat build per memfile | ✅ **done for rootfs in Stage 18** (memfile = Stage 20) |
 | rootfs | same header, served lazily over **NBD** | rootfs still materialized whole (memfile-only header) | 🔴 **deferred** (item 1; Stage 18 assembles, NBD streams) |
 | cross-node cache | NFS-wrapped shared chunks | per-VM local chunk cache | 🟡 multi-host — **deferred** (item 4) |
 
@@ -324,7 +324,7 @@ compaction), deliberately simpler on what the next items add. Verified against `
 2b. **Compression** — a genuine but **optional** E2B mechanism (V4/V5 2 MiB frames, zstd/lz4; raw V3 still supported), orthogonal to COW and deferred here; see the correction above.
 3. **COW layered builds** — ✅ **done for the rootfs in Stage 18** (the per-entry `BuildId`/`BaseBuildId` +
    build-table owner; a child stores only its diff and points unchanged ranges at the parent — E2B's `BuildMap`).
-   The **memfile** half is Stage 19 (it needs live-VM re-snapshotting). Honest caveat: on our re-export pipeline
+   The **memfile** half is Stage 20 (it needs live-VM re-snapshotting). Honest caveat: on our re-export pipeline
    the rootfs diff is bounded (~2×) until block-layout preservation lands — see `docs/STAGE18_DESIGN.md`.
 4. **Cross-node chunk cache** — once multi-host lands, share fetched chunks between orchestrators (E2B's
    NFS wrap).
