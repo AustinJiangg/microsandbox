@@ -1,17 +1,22 @@
 # Stage 20 design — storage depth (4): COW layered **memfile** via live-VM re-snapshot
 
-> Status: **design, pending user go-ahead on 20a.** This closes the one artifact E2B layers that we
-> still store per-build in full: the **memfile** (guest RAM snapshot). Stages 17–19 banked everything
-> the algebra needs — a per-block `.header` index (17), the COW owner/`MergeMappings` machinery + a
-> rootfs diff proof (18), and layout preservation so the diff is the genuine delta (19). Stage 20
-> applies that *same* machinery to RAM. Read `docs/STAGE17_DESIGN.md` (the header) and
-> `docs/STAGE18_DESIGN.md` (the COW algebra) first.
+> Status: **implemented; 20c e2e pending a real-VM run.** 20a (multi-owner page source, `34d0a8f`),
+> 20b (the KVM-free COW algebra + the layered read wiring, `99abb8c`), and 20c-1 (the live-VM producer +
+> build wiring, `058757d`) have landed and are green under `go test ./services/...`. 20c-2 (the real-VM
+> e2e `test_layered_snapshot_via_api` + the `msb-memfile-stat` probe) is written and awaits a run on a
+> box with KVM/firecracker/docker/MinIO in **`--nbd` s3 mode**. This closes the one artifact E2B layers
+> that we still stored per-build in full: the **memfile** (guest RAM snapshot). Stages 17–19 banked the
+> algebra — a per-block `.header` index (17), the COW owner/`MergeMappings` machinery + a rootfs diff proof
+> (18), and layout preservation (19); Stage 20 applies that *same* machinery to RAM.
 >
-> **Honest headline (to be measured in 20c, not promised now):** the win is that N child templates
-> sharing a base no longer each store a full compacted memfile (~228 MiB, Stage 17); each stores only
-> the RAM pages that differ from the base. How small that diff is depends entirely on *how much RAM the
-> child actually changes* — the empirical question 20c answers with a number, exactly as Stage 18/19
-> measured the rootfs diff.
+> **The producer fork was decided here (see §5 D5, updated).** Stage 21's research corrected the original
+> D5: E2B does NOT graft a base's RAM onto a child's rootfs — it resumes the *parent* self-consistently
+> and runs the layer's command in-guest. Full fidelity needs an in-guest command-execution subsystem (+ a
+> writable overlay) we don't have. Of the reachable options we chose the E2B-closest: **resume the base
+> self-consistently, re-snapshot, and diff — no grafting, no in-guest command** (Fork B). The honest
+> consequence is that the child's RAM is the base's warm RAM plus only the tiny delta of
+> resume→health→re-snapshot, so the memfile diff is *maximally* small (a big COW win) but does **not**
+> carry a per-child warm working set. The measured diff is 20c-2's headline number.
 
 ## 1. Where this sits
 
@@ -112,13 +117,23 @@ the stale wording — correcting those committed docs is a separate, user-approv
   Stage-17 wiring (`prepareRestore` stops dropping the owner even in the single-build case). *Alternative:* add
   a separate `layeredSource` and branch by header version — smaller blast radius, but two code paths where E2B
   has one. Per "choose closer to E2B," unify.
-- **D5 — how the child's RAM gets a (meaningful) diff.** E2B runs the *layer's build commands in the guest*,
-  which dirties RAM. Our layers change the **rootfs** via docker (Stage 19), not via in-guest commands — so the
-  producer **restores the base, re-runs the warm-up (health + a prime cell), pauses, and re-snapshots**; the
-  diff captures whatever the warm-up changed. For 20c's e2e to actually exercise cross-owner reads, the child
-  primes something the base did not (e.g. importing a module the child `RUN pip install`'d), so some faults
-  resolve to the child and most to the base. **Honest divergence:** running the layer's *actual* build commands
-  in-guest (E2B's model) is a deeper convergence tied to a start/ready-command subsystem — deferred (§10).
+- **D5 — how the child's RAM gets a diff (REVISED after Stage 21's research; the fork this stage decided).**
+  The original D5 proposed *grafting* (restore the base's RAM but attach the **child's** rootsfs + a
+  child-specific prime). Stage 21's read of `e2b-dev/infra` **corrected** this: E2B does NOT graft — it
+  resumes the *parent* layer **self-consistently** (parent RAM over UFFD + parent rootfs over NBD) and runs
+  the layer's command **in the guest**, dirtying both RAM and disk, then snapshots both. Full fidelity therefore
+  needs an in-guest command-execution subsystem (start/ready-command) **and** a writable rootfs overlay (Stage
+  21b built it, RO-wired) — a re-architecture that would also replace our docker+debugfs rootfs (Stages 6–19).
+  That is out of a single stage's scope. Of the *reachable* options (see the four in `docs/STAGE21_DESIGN.md`
+  §9), we chose the **E2B-closest one that avoids grafting: resume the BASE self-consistently (its own RAM +
+  its own rootfs at its own baked path), re-snapshot, and diff — no in-guest command, no grafting.** The
+  producer is literally `restoreHealthy(baseTmpl)` (the exact restore a user create takes) + `fc.Snapshot` +
+  `PublishMemfileDiff`. **Honest consequence:** the child's RAM is the base's warm RAM plus only the delta of
+  resume → health-probe → re-snapshot, so the diff is *maximally* small (the strongest COW win) but carries no
+  per-child warm working set. Running the layer's actual command in-guest to warm child-specific RAM is the
+  deferred deeper convergence (needs the subsystem above). Because the child bakes the BASE's rootfs path, the
+  produced snapshot is **restorable only under `--nbd`** (the child's own rootfs is served at that path via the
+  per-VM bind), which the producer enforces.
 - **D6 — skip parent-dedup / promotion.** E2B additionally dedups a page against *any* ancestor (not just the
   immediate base) with a budget/promotion pass (`parentByKey`). We classify only three ways vs the immediate
   base — correct layered reads, just less storage-optimal. A pure storage optimization, not a correctness
@@ -183,7 +198,7 @@ shell-only), a precondition for pause/resume-style features.
 | flatten | `MergeMappings`+`NormalizeMappings` at build | same | 🟢 faithful |
 | serve | fault → owner → that build's object; `uuid.Nil` → zeropage | multi-owner `mappedSource` | 🟢 faithful |
 | owner id | per-entry `uuid.UUID` | header-local build index | 🟢 improved (zero-dep, smaller) |
-| what dirties RAM | the layer's **build commands run in-guest** | restore base → **warm-up/prime** → re-snapshot | 🟡 analogue (D5); in-guest build commands deferred (start/ready-command subsystem) |
+| what dirties RAM | the layer's **build commands run in-guest** (parent resume, self-consistent) | **resume the BASE self-consistently** → health-probe → re-snapshot (no grafting, no in-guest command) | 🟡 same self-consistent-resume shape as E2B; the in-guest layer command is deferred (start/ready-command subsystem + writable overlay), so the child carries no per-child warm working set — D5 (revised) |
 | parent-dedup | dedup vs any ancestor + promotion budget | dedup vs immediate base only | 🟡 storage-only optimization deferred (D6) |
 | compression | optional zstd/lz4, 2 MiB frames, V4/V5 (raw V3 too) | raw (v2 header) | 🟡 orthogonal, optional — deferred (D3), **not** "not-E2B" |
 | memfile transport | UFFD | UFFD | 🟢 faithful |

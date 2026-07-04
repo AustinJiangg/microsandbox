@@ -291,12 +291,31 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   `MaterializeLayered` / boot / api / SDK all **unchanged**. **Measured: the same `derived` (default + one `RUN`) now
   stores a 28 KiB rootfs diff over the 576 MiB base — 0.0047%, down from Stage 18's 278.8 MiB / 48%, ~10,000×
   smaller (≈ the genuine delta).** e2e **44/44** in s3 mode. See `docs/STAGE19_DESIGN.md`.
-- **Paused (Stage 20 — memfile COW via live-VM re-snapshot)**: designed + 20a (`34d0a8f`, the multi-owner
-  memfile page source) landed; 20b-1 (the KVM-free memfile COW algebra in `pkg/storage/cow.go`) is done +
-  green but **left uncommitted in the working tree by choice**, to merge into 20b when the live-VM producer
-  lands. It was paused because a faithful producer needs a **stable rootfs device path** (vanilla Firecracker
-  bakes the rootfs's absolute path into the snapshot and cannot override it on load) — so **Stage 21 (NBD)
-  was inserted first**. See `docs/STAGE20_DESIGN.md`.
+- **Done (Stage 20 — storage depth (4): COW layered memfile via live-VM re-snapshot)**: the **last artifact
+  E2B layers that we stored per-build in full** (the memfile / guest RAM) is now a **COW diff over the base**,
+  served lazily over UFFD by the same `pkg/storage/header` algebra as the rootfs. **20a** (`34d0a8f`) the
+  multi-owner page source (`uffd.NewLayeredSource` — a fault resolves to its owning build's object, zero-owner
+  → zeros). **20b** (`99abb8c`) the KVM-free algebra (`storage.PublishMemfileDiff` = materialize the base's full
+  memfile, `header.BuildDiff` the child against it, `MergeMappings` → a flattened v2 header, upload only changed
+  non-zero blocks; `MaterializeMemfileFull` the diff-time expander) + the layered read wiring (`prepareRestore`
+  routes a v2 memfile through the multi-owner source, v1 stays on `NewMappedSource` — zero regression). **20c-1**
+  (`058757d`) the **live-VM producer**: `fc.MicroVM.Snapshot` (pause + Full snapshot-create, previously
+  shell-only) + the orchestrator's `LayeredSnapshot` (injected into `pkg/build` as a `Snapshotter`) — a layered
+  build with a snapshot no longer runs `build-snapshot.sh`; instead it **resumes the base self-consistently**
+  (`restoreHealthy(baseTmpl)`), re-snapshots, and stores the child's memfile as a COW diff + records the baked
+  rootfs path (`fc.RootfsBacking.BakedPath`, bound at restore over the **base's** path since the child's vmstate
+  is a re-snapshot of the base). **The producer fork was decided here** (see `docs/STAGE20_DESIGN.md` D5,
+  revised): Stage 21's research showed E2B resumes the *parent* self-consistently + runs the layer's command
+  in-guest (NOT grafting base RAM onto a child rootfs); full fidelity needs an in-guest command subsystem +
+  writable overlay we lack, so we took the **E2B-closest reachable option — self-consistent base resume, no
+  grafting, no in-guest command**. **Honest consequence:** the child's RAM is the base's warm RAM plus only the
+  resume→health→re-snapshot delta — a *maximal* COW win, but no per-child warm working set. A layered snapshot is
+  **restorable only under `--nbd`** (the child's rootfs is served at the base's baked path via the per-VM bind;
+  the producer enforces it). **Not a single-box speedup** (net setup dominates restore). **20c-2** (this stage's
+  tail): the real-VM e2e `test_layered_snapshot_via_api` (build `derived_snap` over `default` with a snapshot,
+  restore over `--nbd`, assert boot + child disk content + code runs) + a `msb-memfile-stat` probe asserting the
+  stored memfile diff is a small fraction of the base's compacted memfile — **written, pending a KVM run in
+  `--nbd` s3 mode** (`MSB_ORCH_FLAGS=--nbd`). Go units green. See `docs/STAGE20_DESIGN.md`.
 - **Done (Stage 21 — NBD-served rootfs: lazy block streaming)**: the last "materialized whole" artifact is now
   streamed lazily — the rootfs is served to the guest over a **kernel NBD device (`/dev/nbdX`)** whose blocks
   our userspace server resolves through the same `pkg/storage/header` COW mapping + chunked bucket reader as
@@ -317,12 +336,13 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   single-box speedup** — unpooled restore is *slower* (~3.5s vs ~1.6s) because the guest faults its working
   set over NBD on first access; the warm pool hides it. Real-VM e2e **44/44** in `--nbd` s3 mode (cold-start +
   restore + concurrent restores + layered template all boot over NBD). See `docs/STAGE21_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): **resume Stage 20** (memfile COW; now unblocked by
-  the stable NBD device path — the faithful producer resumes the parent over UFFD+NBD, runs the layer's
-  command in-guest, re-snapshots, and diffs both artifacts, which needs an in-guest command-execution path to
-  build) and with it the writable-overlay `rw` rootfs (Stage 21b, wired + waiting); then production fidelity —
-  multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript SDK; a
-  cross-node chunk cache; and auth depth (a key-management API, token expiry/rotation, TLS). Note:
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): **deepen the Stage-20 memfile producer to full
+  E2B fidelity** — an **in-guest command-execution subsystem** (start/ready commands) so a layer runs its
+  actual command in the guest, dirtying a per-child warm working set, plus the **writable-overlay `rw` rootfs**
+  (Stage 21b, built + wired + waiting) so that run's disk writes and RAM are captured by one self-consistent
+  re-snapshot (E2B's two-diffs-from-one-run model, replacing our docker+debugfs rootfs). Then production
+  fidelity — multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript
+  SDK; a cross-node chunk cache; and auth depth (a key-management API, token expiry/rotation, TLS). Note:
   memfile/rootfs **compression IS an optional E2B mechanism** (V4/V5 headers, zstd/lz4 in 2 MiB frames, raw V3
   still supported, orthogonal to COW); we still store raw, so it stays deferred optional depth.
 
@@ -403,8 +423,9 @@ scripts/build-template.sh example --no-snapshot                 # + each built t
 - Before changing the isolation/transport layer, read `docs/ARCHITECTURE.md` to
   confirm the boundaries, then act.
 - The host control plane lives in `services/` (Go module `microsandbox/services`):
-  `cmd/{api,client-proxy,orchestrator,msb-seed,msb-rootfs-stat}` are the binaries (`msb-seed` publishes the
-  baked default/script-built templates into the object store — dev/test glue),
+  `cmd/{api,client-proxy,orchestrator,msb-seed,msb-rootfs-stat,msb-memfile-stat}` are the binaries (`msb-seed`
+  publishes the baked default/script-built templates into the object store; `msb-{rootfs,memfile}-stat` are the
+  e2e COW-win probes for the layered rootfs (Stage 19) / memfile (Stage 20) — all dev/test glue),
   `pkg/{fc,pool,network,proxy,template,store,catalog,storage,build,uffd,nbd,block}` the libraries (`nbd` = the
   Stage-21 NBD device pool + userspace server; `block` = the COW block stack served over it), `proto/` the gRPC
   contract (`orchestrator` + `templatemanager`; generated stubs in `pkg/grpc/`, committed — rerun

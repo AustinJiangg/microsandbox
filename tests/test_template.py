@@ -90,3 +90,52 @@ def test_layered_template_via_api(api_template_build):
     )
     stored, full = map(int, stat.stdout.strip().splitlines()[-1].split())
     assert stored < full // 50, f"layered rootfs stored {stored}B is not << full {full}B (layout not preserved?)"
+
+
+SNAP_MARKER = "/etc/microsandbox-derived-snap"
+
+
+def test_layered_snapshot_via_api(api_template_build):
+    """Stage 20: build a COW-layered template WITH a snapshot, restore it, and assert the memfile COW win.
+
+    Unlike test_layered_template_via_api (with_snapshot=False, cold-start), this asks for a warm snapshot.
+    A layered build no longer boots its own rootfs to snapshot it (a fresh-boot memfile differs from the
+    base everywhere -- no COW win); instead the orchestrator's live-VM producer RESUMES the base
+    self-consistently, re-snapshots, and stores the child's memfile as a COW DIFF over the base's (only the
+    RAM blocks that differ). We then RESTORE from that snapshot (from_snapshot=True): the child's rootfs
+    streams over NBD at the base's baked path, and its memfile streams over UFFD from the multi-owner page
+    source (mostly base pages, a few child-owned). Asserting the VM boots, carries the child's disk content,
+    and runs code proves the layered snapshot is a valid, restorable image.
+
+    Requires --nbd (a layered child's rootfs is served at the base's baked path over NBD -- the producer
+    refuses to build one otherwise) and s3 mode (COW needs object storage).
+    """
+    orch_flags = os.environ.get("MSB_ORCH_FLAGS", "")
+    if "--storage local-fs" in orch_flags:
+        pytest.skip("layered COW builds need object storage (s3 mode)")
+    if "--nbd" not in orch_flags:
+        pytest.skip("layered snapshots require --nbd (run with MSB_ORCH_FLAGS=--nbd)")
+
+    base_url = api_template_build
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    dockerfile = f'FROM microsandbox-agent\nRUN echo "derived snapshot layer" > {SNAP_MARKER}\n'
+
+    build_template("derived_snap", dockerfile, base="default", with_snapshot=True, base_url=base_url)
+
+    # Restore (not cold-start) from the layered snapshot -- the path that exercises the COW memfile.
+    with Sandbox(template="derived_snap", from_snapshot=True, base_url=base_url) as sb:
+        assert "derived snapshot layer" in sb.files.read(SNAP_MARKER)
+        assert sb.run_code("print(6 * 7)").stdout.strip() == "42"
+
+    # The memfile COW win: the child's stored memfile diff must be a small fraction of the base's full
+    # compacted memfile (what a non-layered child would store, Stage 17 ~228 MiB). This is the decisive
+    # guard against the no-COW regression -- if the producer's Full snapshot did NOT fault every base page
+    # in over UFFD (writing zeros for un-faulted pages instead), the diff would balloon toward the full
+    # memfile and fail here. A quarter-of-base ceiling is loose (the real delta of resume->health->snapshot
+    # is far smaller -- see the printed ratio), yet catches the catastrophic case decisively.
+    stat = subprocess.run(
+        ["go", "run", "./services/cmd/msb-memfile-stat", "--name", "derived_snap"],
+        cwd=str(repo_root), capture_output=True, text=True, check=True,
+    )
+    stored, full = map(int, stat.stdout.strip().splitlines()[-1].split())
+    assert stored < full // 4, f"layered memfile diff {stored}B is not << base compacted {full}B (no COW win?)"
