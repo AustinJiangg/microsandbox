@@ -46,8 +46,8 @@ func main() {
 		"dir with build-rootfs.sh / build-snapshot.sh for template builds (default: sibling of --vendor-dir)")
 	useUffd := flag.Bool("uffd", false,
 		"in local-fs mode, restore snapshots over a userfaultfd page-fault handler (pkg/uffd) instead of the File backend (Stage 13). In s3 mode the memfile always streams over UFFD, so this is ignored")
-	useNBD := flag.Bool("nbd", false,
-		"serve the rootfs over an NBD block device streamed from object storage (Stage 21) instead of materializing it whole. s3 mode only; needs the nbd kernel module + root")
+	useNBD := flag.Bool("nbd", true,
+		"serve the rootfs over an NBD block device streamed from object storage as a per-VM writable overlay (Stage 21/22, the default since Stage 22b) instead of materializing it whole. s3 mode only; needs the nbd kernel module + root. --nbd=false reverts to the read-only materialized file (no writable rootfs, no layer producer)")
 	storageMode := flag.String("storage", "s3",
 		"artifact source (Stage 15): s3 (object storage, the default) or local-fs (read artifacts from --vendor-dir directly)")
 	s3Endpoint := flag.String("s3-endpoint", "127.0.0.1:9000", "S3/MinIO endpoint host:port (no scheme), for --storage s3")

@@ -56,8 +56,8 @@ sudo -n ip link set "$TAP" up
 
 cat > "$BASE/config.json" <<EOF
 { "boot-source": { "kernel_image_path": "$KERNEL",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init $IP_ARG" },
-  "drives": [ { "drive_id": "rootfs", "path_on_host": "$ROOTFS", "is_root_device": true, "is_read_only": true } ],
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init $IP_ARG" },
+  "drives": [ { "drive_id": "rootfs", "path_on_host": "$ROOTFS", "is_root_device": true, "is_read_only": false } ],
   "machine-config": { "vcpu_count": 1, "mem_size_mib": 512 },
   "network-interfaces": [ { "iface_id": "eth0", "host_dev_name": "$TAP", "guest_mac": "$GUEST_MAC" } ] }
 EOF

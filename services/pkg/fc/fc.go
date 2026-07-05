@@ -169,19 +169,30 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 	}
 	configPath := filepath.Join(workdir, "config.json")
 
+	// Stage 22b: an NBD-backed rootfs is a per-VM private writable overlay (block.Overlay over a shared
+	// read-only base), so the guest mounts root rw and its writes land in that VM's own cache -- E2B's
+	// model, and what lets the layer producer capture a disk diff. The legacy materialized-file path
+	// stays read-only: it is a shared per-template file, so a rw mount would corrupt it across VMs. So
+	// writability tracks whether the drive is an NBD device.
+	rootMode, readOnly := "ro", true
+	if rootfs.Device != "" {
+		rootMode, readOnly = "rw", false
+	}
+
 	// A single JSON declares the whole VM (--config-file, easy to read at a glance).
 	config := map[string]any{
 		"boot-source": map[string]any{
 			"kernel_image_path": filepath.Join(vendorDir, "vmlinux"),
-			// read-only root; init=/init runs our minimal PID 1, which execs the daemon. The
-			// ip= fragment makes the guest kernel configure eth0 at boot (no `ip` in the rootfs).
-			"boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init " + network.BootIPArg,
+			// init=/init runs our minimal PID 1, which execs the daemon. The ip= fragment makes the guest
+			// kernel configure eth0 at boot (no `ip` in the rootfs). root is rw over NBD (private overlay),
+			// else ro (shared file).
+			"boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda " + rootMode + " init=/init " + network.BootIPArg,
 		},
 		"drives": []any{map[string]any{
 			"drive_id":       "rootfs",
 			"path_on_host":   rootfsPath, // tmpl.Rootfs, or an NBD device (Stage 21c)
 			"is_root_device": true,
-			"is_read_only":   true, // read-only rootfs; all writes go to the in-VM tmpfs /tmp
+			"is_read_only":   readOnly, // writable over NBD (private overlay); read-only for the shared file
 		}},
 		"machine-config": map[string]any{"vcpu_count": vcpus, "mem_size_mib": memMiB},
 		// A virtio-net NIC backed by the netns's TAP -- the daemon's only transport now (Stage 12c
