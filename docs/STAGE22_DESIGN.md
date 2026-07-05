@@ -1,12 +1,29 @@
 # Stage 22 design — the E2B layer producer: run the layer's command **in-guest**, one snapshot → two consistent diffs
 
-> Status: **design, for review.** This stage exists because **Stage 20's e2e now fails on real KVM**
-> (its first run, this session). `tests/test_template.py::test_layered_snapshot_via_api` builds a
-> COW-layered template *with a snapshot*, restores it, and reads the file the layer's `RUN` wrote —
-> and the read returns **404 `no such file or directory`**. The failure is not flaky infra: it is the
-> direct symptom of the divergence Stage 20's own D5 (revised) deferred (`server.go:262`, *"we do NOT
-> run the layer's build command in-guest"*). Stage 22 closes it the way E2B does — and that is exactly
-> the "possible next" the roadmap and `CLAUDE.md` already name.
+> Status: **foundation landed (22a, 22b-1, 22b-2a); the producer (22b-2b) is implemented but blocked on a
+> Firecracker+NBD limitation — deferred.** This stage exists because **Stage 20's e2e failed on real KVM**
+> (its first run): `test_layered_snapshot_via_api` builds a COW-layered template *with a snapshot*, restores
+> it, and reads the file the layer's `RUN` wrote — and the read returned **404** because the Stage-20
+> producer grafted the base's RAM onto a separately-built child rootfs, so the base RAM's cached `/etc`
+> shadowed the child's disk change. Stage 22 closes it the E2B way (run the layer's command **in-guest**, one
+> snapshot → two consistent diffs).
+>
+> **Landed + verified (this session):** **22a** (`pkg/envdclient`, committed), **22b-1** (the rootfs COW
+> producer algebra — `header.MappingFromDirty` + `storage.PublishRootfsDiffBlocks`, KVM-free green), and
+> **22b-2a** (**every sandbox now boots a private writable rootfs overlay** — the D2 foundation; full e2e 19
+> passed + base-snapshot restore 3 passed incl. concurrent, zero regression).
+>
+> **22b-2b (the producer) — implemented and proven to WORK up to snapshot, then blocked.** The producer
+> resumes the base with the writable overlay, runs the layer's `RUN` command **in the guest** (verified: the
+> guest wrote the marker, the build succeeded, both COW diffs were published). But **restoring the produced
+> child snapshot panics Firecracker's virtio-blk device**: `InvalidAvailIdx { queue_size: 256, reported_len:
+> 12659 }`. Diagnosis (this session): it is specifically **writes to the NBD-backed rootfs before the
+> re-snapshot** — Stage-20's read-only re-snapshot restored fine, the file-backed base snapshot restores fine
+> (incl. concurrent), only the *written* NBD-backed re-snapshot's block-queue state is rejected on restore.
+> This is a deep Firecracker + kernel-NBD live-writable-snapshot consistency issue that needs its own focused
+> session (candidate directions in §11). The 22b-2b code (`server.go` producer, `build.go` producer path,
+> `test_template.py` assertion, the `envdclient` no-proxy fix) is **held out of the foundation commits** until
+> it restores cleanly.
 
 ## 1. The problem (why the Stage-20 snapshot is wrong)
 
@@ -98,11 +115,27 @@ consistent (RAM, disk) pair.** That is precisely what our producer lacks.
   single-box-appropriate impls) and keeps the blast radius on the *fix*. Streaming + start/ready-command is
   filed as Stage 23 (§9). *Chose closer-to-E2B on the mechanism that matters (in-guest execution), simpler
   on the transport.*
-- **D2 — the writable overlay is used only DURING the producer build; restore stays read-only (Stage 21c).**
-  The produced snapshot restores with a read-only NBD rootfs, as today. Correctness holds because the
-  producer `sync`s (D4): the file is on the child rootfs *and* in the restored RAM's page cache. A
-  per-restore writable overlay (E2B's runtime model, needed for stateful/pausable runtime sandboxes) is a
-  separate, deeper feature — deferred with Stage 23.
+- **D2 — every sandbox gets a private writable rootfs overlay (E2B's runtime model); non-NBD is retired as
+  the default.** (Chosen by the user over two smaller alternatives — see the fork below.) Restoring a
+  read-only-baked snapshot makes the producer, which uses the restore path, unable to write; and a writable
+  rootfs is only safe with **per-VM private storage** (the NBD overlay's private cache) — a *shared*
+  materialized file mounted rw would corrupt across VMs. So: the base snapshot bakes `root=/dev/vda rw` +
+  `is_read_only: false` (build-snapshot.sh), every `--nbd` spawn/restore binds a `block.NewOverlay(base,
+  cache)` with a per-VM sparse cache removed on Destroy (`buildRootfsBacking`), and `--nbd` becomes the
+  orchestrator default. Writability is gated on the drive being an NBD device: the legacy materialized-file
+  path stays `ro`/read-only (fc.go Spawn keys `rootMode`/`is_read_only` off `rootfs.Device`), so
+  `--nbd=false` still boots (read-only, no writable rootfs, no layer producer). The whole e2e migrates to
+  `--nbd` as its default path.
+  > **The fork (resolved).** Two smaller options were considered and rejected: **(A)** keep the guest
+  > mounting root `ro` and have only the producer `remount,rw` (writable in `--nbd`, minimal change) — the
+  > backward-compatible path; **(C)** a `drop_caches` workaround that keeps the docker+debugfs rootfs and
+  > only evicts the stale `/etc` page so the grafted disk becomes visible (simplest, but doesn't run the
+  > layer command in-guest — diverges from "the E2B way"). The user chose the fullest-fidelity option.
+  > **Honest cost:** this is the largest blast radius of any storage stage — it changes the rootfs semantics
+  > of *every* sandbox and requires the base snapshot rebuilt + the full e2e re-verified under a writable
+  > rootfs. A mount-state note: build-snapshot.sh now boots the base rootfs `rw`, so its throwaway boot
+  > writes ext4 mount state to the seeded file; the bucket base is seeded from that same file, so the
+  > restored guest's cached superblock matches (verified by the e2e booting cleanly).
 - **D3 — scope the one-run producer to layered builds *with a snapshot*.** A cold-start layered build
   (`with_snapshot=False`) has no snapshot and already boots its child rootfs fresh (no grafting), so its
   docker+debugfs rootfs is already correct (`test_layered_template_via_api` is green). Leave it. Only the
@@ -122,29 +155,38 @@ consistent (RAM, disk) pair.** That is precisely what our producer lacks.
 
 ## 6. Sub-steps (KVM-free first — the house discipline)
 
-### Stage 22a — envd in-guest command reach (Go client) + the writable producer binding
-- **Go→envd `Run` client** (`pkg/proxy` or a new `pkg/envdclient`): POST `envd.ProcessService/Run` to
-  `slot:49983` (Connect-JSON, like the Python SDK's `connect.py`), return stdout/stderr/exit. **KVM-free
-  unit test:** a stub HTTP server asserting the request shape + decoding a canned response.
-- **`buildRootfsBacking` writable variant** (`nbd.go`): a `buildWritableRootfsBacking` that binds
-  `block.NewOverlay(base, cache)` and exposes the `*Overlay` (for `ExportToDiff`). **KVM-free unit test:**
-  Overlay round-trip already covered by `overlay_test.go`; add a test that the orchestrator wires a cache
-  sized to the base. `go test ./services/...` green.
+### Stage 22a — Go→envd `Run` client ✅ (committed)
+`pkg/envdclient`: a hand-rolled Connect-JSON unary client that POSTs `envd.ProcessService/Run` to
+`http://<slot-ip>:49983` (the Go twin of the SDK's `connect.py`, zero new deps). 5 KVM-free unit tests
+(request shape, the proto3 `{}` empty-response, a non-zero exit, a Connect error, unreachable).
 
-### Stage 22b — the one-run producer + build wiring (algebra KVM-free; live path KVM)
-- **`Snapshotter.LayeredSnapshot` gains the layer commands** (`pkg/build`): the interface + the call site
-  pass the recipe's `RUN` commands. The build's *with-snapshot layered* path (`build.go`) stops calling
-  `build-rootfs-layered.sh` + `PublishRootfsDiff`, and lets the producer publish **both** diffs.
-- **The producer** (`server.go` `LayeredSnapshot`): resume the base with the **writable** backing → for each
-  `RUN` command `envdRun(vm, cmd)` (fail on non-zero exit) → `envdRun(vm, "sync")` → `vm.Snapshot` →
-  `PublishMemfileDiff` (unchanged) **and** `overlay.ExportToDiff()` → `PublishRootfsDiff`-shaped upload of the
-  captured blocks + header, owner = childBuildID. **KVM-free:** the export→publish glue is unit-testable with
-  a synthetic overlay diff; the live resume+run+snapshot is exercised by the e2e.
+### Stage 22b-1 — the rootfs COW producer algebra ✅ (KVM-free)
+- `header.MappingFromDirty` (a per-block dirty/empty set → the same COW mapping `BuildDiff` produces, via a
+  shared `diffAccumulator` refactored out of `BuildDiff`, so the two paths can't drift). Unit-tested for
+  run-for-run agreement.
+- `storage.PublishRootfsDiffBlocks(DiffBlocks)` (the disk half of the producer): consume the overlay's
+  exported dirty blocks directly — needs only the base **header** (never its bytes), uploads only the
+  changed blocks. Round-trip unit-tested through `MaterializeLayered`.
+
+### Stage 22b-2a — writable rootfs for every sandbox (D2 foundation, KVM)
+`buildRootfsBacking` binds `block.NewOverlay(base, per-VM cache)` (writable) instead of `block.NewReadOnly`;
+fc.go Spawn + build-snapshot.sh bake `root rw` + `is_read_only: false` (gated on the drive being an NBD
+device); `--nbd` becomes the orchestrator default; the default snapshot is rebuilt writable. **Verified by
+the full e2e booting/restoring/isolating on a writable rootfs** (this is the load-bearing verification — it
+touches every sandbox's boot path).
+
+### Stage 22b-2b — the one-run producer + build wiring (KVM)
+- `Snapshotter.LayeredSnapshot` gains the layer's `RUN` commands; the *with-snapshot layered* `build.go`
+  path stops calling `build-rootfs-layered.sh` + `PublishRootfsDiff` and lets the producer publish **both**
+  diffs.
+- The producer (`server.go` `LayeredSnapshot`): resume the base (now a writable overlay) → for each `RUN`
+  `envdclient.Run` (fail on non-zero exit) → `Run("sync")` → `vm.Snapshot` → `PublishMemfileDiff` (unchanged)
+  **and** `overlay.ExportToDiff()` → `PublishRootfsDiffBlocks`, owner = childBuildID.
 
 ### Stage 22c — the e2e goes correctly green + measured win + honest review
-- `test_layered_snapshot_via_api` should now **pass its disk-content assertion** (`test_template.py:114`) —
-  the marker is visible because the guest wrote it in-guest before the snapshot. The memfile-COW-win
-  assertion (`:141`, the original 🔴) is then reached and validated for the first time.
+- `test_layered_snapshot_via_api` now **passes its disk-content assertion** (`test_template.py:114`) — the
+  marker is visible because the guest wrote it in-guest before the snapshot. The memfile-COW-win assertion
+  (`:141`, the original 🔴) is then reached and validated for the first time.
 - Correct the committed docs' `dedupCompare` claim (§2 correction) where it appears (STAGE20 §2.1, the
   roadmap, the memory). Honest 🔴/🟡/🟢 review.
 
@@ -189,9 +231,47 @@ premise finally holds. It also lands the first **orchestrator→guest command ex
 | one run → two diffs | yes (`Sandbox.Pause`) | yes (resume-writable → run → sync → snapshot → both diffs) | 🟢 faithful |
 | rootfs diff source | writable NBD overlay dirty blocks | same (`block.Overlay.ExportToDiff`) | 🟢 faithful |
 | memfile diff source | UFFD dirty-page tracking | `header.BuildDiff` block-compare | 🟡 same result set, simpler mechanism (kept) |
-| restore rootfs | writable overlay per sandbox | read-only + producer `sync` | 🟡 correct for our snapshot model; writable-at-restore deferred (D2) |
+| restore rootfs | writable overlay per sandbox | writable overlay per sandbox (Stage 22b-2a) | 🟢 faithful (D2, full-B) |
 | layers | per-step chain | one child delta | 🟡 single-delta scope (D5) |
 | build logs | streamed | exit-code only | 🟡 ergonomics deferred (D1) |
+
+## 11. The 22b-2b blocker — the writable-NBD re-snapshot won't restore (candidate directions)
+
+**Symptom.** The producer builds a layered snapshot correctly (resume base → run the `RUN` command in-guest
+→ `sync` → Full snapshot → publish both diffs). Restoring that child snapshot panics Firecracker at
+`src/vmm/src/devices/virtio/block/virtio/device.rs`: `InvalidAvailIdx { queue_size: 256, reported_len:
+12659 }` — the restored virtio-blk avail ring is `reported_len` ahead of the used ring, far beyond the
+256-entry queue, i.e. the block device's queue state is inconsistent on restore.
+
+**What the diagnostics rule in/out (this session):**
+- The **file-backed base snapshot restores fine**, including 3 concurrent restores (`test_microvm_snapshot`),
+  under the writable-overlay boot (22b-2a). So writable NBD *at restore* is not the problem.
+- **Stage-20's read-only re-snapshot restored fine** (its e2e failed later, on the marker read, not a block
+  panic). So re-snapshotting a UFFD-restored VM is not itself the problem.
+- The one new variable is **guest writes to the NBD-backed rootfs before the re-snapshot** (Stage 22's whole
+  point). So: *snapshotting a VM that has written to the kernel-NBD block device leaves the virtio-blk queue
+  in a state Firecracker rejects on the next restore.*
+
+**Leading hypotheses (for the focused follow-up):**
+1. **In-flight NBD I/O not drained at pause.** Firecracker's `PATCH /vm Paused` stops the vcpus, but the
+   virtio-blk worker's requests to `/dev/nbdX` (served async by our userspace `pkg/nbd`) may not be fully
+   completed when `/snapshot/create` serializes the queue. `sync` flushes the *guest* page cache but may not
+   guarantee the *device* queue is idle. Try: an explicit drain/quiesce of the NBD device (or our
+   `nbd.Dispatch` loop) before pause; or a `blockdev --flushbufs` + settle in-guest; or verify our NBD server
+   advances the completion (used) ring in lockstep.
+2. **Guest-RAM vs device-state mismatch across UFFD.** The virtqueue rings live in guest RAM (served over
+   UFFD from the COW memfile). If the Full snapshot doesn't capture the *dirtied ring page* into the child
+   memfile (so restore serves the base ring page while the vmstate has the child's avail_idx) → mismatch.
+   Check whether FC's Full snapshot over a UFFD backend writes *all* guest RAM (faulting untouched pages) —
+   the memory's long-standing 🔴 assumption — and specifically whether the block-queue pages are captured.
+3. **file→NBD backend switch.** Our base snapshot is created **file-backed** (`build-snapshot.sh`,
+   `path_on_host=$ROOTFS`) and resumed **NBD-backed**. E2B builds NBD-backed from the start. The write +
+   re-snapshot may expose a state incompatibility this switch introduced. Candidate: rebuild the base
+   snapshot over NBD too (a `build-snapshot.sh` rework), removing the switch.
+
+**Bisect next time:** does a producer re-snapshot with **zero** in-guest commands (just resume-writable →
+`sync` → snapshot) restore? If yes → it's the writes (hypothesis 1/2). If no → it's the writable-overlay
+re-snapshot itself independent of writes. That one KVM run localizes it before any code change.
 
 None of these change the Stage-17/18/20 *seam* (`StorageProvider` / `PageSource` / `header`) or the restore
 path; Stage 22 changes only the **producer**.
