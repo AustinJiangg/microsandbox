@@ -315,3 +315,58 @@ writable *overlay* is the culprit — one KVM run.
 
 None of these change the Stage-17/18/20 *seam* (`StorageProvider` / `PageSource` / `header`) or the restore
 path; Stage 22 changes only the **producer**.
+
+## 12. Chosen path — the E2B architecture: create the base snapshot over NBD (blueprint)
+
+**User decision:** pursue §11 direction 2 (E2B's architecture) — make the base snapshot NBD-backed-writable
+from creation, so the whole chain (base create → producer resume → re-snapshot → restore) rides one
+consistent writable NBD stack, eliminating the file-backed-writable → NBD-writable transition our current
+path takes at re-snapshot.
+
+**Root-cause framing (precise).** Stage 21 (read-only device) re-snapshots + restores fine. Our writable
+path (`block.Overlay`, `is_read_only:false`) panics — *both* base and Stage-21 are **file-backed at
+creation** (`build-snapshot.sh` boots `path_on_host=$ROOTFS`, a regular file) and resumed **NBD-backed**.
+So the differentiator is **writable + the file→NBD transition together**. E2B never transitions: it
+snapshots the base over the *same* writable NBD block device it later resumes on. So the base snapshot must
+be **created over NBD**, and Firecracker must see a **block device at a stable path** at both create and
+restore (a device *node* path is not stable across VMs — bind a device over a stable file path, as
+`fc.Restore` already does).
+
+**The one thing E1 must confirm before E2/E3 (the risk).** It is not yet proven that an *NBD-writable* base
+snapshot re-snapshots + restores cleanly — the bisect only proved the *file-backed-writable* one does not.
+E1 de-risks the whole plan with a **plain restore** of an NBD-created snapshot; only if that is panic-free
+do E2/E3 follow.
+
+### Sub-steps
+
+**E1 — create the base snapshot over NBD; verify a plain restore (de-risk).**
+- **`fc.Spawn` binds the device over a stable path (like `fc.Restore`).** Today cold-start over NBD points
+  `path_on_host` straight at `/dev/nbdX` (`fc.go:150`); change it to the Restore-style setup — bind
+  `/dev/nbdX` over `tmpl.Rootfs` in the per-VM mount ns and boot `path_on_host=tmpl.Rootfs`. Now a
+  cold-started VM (and any snapshot of it) sees a **block device at a stable path**, matching restore.
+  Verify cold-start unaffected (`test_microvm` cold-start cases stay green).
+- **Orchestrator `--make-snapshot <name>` mode** (in `main.go`, after `newServer`, before serving): resolve
+  the template → `spawnHealthy(tmpl)` (now NBD block-device at a stable path) → **warm the kernel** (a
+  code-interpreter `Execute` of `pass`, mirroring `build-snapshot.sh`'s warm-up; reuse the envd/CI ports) →
+  `fc.Snapshot(vmstate, memfile)` → publish (snapfile + Stage-17 compacted memfile + the baked rootfs path =
+  `tmpl.Rootfs`) → exit. Reuses the orchestrator's storage/network/nbdPool init.
+- **Verify:** create the default snapshot via `--make-snapshot default`, run `test_microvm_snapshot`
+  (plain restore, incl. concurrent). **Panic-free ⇒ the E2B path is confirmed; panic ⇒ stop, the writable
+  re-snapshot is broken independent of the transition (fall back to §11 direction 1).**
+
+**E2 — wire it in.** The e2e fixture builds the default snapshot with the orchestrator (`--make-snapshot`)
+instead of `build-snapshot.sh` (which can't drive our userspace NBD). Keep `build-snapshot.sh` only for the
+non-NBD escape hatch (or retire it). Re-verify the full suite green.
+
+**E3 — re-implement the producer (reverted at the foundation commit).** Restore the 22b-2b code (from
+`docs/STAGE22_DESIGN.md` §6 + the memory ledger): `Snapshotter.LayeredSnapshot(…, commands)`,
+`restoreHealthyWritable` (returns the `*block.Overlay`), the `server.go` producer (resume base over NBD →
+`envdclient.Run` each command → `sync` → `fc.Snapshot` → `PublishMemfileDiff` + `overlay.ExportToDiff()` →
+`PublishRootfsDiffBlocks`), the `build.go` producer early-return + `runCommands`, and the `envdclient`
+`Proxy:nil` fix (else the 502 returns). Run `test_layered_snapshot_via_api` (now `--nbd` default): the
+marker is visible AND the re-snapshot restores. This closes Stage 22.
+
+**Note on D2/full-B:** with the base `rw`-booted, background writes still dirty the block queue — E2B lives
+with this because its whole stack is NBD-consistent, so the re-snapshot is self-consistent regardless. E1's
+result decides whether `rw` boot stays or the base should boot `ro` with the producer remounting (Option A's
+mechanism) as an extra safety.
