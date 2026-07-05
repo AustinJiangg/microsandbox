@@ -269,9 +269,49 @@ premise finally holds. It also lands the first **orchestrator→guest command ex
    re-snapshot may expose a state incompatibility this switch introduced. Candidate: rebuild the base
    snapshot over NBD too (a `build-snapshot.sh` rework), removing the switch.
 
-**Bisect next time:** does a producer re-snapshot with **zero** in-guest commands (just resume-writable →
-`sync` → snapshot) restore? If yes → it's the writes (hypothesis 1/2). If no → it's the writable-overlay
-re-snapshot itself independent of writes. That one KVM run localizes it before any code change.
+**Bisect (done, this session).** Ran the *old* Stage-20 producer (resume → snapshot, **no in-guest command,
+no `sync`**) on the writable-overlay foundation. Result: the **same panic**, `reported_len: 12659`
+**identical** to the with-command run. So:
+- It is **not** the in-guest command's writes — it is the **writable overlay at re-snapshot itself**. The
+  old read-only producer (Stage 20/21) re-snapshotted + restored fine; swapping in the writable overlay
+  (22b-2a) breaks it with no code-path change.
+- The **identical 12659** across independent runs means it is **deterministic**, not random in-flight I/O —
+  which rules out "un-drained pending writes" and points at a **structural** wrong value: most likely the
+  guest's virtqueue **avail-ring page**, dirtied by the `rw`-mount's background writes (atime / ext4 journal)
+  during resume, **is not captured into the child memfile** by the Full-snapshot-over-UFFD, so at restore it
+  is served from the *base* memfile (the base's old avail_idx = 12659) while the vmstate holds the child's
+  used_idx → `avail - used` blows past the queue size.
+
+**Experiment C (done, this session): boot the base snapshot `ro` (device still `is_read_only:false`), re-run
+the no-command bisect.** Result: the block-device `InvalidAvailIdx { … 12659 }` panic **is gone** — but a
+**different** virtqueue panic appears at `src/vmm/src/devices/mod.rs:32`: *"The number of available virtio
+descriptors 65533 is greater than queue size: 256!"* (`65533 = -3 mod 65536`, a generic per-device check; the
+resume log shows both `[Net:eth0]` and `[Block:rootfs]` being kicked, so it is one of them). So:
+- The `rw`-mount's **background writes** were indeed the cause of the *block-queue* corruption (12659) —
+  booting `ro` fixes that one. Confirms the write→block-queue link.
+- **But a second, deeper inconsistency remains** (65533) even with a quiescent `ro` mount. The only remaining
+  difference from Stage 20/21 (which re-snapshotted + restored fine) is the **writable device itself**
+  (`block.Overlay` / `is_read_only:false`) vs the read-only device (`block.ReadOnly` / `is_read_only:true`).
+  So **the writable block device changes the virtio state such that a re-snapshot of a UFFD-restored VM no
+  longer restores** — independent of writes and of mount mode. This is a *systemic* re-snapshot/virtqueue
+  consistency problem, not a single-device drain issue.
+
+**Conclusion / where the focused follow-up must start.** This is deeper than a `sync`/drain fix. Two concrete
+directions, in order of promise:
+1. **Whether FC's Full-over-UFFD snapshot captures a self-consistent (memfile, vmstate) pair for the virtio
+   rings when the device is writable.** Instrument or read FC's `create_snapshot` + the UFFD memory dump
+   path; the `-3`/`+N` avail-vs-used skews smell like ring pages served from the base memfile that don't
+   match the saved device state. If the memfile diff is missing dirtied ring pages, the header/`BuildDiff`
+   or the multi-owner read is a suspect too.
+2. **E2B's architecture — build the base snapshot NBD-backed (writable overlay) from the start**, removing
+   both the file→NBD backend switch *and* the read-only→writable transition our path introduces at re-snapshot
+   (a `build-snapshot.sh` rework so the base is snapshotted over the same writable NBD stack it will resume
+   on). This is the biggest change but the most likely to be robust, and it is literally how E2B avoids the
+   whole class of problem.
+
+**Bisect for next session:** does a **read-only** device (`block.ReadOnly`, `is_read_only:true`) + a
+`remount,rw` only for the command restore? That isolates whether the writable *device config* or the
+writable *overlay* is the culprit — one KVM run.
 
 None of these change the Stage-17/18/20 *seam* (`StorageProvider` / `PageSource` / `header`) or the restore
 path; Stage 22 changes only the **producer**.
