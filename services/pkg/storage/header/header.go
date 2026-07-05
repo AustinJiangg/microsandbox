@@ -383,6 +383,50 @@ func SingleBuildMapping(size uint64, owner string) Mapping {
 // The "child != base" test is our build-time analogue of E2B's runtime dirty bit (STAGE18_DESIGN.md
 // Decision 2); combining the compare with run-coalescing here is the single-machine equivalent of E2B's
 // writeDiff + CreateMapping. The caller flattens onto the base via MergeMappings(baseMapping, diff).
+// diffAccumulator coalesces a block-by-block COW classification into a diff Mapping: child-owned runs
+// (their bytes concatenated in ascending order in the caller's diff object, tracked by storageOff),
+// zero-owner runs (no bytes stored), and gaps where a block is unchanged. It is the single place the
+// run/coalescing/storage-offset contract lives, shared by BuildDiff (a base-vs-child content compare)
+// and MappingFromDirty (a per-block dirty set), so the two paths always produce identical mappings.
+type diffAccumulator struct {
+	mapping    Mapping
+	storageOff uint64    // child-owned bytes emitted so far = the next child-owned run's storage offset
+	cur        *BuildMap // the open run, or nil
+}
+
+// unchanged ends any open run: an unchanged block resolves to the base, so it is omitted from the diff.
+func (a *diffAccumulator) unchanged() {
+	if a.cur != nil {
+		a.mapping = append(a.mapping, *a.cur)
+		a.cur = nil
+	}
+}
+
+// add records a changed block [off,off+n) owned by owner ("" = zero-owner, no bytes stored): it extends
+// the open run when the owner matches, else flushes and starts a new one. A child-owned block advances
+// storageOff, because the caller writes its bytes to the diff object in this same ascending order.
+func (a *diffAccumulator) add(off, n int64, owner string) {
+	if a.cur == nil || a.cur.Owner != owner {
+		a.unchanged() // flush the open run
+		start := uint64(0)
+		if owner != "" {
+			start = a.storageOff
+		}
+		a.cur = &BuildMap{Offset: uint64(off), Length: uint64(n), BuildStorageOffset: start, Owner: owner}
+	} else {
+		a.cur.Length += uint64(n)
+	}
+	if owner != "" {
+		a.storageOff += uint64(n)
+	}
+}
+
+// finish flushes the last open run and returns the accumulated mapping.
+func (a *diffAccumulator) finish() Mapping {
+	a.unchanged()
+	return a.mapping
+}
+
 func BuildDiff(base, child io.ReaderAt, size, blockSize int64, childOwner string, out io.Writer) (Mapping, error) {
 	bs := blockSize
 	if bs <= 0 {
@@ -390,17 +434,7 @@ func BuildDiff(base, child io.ReaderAt, size, blockSize int64, childOwner string
 	}
 	childBuf := make([]byte, bs)
 	baseBuf := make([]byte, bs)
-	var (
-		mapping    Mapping
-		storageOff uint64    // bytes written to out so far (the next child-owned run's storage offset)
-		cur        *BuildMap // the open run, or nil
-	)
-	flush := func() {
-		if cur != nil {
-			mapping = append(mapping, *cur)
-			cur = nil
-		}
-	}
+	var acc diffAccumulator
 	for off := int64(0); off < size; off += bs {
 		n := bs
 		if off+n > size {
@@ -414,35 +448,54 @@ func BuildDiff(base, child io.ReaderAt, size, blockSize int64, childOwner string
 		if err := readBlock(base, bb, off); err != nil {
 			return nil, fmt.Errorf("read base at %d: %w", off, err)
 		}
-		if equalBytes(cb, bb) {
-			flush() // unchanged -> resolves to the base; ends any open run
-			continue
-		}
-		// Changed: a zero block becomes a zero-owner run (no bytes stored); else the child owns it.
-		owner := childOwner
-		zero := isZero(cb)
-		if zero {
-			owner = ""
-		}
-		if cur == nil || cur.Owner != owner {
-			flush()
-			start := uint64(0)
-			if !zero {
-				start = storageOff
-			}
-			cur = &BuildMap{Offset: uint64(off), Length: uint64(n), BuildStorageOffset: start, Owner: owner}
-		} else {
-			cur.Length += uint64(n)
-		}
-		if !zero {
+		switch {
+		case equalBytes(cb, bb):
+			acc.unchanged() // resolves to the base
+		case isZero(cb):
+			acc.add(off, n, "") // changed to zero: a zero-owner override, no bytes stored
+		default:
+			acc.add(off, n, childOwner)
 			if _, err := out.Write(cb); err != nil {
 				return nil, fmt.Errorf("write diff block at %d: %w", off, err)
 			}
-			storageOff += uint64(n)
 		}
 	}
-	flush()
-	return mapping, nil
+	return acc.finish(), nil
+}
+
+// MappingFromDirty builds a COW diff mapping identical in form to BuildDiff's, but from a per-block
+// dirty/empty classification instead of a base-vs-child content compare -- the input the Stage-22 layer
+// producer gets from the writable rootfs overlay's ExportToDiff (block.Cache): a dirty non-empty block
+// is a run owned by childOwner (its bytes are the caller's diff object, the dirty non-empty blocks
+// concatenated in ascending block order), a dirty all-zero block is a zero-owner ("") run (no bytes
+// stored), and an unwritten block is omitted (it resolves to the base in MergeMappings). dirty and empty
+// are per-block flags; size is the logical image size; a non-positive blockSize uses DefaultBlockSize.
+// This is the disk-diff twin of BuildDiff for the one-run-two-diffs producer -- see docs/STAGE22_DESIGN.md.
+func MappingFromDirty(dirty, empty []bool, blockSize, size int64, childOwner string) Mapping {
+	bs := blockSize
+	if bs <= 0 {
+		bs = int64(DefaultBlockSize)
+	}
+	var acc diffAccumulator
+	for b := 0; b < len(dirty); b++ {
+		off := int64(b) * bs
+		if off >= size {
+			break
+		}
+		n := bs
+		if off+n > size {
+			n = size - off
+		}
+		switch {
+		case !dirty[b]:
+			acc.unchanged()
+		case b < len(empty) && empty[b]:
+			acc.add(off, n, "")
+		default:
+			acc.add(off, n, childOwner)
+		}
+	}
+	return acc.finish()
 }
 
 // readBlock fills p from ra at off, tolerating a short read at the object's end (the tail is left as the

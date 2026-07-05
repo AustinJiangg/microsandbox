@@ -119,6 +119,40 @@ func TestBuildDiffAndReconstruct(t *testing.T) {
 	}
 }
 
+// TestMappingFromDirtyMatchesBuildDiff proves the Stage-22 disk-diff twin agrees with BuildDiff run for
+// run: given the same change, the dirty-block path (MappingFromDirty, the overlay's ExportToDiff input)
+// produces the identical mapping as the content-compare path (BuildDiff). The change exercises coalescing
+// (two contiguous changed blocks), the running storage offset (a later child run after the first), a
+// zero-owner run, and unchanged gaps -- the four things the shared diffAccumulator has to get right.
+func TestMappingFromDirtyMatchesBuildDiff(t *testing.T) {
+	const bs = 4
+	base := img(bs, 1, 2, 3, 4, 5, 6, 7)
+	child := img(bs, 1, 9, 9, 0, 5, 8, 7) // blocks 1,2 -> 9 (contiguous data), 3 -> 0 (zeroed), 5 -> 8 (data)
+	size := int64(len(base))
+
+	var diff bytes.Buffer
+	want, err := BuildDiff(bytes.NewReader(base), bytes.NewReader(child), size, bs, "B", &diff)
+	if err != nil {
+		t.Fatalf("BuildDiff: %v", err)
+	}
+
+	// Derive the per-block dirty/empty flags the overlay's cache would report for the same writes.
+	n := len(base) / bs
+	dirty := make([]bool, n)
+	empty := make([]bool, n)
+	for b := 0; b < n; b++ {
+		cb, bb := child[b*bs:(b+1)*bs], base[b*bs:(b+1)*bs]
+		if !bytes.Equal(cb, bb) {
+			dirty[b] = true
+			empty[b] = isZero(cb)
+		}
+	}
+	got := MappingFromDirty(dirty, empty, bs, size, "B")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MappingFromDirty != BuildDiff:\n got %+v\nwant %+v", got, want)
+	}
+}
+
 // TestBuildDiffIdentical: a child equal to the base diffs to nothing (empty mapping, no stored bytes).
 func TestBuildDiffIdentical(t *testing.T) {
 	const bs = 4

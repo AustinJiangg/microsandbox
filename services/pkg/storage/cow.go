@@ -110,6 +110,68 @@ func PublishRootfsDiff(ctx context.Context, sp StorageProvider, baseBuildID, chi
 	return nil
 }
 
+// DiffBlocks is a writable rootfs overlay's exported diff (block.Cache.ExportToDiff) in a
+// storage-package-local form, so pkg/storage stays free of pkg/block (which is linux/nbd-gated). Data is
+// the dirty non-empty blocks concatenated in ascending block order, Dirty/Empty are per-block flags, and
+// Size is the logical device size. The Stage-22 producer fills it from the overlay after the layer's
+// command runs in-guest (docs/STAGE22_DESIGN.md); the orchestrator maps block.Diff into it field for field.
+type DiffBlocks struct {
+	Data      []byte
+	Dirty     []bool
+	Empty     []bool
+	BlockSize int64
+	Size      int64
+}
+
+// PublishRootfsDiffBlocks stores a Stage-22 layer's rootfs as a copy-on-write diff over baseBuildID from
+// the writable overlay's exported dirty blocks -- the disk half of the one-run-two-diffs producer. Unlike
+// PublishRootfsDiff (a base-vs-child content compare that must materialize the whole base to diff against),
+// this consumes the overlay's ExportToDiff directly: it needs only the base's HEADER (for the flattened
+// owner chain), never the base's bytes, so a `RUN` that touched a few blocks uploads a few blocks -- E2B's
+// cache.ExportToDiff -> header path. It uploads {childBuildID}/rootfs.ext4 = d.Data (the changed non-zero
+// blocks) and {childBuildID}/rootfs.ext4.header (the flattened v2 mapping pointing unchanged ranges at the
+// base's objects and zeroed ranges at no owner). The boot path reassembles via MaterializeLayered, exactly
+// as for a PublishRootfsDiff-produced child -- only the production differs.
+func PublishRootfsDiffBlocks(ctx context.Context, sp StorageProvider, baseBuildID, childBuildID string, d DiffBlocks) error {
+	// The child's own diff runs, in BuildDiff's exact form (the shared diffAccumulator), owned by the child.
+	childDiff := header.MappingFromDirty(d.Dirty, d.Empty, d.BlockSize, d.Size, childBuildID)
+
+	// Resolve the base's flattened mapping/metadata from its header alone (no base bytes needed): a
+	// non-layered base is one full run owned by itself; a layered base contributes its flattened chain.
+	baseHdr, err := OpenRootfsHeader(ctx, sp, baseBuildID)
+	if err != nil {
+		return err
+	}
+	baseMapping := header.SingleBuildMapping(uint64(d.Size), baseBuildID)
+	baseGen, chainRoot := uint64(0), baseBuildID
+	if baseHdr != nil {
+		baseMapping = baseHdr.Mapping
+		baseGen = baseHdr.Metadata.Generation
+		chainRoot = baseHdr.Metadata.BaseBuildId
+	}
+
+	flat := header.NormalizeMappings(header.MergeMappings(baseMapping, childDiff))
+	h := header.Header{
+		Metadata: header.Metadata{
+			Version:     header.VersionLayered,
+			BlockSize:   uint64(d.BlockSize),
+			Size:        uint64(d.Size),
+			Generation:  baseGen + 1,
+			BuildId:     childBuildID,
+			BaseBuildId: chainRoot,
+		},
+		Mapping: flat,
+	}
+	if err := sp.Upload(ctx, ArtifactKey(childBuildID, RootfsName), bytes.NewReader(d.Data), int64(len(d.Data))); err != nil {
+		return fmt.Errorf("upload rootfs diff blocks: %w", err)
+	}
+	hb := h.Serialize()
+	if err := sp.Upload(ctx, ArtifactKey(childBuildID, RootfsHeaderName), bytes.NewReader(hb), int64(len(hb))); err != nil {
+		return fmt.Errorf("upload rootfs header: %w", err)
+	}
+	return nil
+}
+
 // MaterializeLayered makes buildID's full rootfs available at the local path dst. If buildID carries a
 // rootfs header the rootfs is layered: dst is assembled by copying each run from its owning build's
 // object (a per-owner reader cache keeps each {owner}/rootfs.ext4 open once -- E2B's DiffStore analogue),
