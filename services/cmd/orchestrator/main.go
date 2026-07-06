@@ -55,6 +55,8 @@ func main() {
 	s3AccessKey := flag.String("s3-access-key", "minioadmin", "S3 access key, for --storage s3")
 	s3SecretKey := flag.String("s3-secret-key", "minioadmin", "S3 secret key, for --storage s3")
 	s3SSL := flag.Bool("s3-ssl", false, "use https for the S3 endpoint, for --storage s3")
+	makeSnapshot := flag.String("make-snapshot", "",
+		"one-shot: create the named template's warm snapshot over the NBD stack and publish it, then exit (Stage 22 E1; the Go replacement for build-snapshot.sh under --nbd). Requires --nbd + --storage s3")
 	flag.Parse()
 
 	poolSpecs, err := parsePoolSpecs(poolFlags, *poolSize)
@@ -80,6 +82,16 @@ func main() {
 		}
 	}
 	srv := newServer(*vendorDir, poolSpecs, *useUffd, provider, nbdPool)
+
+	// Stage 22 E1: one-shot snapshot creation over the NBD stack (the Go replacement for build-snapshot.sh),
+	// then exit -- no listeners. It reuses the storage / network / nbd init above. Invoke without --pool.
+	if *makeSnapshot != "" {
+		if err := srv.makeSnapshot(*makeSnapshot); err != nil {
+			log.Fatalf("orchestrator: --make-snapshot %q: %v", *makeSnapshot, err)
+		}
+		log.Printf("orchestrator: created and published snapshot for template %q", *makeSnapshot)
+		return
+	}
 
 	// Template builder (Stage 10): the scripts dir defaults to the sibling of vendor (their
 	// repo layout), overridable by flag. The builder writes artifacts in place under

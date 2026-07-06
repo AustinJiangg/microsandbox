@@ -70,9 +70,12 @@ type MicroVM struct {
 // rootfs is served over that NBD device (streamed from object storage by the orchestrator's block stack,
 // never materialized whole):
 //
-//   - Spawn (cold start) points the drive's path_on_host straight at Device (a fresh config).
-//   - Restore cannot retarget the snapshot's baked rootfs path, so it bind-mounts Device over that path
-//     inside a per-VM mount namespace -- firecracker then opens the baked path and gets this VM's device.
+//   - Spawn (cold start) binds Device over tmpl.Rootfs (a stable path) in a per-VM mount namespace and
+//     boots path_on_host=tmpl.Rootfs -- so the snapshot a cold-started VM produces bakes a stable rootfs
+//     path, not a device node like /dev/nbdX that is not stable across VMs (Stage 22 E1). Before Stage 22
+//     it pointed path_on_host straight at Device.
+//   - Restore cannot retarget the snapshot's baked rootfs path, so it likewise bind-mounts Device over that
+//     path inside a per-VM mount namespace -- firecracker then opens the baked path and gets this VM's device.
 //
 // Close tears the backing down on Destroy (disconnect + return the device + close the base); nil = no-op.
 type RootfsBacking struct {
@@ -144,11 +147,15 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 		return nil, fmt.Errorf("/dev/net/tun missing; it is needed for per-sandbox networking" +
 			" (Stage 12). See docs/MICROVM_DESIGN.md")
 	}
-	// The drive points at the NBD device (Stage 21c) or the materialized rootfs file. Only the latter
-	// must exist on disk here -- the device is served by the block stack the orchestrator already bound.
+	// The drive always boots from tmpl.Rootfs (a stable path). Over NBD (Stage 22 E1) the device is
+	// bind-mounted over that path in a per-VM mount namespace -- exactly as Restore does -- so a cold start
+	// and the snapshot it produces bake a stable rootfs path (a device node like /dev/nbdX is not stable
+	// across VMs). The materialized-file path (no device) must have the real rootfs at tmpl.Rootfs; the NBD
+	// path only needs a placeholder there (the orchestrator's prepareSpawn ensures it) that the bind shadows.
 	rootfsPath := tmpl.Rootfs
+	var bind *bindMount
 	if rootfs.Device != "" {
-		rootfsPath = rootfs.Device
+		bind = &bindMount{device: rootfs.Device, target: tmpl.Rootfs}
 	} else if _, err := os.Stat(tmpl.Rootfs); err != nil {
 		return nil, fmt.Errorf("missing rootfs %s for template %q; run scripts/build-rootfs.sh"+
 			" (or scripts/build-template.sh %s) first", tmpl.Rootfs, tmpl.Name, tmpl.Name)
@@ -190,7 +197,7 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 		},
 		"drives": []any{map[string]any{
 			"drive_id":       "rootfs",
-			"path_on_host":   rootfsPath, // tmpl.Rootfs, or an NBD device (Stage 21c)
+			"path_on_host":   rootfsPath, // tmpl.Rootfs; over NBD the device binds over it (Stage 22 E1)
 			"is_root_device": true,
 			"is_read_only":   readOnly, // writable over NBD (private overlay); read-only for the shared file
 		}},
@@ -210,7 +217,7 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 		return nil, err
 	}
 
-	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns, nil,
+	vm, err := startFirecracker(id, vendorDir, workdir, slot.Netns, bind,
 		"--api-sock", filepath.Join(workdir, "api.sock"), "--config-file", configPath)
 	if err != nil {
 		os.RemoveAll(workdir)

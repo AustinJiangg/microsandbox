@@ -434,7 +434,10 @@ func (s *server) prepareSpawn(tmpl template.Template) error {
 		return nil // local-fs: the rootfs is already at its local path
 	}
 	if s.useNBD {
-		return nil // NBD serves the rootfs lazily (buildRootfsBacking); the drive points at the device
+		// NBD serves the rootfs lazily (buildRootfsBacking binds it to a device). Since Stage 22 E1 Spawn
+		// binds that device over tmpl.Rootfs (a stable path, so the cold-start snapshot bakes a stable
+		// rootfs path), that path must exist as a file for `mount --bind`; the bind shadows this placeholder.
+		return ensureFile(tmpl.Rootfs)
 	}
 	if _, err := os.Stat(tmpl.Rootfs); err == nil {
 		return nil // cache hit: no need to resolve the alias or download
