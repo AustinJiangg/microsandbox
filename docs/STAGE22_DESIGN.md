@@ -385,3 +385,37 @@ marker is visible AND the re-snapshot restores. This closes Stage 22.
 with this because its whole stack is NBD-consistent, so the re-snapshot is self-consistent regardless. E1's
 result decides whether `rw` boot stays or the base should boot `ro` with the producer remounting (Option A's
 mechanism) as an extra safety.
+
+## 13. E3 result — the producer builds, but the child re-snapshot still won't restore
+
+**E3 is implemented and the build path works end to end.** The producer resumes the base (now NBD-created,
+per E1) over a writable overlay, runs the layer's `RUN` command **in the guest** (envd `Run` via
+`/bin/sh -c`, the `Proxy:nil` client), `sync`s, re-snapshots, and publishes **both** diffs. Measured on
+`derived_snap` (`FROM microsandbox-agent` + one `RUN echo > /etc/...`): **memfile diff 6.4 MiB / 240 MiB
+compacted = 2.68%**, **rootfs diff 2.6 MiB / 604 MiB = 0.43%** — both small and sensible. This is a real step
+past the Stage-20 grafting bug: the in-guest command runs and produces correct, tiny COW diffs.
+
+**But restoring the child snapshot panics** `InvalidAvailIdx { queue_size: 256, reported_len: 714 }` in
+Firecracker's virtio-blk device — the same class as the §11 blocker (the values 714 / 1229 / 12659 are all
+avail-vs-used skews).
+
+**Two causes ruled apart (this session):**
+1. **Not a stale local cache.** A first attempt panicked on the *base resume* because `--make-snapshot`
+   republishes the mutable `default` alias while `storage.Materialize` caches the vmstate by existence, so a
+   *stale* vmstate paired with a *fresh* streamed memfile. Fixed by `makeSnapshot` dropping the local
+   snapshot cache after publishing (committed `05ffa4c`); `test_microvm_snapshot` then passes the
+   second-session scenario. The child (`derived_snap`) is a *fresh* buildID with no cache, so its panic is
+   not this.
+2. **Not the memfile diff / the 🔴 assumption.** The diffs are small (2.68% / 0.43%), which means FC's
+   Full-over-UFFD snapshot **does** fault the base pages in (the long-standing 🔴 assumption *holds*), so the
+   reconstructed child memfile equals the raw re-snapshot memfile. The panic is therefore the **re-snapshot
+   itself** producing an inconsistent (vmstate, memfile) pair — not a reconstruction error.
+
+**Conclusion — the §12 E2B-architecture theory is refuted for the re-snapshot.** Creating the base over NBD
+fixed the *plain* restore (E1) but **not** the re-snapshot: even with an all-NBD chain, re-snapshotting a
+UFFD-restored, writable-NBD, `rw`-booted VM yields a child snapshot Firecracker rejects on load. This matches
+§11's Experiment C (the `rw` mount's background writes dirty the block queue) — now confirmed to persist with
+an NBD-created base. The E3 producer code is correct in structure and **held in the working tree**; closing
+it needs the D2/full-B decision (boot the base `ro` for a quiescent block queue vs. keep the user-facing
+writable root) and likely a block-queue quiesce (`fsfreeze` / `remount,ro` / drain) before the re-snapshot —
+its own focused experiment loop.
