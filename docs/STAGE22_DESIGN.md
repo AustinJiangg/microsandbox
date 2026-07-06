@@ -465,5 +465,10 @@ even bigger backlog. Async without a fast backend is counterproductive; reverted
 backend itself to be **fast/drained at pause** so FC's device consumes its whole avail ring before the
 snapshot — i.e. an mmap-memcpy write cache + a warm local read cache (so no MinIO round-trip is in flight),
 or a real drain that makes FC finish consuming the avail queue. That is a **focused backend redesign**, not a
-one-line experiment — the honest stopping point for this session. E3's producer (correct in structure, builds
-end to end, both diffs small) stays held pending that work.
+one-line experiment — the honest stopping point for this session.
+
+**E3 landed (committed `132d630`), the e2e gated.** The producer (correct in structure, builds end to end,
+both diffs small) is committed; `test_layered_snapshot_via_api` is skipped by default behind
+`MSB_TEST_LAYERED_SNAPSHOT=1` (matching the `MSB_TEST_NBD` gate) with the blocker in its skip reason, so the
+suite stays green while the code is preserved for the backend-redesign follow-up. Unskip it once the NBD
+backend is fast/drained at pause.
