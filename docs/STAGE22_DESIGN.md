@@ -24,6 +24,17 @@
 > session (candidate directions in §11). The 22b-2b code (`server.go` producer, `build.go` producer path,
 > `test_template.py` assertion, the `envdclient` no-proxy fix) is **held out of the foundation commits** until
 > it restores cleanly.
+>
+> **UPDATE — §12 E1/E2 landed + the de-risk PASSED.** The chosen path (§12: create the base snapshot over
+> the NBD stack) is now implemented and verified. **E1a** — `fc.Spawn` binds the NBD device over a stable
+> rootfs path (like `fc.Restore`) so the cold-start snapshot bakes a stable path. **E1b** — an orchestrator
+> `--make-snapshot <name>` one-shot creates the snapshot over NBD (cold-start → warm kernel → Full snapshot →
+> publish), the Go replacement for `build-snapshot.sh` under `--nbd`. **E2** — the e2e fixture builds the
+> default snapshot with `--make-snapshot` instead of `build-snapshot.sh`. **Result: `test_microvm_snapshot`
+> passes 3/3 (plain + fast + concurrent) with no `InvalidAvailIdx` panic** — an NBD-created snapshot restores
+> cleanly, confirming the file-backed→NBD transition was the cause and clearing the gate for **E3** (the
+> producer). Honest boundary: E1 proves a *plain restore* of an NBD-created snapshot; the *re-snapshot*
+> producer path is E3's proof (`test_layered_snapshot_via_api`).
 
 ## 1. The problem (why the Stage-20 snapshot is wrong)
 
@@ -339,7 +350,8 @@ do E2/E3 follow.
 
 ### Sub-steps
 
-**E1 — create the base snapshot over NBD; verify a plain restore (de-risk).**
+**E1 — create the base snapshot over NBD; verify a plain restore (de-risk). ✅ DONE — PASSED.**
+`test_microvm_snapshot` 3/3 (plain + fast + concurrent), no `InvalidAvailIdx` panic.
 - **`fc.Spawn` binds the device over a stable path (like `fc.Restore`).** Today cold-start over NBD points
   `path_on_host` straight at `/dev/nbdX` (`fc.go:150`); change it to the Restore-style setup — bind
   `/dev/nbdX` over `tmpl.Rootfs` in the per-VM mount ns and boot `path_on_host=tmpl.Rootfs`. Now a
@@ -354,9 +366,12 @@ do E2/E3 follow.
   (plain restore, incl. concurrent). **Panic-free ⇒ the E2B path is confirmed; panic ⇒ stop, the writable
   re-snapshot is broken independent of the transition (fall back to §11 direction 1).**
 
-**E2 — wire it in.** The e2e fixture builds the default snapshot with the orchestrator (`--make-snapshot`)
-instead of `build-snapshot.sh` (which can't drive our userspace NBD). Keep `build-snapshot.sh` only for the
-non-NBD escape hatch (or retire it). Re-verify the full suite green.
+**E2 — wire it in. ✅ DONE.** The e2e fixture builds the default snapshot with the orchestrator
+(`--make-snapshot`) instead of `build-snapshot.sh` (which can't drive our userspace NBD); `ensure_snapshot()`
+is a no-op in `--nbd` s3 mode (the snapshot lives in the bucket now). `build-snapshot.sh` is kept for the
+non-NBD escape hatch (`--nbd=false` / `--storage local-fs`). Also fixed a stale test
+(`test_write_to_readonly_root_fails`) that asserted a read-only root — obsolete since Stage 22b-2a made
+every sandbox's root a writable overlay; it was already red at HEAD. Core VM e2e green.
 
 **E3 — re-implement the producer (reverted at the foundation commit).** Restore the 22b-2b code (from
 `docs/STAGE22_DESIGN.md` §6 + the memory ledger): `Snapshotter.LayeredSnapshot(…, commands)`,
