@@ -4,11 +4,10 @@ The daemon lives inside the microVM, so files/commands act on the VM's own
 filesystem. These operations are performed directly by the daemon, independent of
 the execution backend.
 
-Note: the VM has a --read-only root with only /tmp writable, so all write
-operations land in /tmp.
+Note: since Stage 22b every sandbox boots a private writable rootfs overlay (an
+NBD copy-on-write overlay over the shared read-only base), so writes outside /tmp
+succeed into that VM's own cache and are discarded on destroy.
 """
-
-import pytest
 
 from microsandbox import Sandbox
 
@@ -34,10 +33,13 @@ def test_list_dir(sandbox: Sandbox) -> None:
     assert "listme.txt" in names
 
 
-def test_write_to_readonly_root_fails(sandbox: Sandbox) -> None:
-    """Writing outside /tmp: the resident container's root is --read-only, so it should fail faithfully (raise RuntimeError)."""
-    with pytest.raises(RuntimeError):
-        sandbox.files.write("/etc/nope.txt", "x")
+def test_write_to_root_succeeds_on_writable_overlay(sandbox: Sandbox) -> None:
+    """Writing outside /tmp now succeeds. Since Stage 22b every sandbox boots a private writable rootfs
+    overlay (an NBD block.Overlay over the shared read-only base), so a write to /etc lands in this VM's
+    own copy-on-write cache -- invisible to other sandboxes and discarded on destroy. (Before Stage 22 the
+    microVM root was read-only and this write raised RuntimeError.)"""
+    sandbox.files.write("/etc/nope.txt", "x")
+    assert sandbox.files.read("/etc/nope.txt") == "x"
 
 
 def test_command_run(sandbox: Sandbox) -> None:

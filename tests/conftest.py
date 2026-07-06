@@ -94,10 +94,31 @@ def ensure_rootfs() -> None:
     subprocess.run([str(repo_root / "scripts" / "build-rootfs.sh")], check=True)
 
 
+def _orch_flags() -> str:
+    """The extra orchestrator flags for this run (MSB_ORCH_FLAGS). --nbd + --storage s3 are the defaults."""
+    return os.environ.get("MSB_ORCH_FLAGS", "")
+
+
+def _s3_mode() -> bool:
+    """True when the orchestrator reads artifacts from object storage (the default); local-fs is the escape hatch."""
+    return "--storage local-fs" not in _orch_flags()
+
+
+def _nbd_mode() -> bool:
+    """True when the rootfs is served over NBD -- the orchestrator default since Stage 22b, disabled only by
+    --nbd=false, and an s3-mode feature (NBD streams the rootfs from the bucket). In this mode the default's
+    warm snapshot is created in the bucket over the NBD stack (orchestrator --make-snapshot), so no local
+    vendor/snapshot is built: build-snapshot.sh's file-backed boot -> NBD resume is the transition that
+    triggered the re-snapshot panic (docs/STAGE22_DESIGN.md §12)."""
+    return _s3_mode() and "--nbd=false" not in _orch_flags()
+
+
 @functools.lru_cache(maxsize=1)
 def ensure_snapshot() -> None:
     """Build the snapshot on demand if absent (boot VM + warm up kernel + snapshot, ~10s, produces a 512MB memfile).
     In normal use the developer pre-runs scripts/build-snapshot.sh."""
+    if _nbd_mode():
+        return  # Stage 22 E2: the snapshot lives in the bucket, created over NBD by the control_plane fixture
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     snap = repo_root / "vendor" / "snapshot"
     if (snap / "vmstate").exists() and (snap / "memfile").exists():
@@ -280,6 +301,24 @@ def _seed_template(repo_root: pathlib.Path, endpoint: str, name: str) -> None:
         time.sleep(0.5)
 
 
+def _make_snapshot_over_nbd(repo_root: pathlib.Path, vendor: str, name: str) -> None:
+    """Create a template's warm snapshot via the orchestrator's one-shot --make-snapshot mode (Stage 22
+    E1/E2): cold-start over NBD at a stable rootfs path, warm the kernel, take a Full snapshot, and publish
+    snapfile + compacted memfile + baked rootfs path into the bucket. This replaces build-snapshot.sh under
+    --nbd so the base snapshot rides the same writable NBD stack it is later resumed on -- build-snapshot.sh
+    boots the base over a plain file, and that file-backed -> NBD-resume transition triggered the
+    writable-re-snapshot virtio-blk panic (docs/STAGE22_DESIGN.md §12). Needs root (the nbd module + a
+    netns/TAP), so it goes through the same passwordless sudo the orchestrator server uses."""
+    cmd = [str(repo_root / "vendor" / "orchestrator"),
+           "--vendor-dir", vendor, "--make-snapshot", name]
+    cmd += shlex.split(os.environ.get("MSB_ORCH_FLAGS", ""))
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n", "-E"] + cmd
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"orchestrator --make-snapshot {name} failed (rc={r.returncode}):\n{r.stdout}\n{r.stderr}")
+
+
 @pytest.fixture(scope="session")
 def control_plane(tmp_path_factory):
     """Build and run the Go services (orchestrator + client-proxy + api) once per session.
@@ -317,11 +356,20 @@ def control_plane(tmp_path_factory):
     # artifacts, bring up MinIO, and seed default + example into the bucket so the orchestrator can
     # materialize rootfs/snapfile and stream the memfile from it.
     orch_flags = os.environ.get("MSB_ORCH_FLAGS", "")
-    if "--storage local-fs" not in orch_flags:
-        ensure_snapshot()          # default's rootfs + snapshot, so default/memfile etc. can be seeded
+    if _s3_mode():
         ensure_example_template()  # the example template's rootfs (cold-start, no snapshot)
         s3_endpoint = ensure_minio()
-        _seed_template(repo_root, s3_endpoint, "default")
+        if _nbd_mode():
+            # Stage 22 E2: seed default's rootfs, then create its warm snapshot over the SAME writable NBD
+            # stack it will be resumed on (orchestrator --make-snapshot), instead of build-snapshot.sh's
+            # file-backed boot + seeding it. The file-backed -> NBD transition triggered the re-snapshot
+            # virtio-blk panic; see docs/STAGE22_DESIGN.md §12.
+            ensure_rootfs()
+            _seed_template(repo_root, s3_endpoint, "default")   # rootfs + alias (no local snapshot)
+            _make_snapshot_over_nbd(repo_root, vendor, "default")
+        else:
+            ensure_snapshot()      # default's rootfs + file-backed snapshot (the --nbd=false escape hatch)
+            _seed_template(repo_root, s3_endpoint, "default")
         _seed_template(repo_root, s3_endpoint, "example")
         # We deliberately do NOT clear local artifacts to "force" a bucket download here. The ensure_*
         # fixtures rebuild a missing local artifact via docker, and the root orchestrator's own
