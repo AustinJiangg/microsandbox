@@ -437,3 +437,33 @@ therefore exhausted; the fix must drain **FC's virtio-blk device ↔ our NBD ser
 before the snapshot, or match whatever E2B does at pause. **Next: read `e2b-dev/infra` for how it snapshots a
 live writable-NBD VM without this panic** (block-queue drain at pause? synchronous backend? a device flush?)
 before more KVM guesses. The E3 producer stays held in the working tree.
+
+### 13.2 What E2B does (read from `e2b-dev/infra` @ `ca248d079`) — and the definitive root cause
+
+A read-only source study answered "how does E2B Full-snapshot a live writable-NBD VM without this panic?":
+
+- **E2B does *nothing* to drain/flush/detach the block device at snapshot.** Between `PATCH /vm {Paused}` and
+  `PUT /snapshot/create` (`internal/sandbox/sandbox.go:731-765`) it only disables the UFFD memory handler —
+  no NBD flush, no barrier, no device disconnect. The NBD `Drain()` (`nbd/dispatch.go:88`) and `flush()`
+  (`rootfs/nbd.go:146`) run only at teardown, *after* the snapshot.
+- **E2B's write path is a synchronous mmap memcpy.** `cache.go:245 copy((*m.mmap)[off:end], b)` — an NBD write
+  returns in sub-microseconds and the real disk flush is deferred to `ExportToDiff` (post-snapshot). So the
+  virtio-blk queue **empties essentially instantly**; there is never a slow-in-flight backlog to capture.
+- **E2B runs a guest `sync` before every pause** (`sandboxtools.SyncChangesToDisk`) — we already do this.
+- **E2B uses `IoEngine: "Async"` (io_uring)** on a **pinned custom Firecracker `v1.10.1_1fcdaec08`** whose
+  block-drain-on-pause behavior is baked into that binary (not in the repo).
+
+**Definitive root cause (confirmed by experiment).** The panic is FC's Full snapshot capturing the writable
+virtio-blk queue with a **backlog of slow in-flight requests** from our **lazy object-storage NBD backend**
+(reads stream 1 MiB chunks from MinIO; the guest's continuous background block I/O over that slow path keeps
+the queue non-empty). E2B never hits this because its backend is instant (mmap writes + local chunk-cached
+reads). The clincher: setting `io_engine: Async` (matching E2B) made it **worse** — `reported_len` jumped from
+714–1758 (Sync) to **61807** — because io_uring submits *more* concurrent I/O, so a slow backend leaves an
+even bigger backlog. Async without a fast backend is counterproductive; reverted.
+
+**Consequence for the fix.** Guest-side quiesce and io_engine are both dead ends. Matching E2B needs the NBD
+backend itself to be **fast/drained at pause** so FC's device consumes its whole avail ring before the
+snapshot — i.e. an mmap-memcpy write cache + a warm local read cache (so no MinIO round-trip is in flight),
+or a real drain that makes FC finish consuming the avail queue. That is a **focused backend redesign**, not a
+one-line experiment — the honest stopping point for this session. E3's producer (correct in structure, builds
+end to end, both diffs small) stays held pending that work.
