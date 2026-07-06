@@ -87,6 +87,18 @@ func (s *server) makeSnapshot(name string) error {
 	if err := storage.PublishRootfsBakedPath(ctx, s.storage, buildID, tmpl.Rootfs); err != nil {
 		return fmt.Errorf("record baked rootfs path: %w", err)
 	}
+
+	// Invalidate the local materialize cache of this snapshot's vmstate. We just rewrote the bucket's
+	// snapfile + memfile under the mutable "default" alias, but prepareRestore's storage.Materialize keys
+	// its cache on the local file's existence -- so a leftover vmstate from a PREVIOUS --make-snapshot would
+	// be reused against this run's freshly-streamed memfile, and Firecracker rejects the mismatched
+	// virtqueue state on load (InvalidAvailIdx). Removing it forces the next restore to re-materialize the
+	// matching vmstate. (In production a build's artifacts are immutable under its buildID, so this can't
+	// arise; --make-snapshot is dev/test glue that republishes a mutable alias.) The memfile is never
+	// materialized in s3 mode, but drop a local-fs leftover too. Runs as root here, so a root-owned cache
+	// from an earlier root orchestrator is removable.
+	_ = os.Remove(filepath.Join(tmpl.SnapshotDir, "vmstate"))
+	_ = os.Remove(filepath.Join(tmpl.SnapshotDir, "memfile"))
 	return nil
 }
 
