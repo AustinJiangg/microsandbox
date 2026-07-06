@@ -419,3 +419,21 @@ an NBD-created base. The E3 producer code is correct in structure and **held in 
 it needs the D2/full-B decision (boot the base `ro` for a quiescent block queue vs. keep the user-facing
 writable root) and likely a block-queue quiesce (`fsfreeze` / `remount,ro` / drain) before the re-snapshot —
 its own focused experiment loop.
+
+### 13.1 Quiesce-before-snapshot is exhausted (this session)
+
+Chose the least-invasive fix (keep the writable root; quiesce the block queue right before the re-snapshot).
+Both variants **failed**, still panicking `InvalidAvailIdx`:
+- `mount -o remount,ro /` before `fc.Snapshot` → `reported_len: 1709`.
+- `mount -o remount,ro / && sync && sleep 2` → `reported_len: 1758`.
+
+Across the four attempts `reported_len` was **714 / 1229 / 1709 / 1758** — it **varies run to run**, which rules
+out a fixed structural bug and points at a **timing race**: FC's Full snapshot captures the writable
+virtio-blk queue while it still carries in-flight requests (`avail_idx` far ahead of `used_idx`). This fits
+our architecture — the NBD backend serves blocks **lazily** (1 MiB chunks streamed from MinIO), so the
+device-to-backend pipeline holds a backlog that no guest-side `sync`/`remount,ro`/`sleep` can drain (those
+quiesce the *filesystem*, not FC's device queue + our async `nbd.Dispatch`). The quiesce approach is
+therefore exhausted; the fix must drain **FC's virtio-blk device ↔ our NBD server** to `avail_idx == used_idx`
+before the snapshot, or match whatever E2B does at pause. **Next: read `e2b-dev/infra` for how it snapshots a
+live writable-NBD VM without this panic** (block-queue drain at pause? synchronous backend? a device flush?)
+before more KVM guesses. The E3 producer stays held in the working tree.
