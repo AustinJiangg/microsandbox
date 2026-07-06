@@ -39,10 +39,15 @@ type Client struct {
 	BaseURL string
 }
 
-// New builds a Client for baseURL (e.g. "http://<slot-ip>:49983") over http.DefaultClient. The default
-// client has no timeout, which is intended: a build step's own duration is bounded by the daemon's
-// per-command timeout (RunRequest.timeout_seconds), not by the HTTP client cutting the request off.
-func New(baseURL string) *Client { return &Client{HTTP: http.DefaultClient, BaseURL: baseURL} }
+// New builds a Client for baseURL (e.g. "http://<slot-ip>:49983"). The client has no timeout, which is
+// intended: a build step's own duration is bounded by the daemon's per-command timeout
+// (RunRequest.timeout_seconds), not by the HTTP client cutting the request off. Proxy is disabled: the
+// slot address (10.0.<i>.2) is private, and a stray HTTP(S)_PROXY in the orchestrator's env (it runs under
+// sudo, which does not source the no_proxy set in the shell profile) would otherwise hijack the loopback
+// dial and return 502 -- the WSL2 proxy trap (see docs/STAGE22_DESIGN.md §12).
+func New(baseURL string) *Client {
+	return &Client{HTTP: &http.Client{Transport: &http.Transport{Proxy: nil}}, BaseURL: baseURL}
+}
 
 // runRequest / runResponse mirror envd.RunRequest / envd.RunResponse in Connect's canonical JSON
 // (lowerCamelCase field names). proto3 JSON omits zero-valued fields, so a successful no-output command

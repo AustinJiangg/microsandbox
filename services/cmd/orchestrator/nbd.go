@@ -24,14 +24,18 @@ import (
 //
 // It applies only in --nbd s3 mode; local-fs mode (storage == nil) and non-NBD keep the legacy
 // materialized-file rootfs (a zero RootfsBacking), so those paths are unchanged.
-func (s *server) buildRootfsBacking(tmpl template.Template) (fc.RootfsBacking, error) {
+// It also returns the writable *block.Overlay it bound (nil in the legacy/non-NBD path), so the Stage-22
+// layer producer can ExportToDiff the guest's writes after the in-guest command runs; callers that don't
+// need it discard it. The overlay is the same object the returned Close tears down, so a caller must
+// ExportToDiff before the VM's Destroy runs Close.
+func (s *server) buildRootfsBacking(tmpl template.Template) (fc.RootfsBacking, *block.Overlay, error) {
 	if !s.useNBD || s.storage == nil {
-		return fc.RootfsBacking{}, nil // legacy: the drive/snapshot uses the materialized file at tmpl.Rootfs
+		return fc.RootfsBacking{}, nil, nil // legacy: the drive/snapshot uses the materialized file at tmpl.Rootfs
 	}
 	ctx := context.Background()
 	buildID, err := storage.ResolveAlias(ctx, s.storage, tmpl.Name)
 	if err != nil {
-		return fc.RootfsBacking{}, err
+		return fc.RootfsBacking{}, nil, err
 	}
 	// A Stage-20 layered child's snapshot is a re-snapshot of its base, so it bakes the base template's
 	// rootfs path (recorded at {buildID}/rootfs.path). Bind the device over THAT path, not tmpl.Rootfs, so
@@ -39,19 +43,19 @@ func (s *server) buildRootfsBacking(tmpl template.Template) (fc.RootfsBacking, e
 	// binds over tmpl.Rootfs as before.
 	bakedPath, err := storage.OpenRootfsBakedPath(ctx, s.storage, buildID)
 	if err != nil {
-		return fc.RootfsBacking{}, err
+		return fc.RootfsBacking{}, nil, err
 	}
 	// The bind target must exist as a file for `mount --bind` (prepareRestore only ensures tmpl.Rootfs,
 	// which for a layered child is NOT the baked path the device binds over). In --nbd mode the base's
 	// rootfs is never materialized there, so create an empty placeholder the bind then shadows.
 	if bakedPath != "" {
 		if err := ensureFile(bakedPath); err != nil {
-			return fc.RootfsBacking{}, err
+			return fc.RootfsBacking{}, nil, err
 		}
 	}
 	base, err := s.openRootfsBase(ctx, buildID)
 	if err != nil {
-		return fc.RootfsBacking{}, err
+		return fc.RootfsBacking{}, nil, err
 	}
 
 	// Stage 22b: give this VM a private writable overlay over the shared read-only base (E2B's model), so
@@ -61,14 +65,14 @@ func (s *server) buildRootfsBacking(tmpl template.Template) (fc.RootfsBacking, e
 	cachePath, cache, err := newRootfsCache(buildID, base.Size())
 	if err != nil {
 		_ = base.Close()
-		return fc.RootfsBacking{}, err
+		return fc.RootfsBacking{}, nil, err
 	}
 	provider, err := block.NewOverlay(base, cache)
 	if err != nil {
 		_ = cache.Close()
 		_ = base.Close()
 		_ = os.Remove(cachePath)
-		return fc.RootfsBacking{}, err
+		return fc.RootfsBacking{}, nil, err
 	}
 	// Bind the writable overlay to a pooled device. On any failure past Get, put the device back, close the
 	// provider (base readers + cache handle), and remove the cache file so nothing leaks.
@@ -76,14 +80,14 @@ func (s *server) buildRootfsBacking(tmpl template.Template) (fc.RootfsBacking, e
 	if err != nil {
 		_ = provider.Close()
 		_ = os.Remove(cachePath)
-		return fc.RootfsBacking{}, fmt.Errorf("acquire nbd device: %w", err)
+		return fc.RootfsBacking{}, nil, fmt.Errorf("acquire nbd device: %w", err)
 	}
 	exp, err := nbd.Bind(idx, provider)
 	if err != nil {
 		_ = provider.Close()
 		_ = os.Remove(cachePath)
 		s.nbdPool.Put(idx)
-		return fc.RootfsBacking{}, fmt.Errorf("bind nbd%d: %w", idx, err)
+		return fc.RootfsBacking{}, nil, fmt.Errorf("bind nbd%d: %w", idx, err)
 	}
 	return fc.RootfsBacking{
 		Device:    nbd.DevicePath(idx),
@@ -98,7 +102,7 @@ func (s *server) buildRootfsBacking(tmpl template.Template) (fc.RootfsBacking, e
 			}
 			return cerr
 		},
-	}, nil
+	}, provider, nil
 }
 
 // newRootfsCache creates this VM's private writable overlay cache: a sparse temp file sized to the device,

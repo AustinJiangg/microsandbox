@@ -202,58 +202,57 @@ func TestBuildLayeredInPlace(t *testing.T) {
 	}
 }
 
-// fakeSnapshotter records LayeredSnapshot calls (and can fail) so the build wiring is testable without
-// firecracker/KVM -- the real producer lives in the orchestrator (it resumes a base VM).
+// fakeSnapCall records one LayeredSnapshot invocation. fakeSnapshotter records them (and can fail) so the
+// build wiring is testable without firecracker/KVM -- the real producer lives in the orchestrator (it
+// resumes a base VM, runs the layer's commands in-guest, and re-snapshots).
+type fakeSnapCall struct {
+	baseName, baseBuildID, childBuildID string
+	commands                            []string
+}
+
 type fakeSnapshotter struct {
-	calls [][3]string // {baseName, baseBuildID, childBuildID}
+	calls []fakeSnapCall
 	err   error
 }
 
-func (f *fakeSnapshotter) LayeredSnapshot(_ context.Context, baseName, baseBuildID, childBuildID string) error {
-	f.calls = append(f.calls, [3]string{baseName, baseBuildID, childBuildID})
+func (f *fakeSnapshotter) LayeredSnapshot(_ context.Context, baseName, baseBuildID, childBuildID string, commands []string) error {
+	f.calls = append(f.calls, fakeSnapCall{baseName, baseBuildID, childBuildID, commands})
 	return f.err
 }
 
-// seedLayeredBase seeds a Local bucket with a non-layered 2 MiB base (like the default) under alias
-// `base`, and returns a fake exec that writes the child rootfs the layered builder would produce.
-func seedLayeredBase(t *testing.T, bucket *storage.Local) func(string, ...string) (string, error) {
-	t.Helper()
+// TestBuildLayeredWithSnapshot: a layered build WITH a snapshot (Stage 22 E3) is produced entirely by the
+// injected in-guest-run producer -- no docker build, no build-rootfs, no build-snapshot. Build parses the
+// recipe's RUN commands, hands them to LayeredSnapshot(baseName, baseBuildID, childBuildID, commands),
+// flips the alias, and shells out to nothing.
+func TestBuildLayeredWithSnapshot(t *testing.T) {
 	ctx := context.Background()
-	const mib = 1 << 20
-	base := bytes.Repeat([]byte{1}, 2*mib)
-	if err := bucket.Upload(ctx, storage.ArtifactKey("bld_base", storage.RootfsName), bytes.NewReader(base), int64(len(base))); err != nil {
-		t.Fatal(err)
-	}
+	bucket := storage.NewLocal(t.TempDir())
 	if err := storage.SetAlias(ctx, bucket, "base", "bld_base"); err != nil {
 		t.Fatal(err)
 	}
-	return func(name string, args ...string) (string, error) {
-		if strings.Contains(name, "build-snapshot") {
-			t.Errorf("a layered build must not run build-snapshot.sh (the live-VM producer replaces it): %v", args)
-		}
-		if strings.Contains(name, "build-rootfs-layered") { // <child_img> <from_img> <base_rootfs> <out>
-			_ = os.WriteFile(args[3], make([]byte, 2*mib), 0o644)
-		}
+	snap := &fakeSnapshotter{}
+	run := func(name string, args ...string) (string, error) {
+		t.Errorf("a layered snapshot build must run no commands (the in-guest producer replaces docker+rootfs): %s %v", name, args)
 		return "", nil
 	}
-}
-
-// TestBuildLayeredWithSnapshot: a layered build WITH a snapshot skips build-snapshot.sh and instead
-// invokes the injected live-VM producer with (baseName, baseBuildID, childBuildID) (Stage 20), still
-// publishing the rootfs as a COW diff.
-func TestBuildLayeredWithSnapshot(t *testing.T) {
-	bucket := storage.NewLocal(t.TempDir())
-	run := seedLayeredBase(t, bucket)
-	snap := &fakeSnapshotter{}
 	b := &Builder{storage: bucket, localRoot: t.TempDir(), scriptsDir: "/repo/scripts", snapshotter: snap, run: run}
-	if err := b.Build("bld_ds", "derived", "FROM base\nRUN true", "base", true); err != nil {
+	recipe := "FROM base\nRUN echo hi > /etc/m\nRUN true"
+	if err := b.Build("bld_ds", "derived", recipe, "base", true); err != nil {
 		t.Fatalf("layered Build with snapshot: %v", err)
 	}
-	if len(snap.calls) != 1 || snap.calls[0] != [3]string{"base", "bld_base", "bld_ds"} {
-		t.Fatalf("LayeredSnapshot calls = %v, want one {base bld_base bld_ds}", snap.calls)
+	if len(snap.calls) != 1 {
+		t.Fatalf("LayeredSnapshot calls = %d, want 1", len(snap.calls))
 	}
-	if h, err := storage.OpenRootfsHeader(context.Background(), bucket, "bld_ds"); err != nil || h == nil {
-		t.Fatalf("rootfs still published as a COW diff: err=%v nil=%v", err, h == nil)
+	c := snap.calls[0]
+	if c.baseName != "base" || c.baseBuildID != "bld_base" || c.childBuildID != "bld_ds" {
+		t.Fatalf("LayeredSnapshot ids = %+v, want {base bld_base bld_ds}", c)
+	}
+	if len(c.commands) != 2 || c.commands[0] != "echo hi > /etc/m" || c.commands[1] != "true" {
+		t.Fatalf("LayeredSnapshot commands = %v, want [echo hi > /etc/m, true]", c.commands)
+	}
+	// The alias is flipped to the child build (published last, so a resolver never sees a half-built one).
+	if bid, err := storage.ResolveAlias(ctx, bucket, "derived"); err != nil || bid != "bld_ds" {
+		t.Fatalf("alias derived -> %q (err %v), want bld_ds", bid, err)
 	}
 }
 
@@ -294,6 +293,38 @@ func TestFirstFromImage(t *testing.T) {
 	for _, recipe := range []string{"", "RUN true\n# no FROM here"} {
 		if _, err := firstFromImage(recipe); err == nil {
 			t.Errorf("firstFromImage(%q) = nil error; want an error (no FROM)", recipe)
+		}
+	}
+}
+
+// TestRunCommands covers the RUN parser the Stage-22 producer feeds the guest (D5): RUN commands in order,
+// case-insensitive, non-RUN instructions skipped, comments/blanks ignored, backslash line-continuations
+// joined, and a recipe with no RUN yielding an empty (not error) list.
+func TestRunCommands(t *testing.T) {
+	cases := []struct {
+		recipe string
+		want   []string
+	}{
+		{"FROM base\nRUN echo hi > /etc/m\nRUN true", []string{"echo hi > /etc/m", "true"}},
+		{"FROM base\nENV X=1\nrun make", []string{"make"}},           // non-RUN skipped, RUN case-insensitive
+		{"FROM base\n# c\n\nRUN a", []string{"a"}},                    // comments + blanks ignored
+		{"FROM base\nRUN echo a \\\n  && echo b", []string{"echo a && echo b"}}, // line continuation joined
+		{"FROM base", nil},                                            // no RUN -> empty layer, no error
+	}
+	for _, c := range cases {
+		got, err := runCommands(c.recipe)
+		if err != nil {
+			t.Errorf("runCommands(%q) error: %v", c.recipe, err)
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("runCommands(%q) = %v, want %v", c.recipe, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("runCommands(%q)[%d] = %q, want %q", c.recipe, i, got[i], c.want[i])
+			}
 		}
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"microsandbox/services/pkg/block"
+	"microsandbox/services/pkg/envdclient"
 	"microsandbox/services/pkg/fc"
 	"microsandbox/services/pkg/nbd"
 	"microsandbox/services/pkg/network"
@@ -230,7 +232,7 @@ func (s *server) restoreHealthy(tmpl template.Template) (*fc.MicroVM, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare restore artifacts for %q: %w", tmpl.Name, err)
 	}
-	rootfs, err := s.buildRootfsBacking(tmpl) // NBD device (Stage 21c), or a zero backing (legacy file)
+	rootfs, _, err := s.buildRootfsBacking(tmpl) // NBD device (Stage 21c), or a zero backing (legacy file)
 	if err != nil {
 		if memSource != nil {
 			_ = memSource.Close() // fc.Restore would have owned it; we bailed before calling it
@@ -240,39 +242,63 @@ func (s *server) restoreHealthy(tmpl template.Template) (*fc.MicroVM, error) {
 	return healthyOrDestroy(fc.Restore(fc.NewID(), s.vendorDir, tmpl, s.net, memSource, rootfs))
 }
 
+// restoreHealthyWritable is restoreHealthy that also returns the VM's writable rootfs overlay, for the
+// Stage-22 layer producer: after the layer's command runs in-guest, the producer exports the overlay's
+// dirtied blocks as the child's rootfs diff. The overlay is owned by the VM (torn down by Destroy via the
+// backing's Close), so the caller must ExportToDiff before Destroy. --nbd s3 mode only (the overlay is nil
+// otherwise, which is why the producer guards on useNBD).
+func (s *server) restoreHealthyWritable(tmpl template.Template) (*fc.MicroVM, *block.Overlay, error) {
+	memSource, err := s.prepareRestore(tmpl)
+	if err != nil {
+		return nil, nil, fmt.Errorf("prepare restore artifacts for %q: %w", tmpl.Name, err)
+	}
+	rootfs, overlay, err := s.buildRootfsBacking(tmpl)
+	if err != nil {
+		if memSource != nil {
+			_ = memSource.Close()
+		}
+		return nil, nil, fmt.Errorf("prepare rootfs backing for %q: %w", tmpl.Name, err)
+	}
+	vm, err := healthyOrDestroy(fc.Restore(fc.NewID(), s.vendorDir, tmpl, s.net, memSource, rootfs))
+	if err != nil {
+		return nil, nil, err
+	}
+	return vm, overlay, nil
+}
+
 func (s *server) spawnHealthy(tmpl template.Template) (*fc.MicroVM, error) {
 	if err := s.prepareSpawn(tmpl); err != nil {
 		return nil, fmt.Errorf("prepare spawn artifacts for %q: %w", tmpl.Name, err)
 	}
-	rootfs, err := s.buildRootfsBacking(tmpl)
+	rootfs, _, err := s.buildRootfsBacking(tmpl)
 	if err != nil {
 		return nil, fmt.Errorf("prepare rootfs backing for %q: %w", tmpl.Name, err)
 	}
 	return healthyOrDestroy(fc.Spawn(fc.NewID(), s.vendorDir, tmpl, s.net, rootfs))
 }
 
-// LayeredSnapshot produces a layered template's snapshot by a self-consistent live-VM re-snapshot -- the
-// Stage-20 memfile-COW producer (chosen over grafting / in-guest-command; see docs/STAGE20_DESIGN.md). It
-// resumes the BASE build exactly as a normal restore does (base RAM over UFFD + base rootfs at the base's
-// own baked path -- the self-consistent snapshot E2B resumes), takes a fresh Full snapshot, and stores the
-// child's memfile as a COW diff over the base ({childBuildID}/memfile + .header) plus its re-snapshotted
-// vmstate ({childBuildID}/snapfile) and the baked rootfs path (so the child's restore binds its NBD device
-// over exactly what the vmstate references -- the re-snapshot bakes the BASE's rootfs path, not the child's).
+// LayeredSnapshot produces a layered template's snapshot by E2B's one-run-two-diffs model (Stage 22): it
+// resumes the BASE over a writable rootfs overlay, runs the layer's commands IN THE GUEST, then takes one
+// Full snapshot from which BOTH diffs are derived -- the memfile as a COW diff over the base
+// ({childBuildID}/memfile + .header) and the rootfs as a COW diff from the overlay's dirtied blocks
+// ({childBuildID}/rootfs.ext4 + .header). Because the guest itself made the changes, its RAM (page cache)
+// and disk (the overlay) are one consistent state at the snapshot instant -- fixing the Stage-20 producer,
+// which grafted a separately-built docker+debugfs rootfs onto the base's RAM and so left the child's disk
+// change invisible at restore (the base RAM's cached /etc shadowed it; docs/STAGE22_DESIGN.md).
 //
-// Honest divergence from E2B: we do NOT run the layer's build command in-guest (that needs a
-// start/ready-command subsystem we lack), and the rootfs diff is produced separately by docker+debugfs
-// (Stage 19). So the child's RAM is the base's warm RAM plus only the small delta of
-// resume -> health -> re-snapshot -- a maximal COW win, not a per-child warm working set. The produced
-// layered snapshot is restorable only under --nbd (the child's rootfs must be served at the base's baked
-// path without clobbering the base's own rootfs there). Implemented on *server so it can reach fc + the
-// network manager; injected into pkg/build as a build.Snapshotter.
-func (s *server) LayeredSnapshot(ctx context.Context, baseName, baseBuildID, childBuildID string) error {
+// It also stores the re-snapshotted vmstate ({childBuildID}/snapfile) and the baked rootfs path (the
+// re-snapshot bakes the BASE's rootfs path, so the child's restore binds its own NBD device over exactly
+// what the vmstate references). Restorable only under --nbd (the child's rootfs is served at the base's
+// baked path via the per-VM bind, without clobbering the base's rootfs there). Implemented on *server so it
+// can reach fc + the network manager + envd; injected into pkg/build as a build.Snapshotter.
+func (s *server) LayeredSnapshot(ctx context.Context, baseName, baseBuildID, childBuildID string, commands []string) error {
 	if s.storage == nil {
 		return fmt.Errorf("layered snapshot needs object storage (s3 mode)")
 	}
 	// The child bakes its base's rootfs path (below); only NBD can then serve the child's OWN rootfs at
-	// that path at restore (via the per-VM bind) without clobbering the base's rootfs there. Without --nbd
-	// the child would restore against the base's rootfs -- silently wrong -- so refuse to produce one.
+	// that path at restore (via the per-VM bind) without clobbering the base's rootfs there. It is also
+	// what gives the producer a writable overlay to capture the in-guest command's disk writes. Without
+	// --nbd the child would restore against the base's rootfs -- silently wrong -- so refuse to produce one.
 	if !s.useNBD {
 		return fmt.Errorf("layered snapshot requires --nbd (the child's rootfs is served over NBD at the base's baked path)")
 	}
@@ -280,23 +306,44 @@ func (s *server) LayeredSnapshot(ctx context.Context, baseName, baseBuildID, chi
 	if err != nil {
 		return fmt.Errorf("resolve base template %q: %w", baseName, err)
 	}
-	// The child's rootfs was diffed against baseBuildID (build.Build); the memfile must diff against the
-	// same base. restoreHealthy resumes by template name (the alias), so guard that the base's alias still
-	// points at that build -- a concurrent base rebuild mid-child-build is unsupported, not silently wrong.
+	// The child's diffs are computed against baseBuildID; the resume goes by template name (the alias), so
+	// guard that the base's alias still points at that build -- a concurrent base rebuild mid-child-build is
+	// unsupported, not silently wrong.
 	if cur, err := storage.ResolveAlias(ctx, s.storage, baseName); err != nil {
 		return fmt.Errorf("resolve base %q: %w", baseName, err)
 	} else if cur != baseBuildID {
 		return fmt.Errorf("base %q moved from %s to %s during the layered build (unsupported concurrent rebuild)", baseName, baseBuildID, cur)
 	}
 
-	// Resume the base self-consistently and wait for health, reusing the exact restore path a user create
-	// takes. The producer VM is unregistered -- we own its lifecycle and Destroy it below.
-	vm, err := s.restoreHealthy(baseTmpl)
+	// Resume the base over a WRITABLE overlay and wait for health, reusing the restore path a user create
+	// takes. The producer VM is unregistered -- we own its lifecycle and Destroy it below (Destroy also
+	// closes the overlay via the backing's Close, so ExportToDiff must run before then).
+	vm, overlay, err := s.restoreHealthyWritable(baseTmpl)
 	if err != nil {
 		return fmt.Errorf("resume base %q for re-snapshot: %w", baseName, err)
 	}
 	defer vm.Destroy()
 
+	// Run the layer's commands IN THE GUEST (E2B's model), so the one snapshot below captures a mutually
+	// consistent (RAM page cache, overlay disk) pair. envd's ProcessService.Run is synchronous; a non-zero
+	// exit fails the build. envd is reached over the VM's NIC at the slot's routable addr.
+	envd := envdclient.New("http://" + vm.Slot.Addr(fc.EnvdTCPPort))
+	for _, cmd := range commands {
+		res, err := envd.Run(ctx, cmd, 0)
+		if err != nil {
+			return fmt.Errorf("run layer command %q in guest: %w", cmd, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("layer command %q exited %d: %s", cmd, res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
+	}
+	// sync so the writes are durable in the overlay AND settled in the page cache before the snapshot -- the
+	// (disk diff, RAM diff) pair must be consistent at rest (docs/STAGE22_DESIGN.md D4).
+	if res, err := envd.Run(ctx, "sync", 0); err != nil {
+		return fmt.Errorf("sync guest before snapshot: %w", err)
+	} else if res.ExitCode != 0 {
+		return fmt.Errorf("sync guest exited %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
 	// Re-snapshot the running base to temp files. A Full snapshot faults all base RAM in over UFFD, so the
 	// memfile is complete and mostly identical to the base -- the COW diff (below) is then small.
 	tmp, err := os.MkdirTemp("", "msb-resnap-"+childBuildID+"-")
@@ -310,8 +357,8 @@ func (s *server) LayeredSnapshot(ctx context.Context, baseName, baseBuildID, chi
 		return fmt.Errorf("re-snapshot base for %q: %w", childBuildID, err)
 	}
 
-	// Publish the child's snapshot artifacts: the memfile as a COW diff over the base, the vmstate as the
-	// snapfile, and the baked rootfs path the vmstate references (so the child's restore binds over it).
+	// Publish the memfile COW diff over the base, the re-snapshotted vmstate, and the baked rootfs path the
+	// vmstate references (so the child's restore binds its NBD device over it).
 	if err := storage.PublishMemfileDiff(ctx, s.storage, baseBuildID, newMemfile, childBuildID); err != nil {
 		return fmt.Errorf("publish memfile diff for %q: %w", childBuildID, err)
 	}
@@ -320,6 +367,24 @@ func (s *server) LayeredSnapshot(ctx context.Context, baseName, baseBuildID, chi
 	}
 	if err := storage.PublishRootfsBakedPath(ctx, s.storage, childBuildID, baseTmpl.Rootfs); err != nil {
 		return fmt.Errorf("record baked rootfs path for %q: %w", childBuildID, err)
+	}
+
+	// Publish the rootfs COW diff from the overlay's dirtied blocks -- the disk half of the one-run producer
+	// (Stage 22 E3). This REPLACES the Stage-19 docker+debugfs rootfs for the with-snapshot path: because
+	// the guest itself wrote these blocks (before the snapshot above), they are consistent with the captured
+	// RAM. ExportToDiff must run before the deferred Destroy closes the overlay.
+	diff, err := overlay.ExportToDiff()
+	if err != nil {
+		return fmt.Errorf("export rootfs diff for %q: %w", childBuildID, err)
+	}
+	if err := storage.PublishRootfsDiffBlocks(ctx, s.storage, baseBuildID, childBuildID, storage.DiffBlocks{
+		Data:      diff.Data,
+		Dirty:     diff.Dirty,
+		Empty:     diff.Empty,
+		BlockSize: diff.BlockSize,
+		Size:      overlay.Size(),
+	}); err != nil {
+		return fmt.Errorf("publish rootfs diff for %q: %w", childBuildID, err)
 	}
 	return nil
 }

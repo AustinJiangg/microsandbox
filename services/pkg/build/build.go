@@ -18,14 +18,18 @@ import (
 	"microsandbox/services/pkg/storage"
 )
 
-// Snapshotter produces a layered template's snapshot by a live-VM re-snapshot (Stage 20): resume the
-// base self-consistently, re-snapshot, and publish the child's snapfile + COW memfile diff over the base.
-// It is implemented by the orchestrator (which owns firecracker + the network manager); the builder
-// depends only on this interface so it stays docker/KVM-free and unit-testable with a fake. nil => no
-// live-VM producer, so a layered build that also asks for a snapshot is rejected (a Stage-17 single-build
-// memfile is meaningless for a layer -- two independently-booted RAM images differ everywhere).
+// Snapshotter produces a layered template's snapshot by a live-VM re-snapshot (Stage 20/22): resume the
+// base self-consistently over a writable overlay, run the layer's commands IN THE GUEST, then take one
+// Full snapshot from which both the memfile diff and the rootfs diff are derived -- so the child's RAM
+// (page cache) and disk (the overlay) are a mutually consistent pair (E2B's one-run-two-diffs model; the
+// Stage-20 producer instead grafted a separately-built rootfs onto the base's RAM, which left the child's
+// disk change invisible at restore -- docs/STAGE22_DESIGN.md). It is implemented by the orchestrator
+// (which owns firecracker + the network manager); the builder depends only on this interface so it stays
+// docker/KVM-free and unit-testable with a fake. nil => no live-VM producer, so a layered build that also
+// asks for a snapshot is rejected (a Stage-17 single-build memfile is meaningless for a layer -- two
+// independently-booted RAM images differ everywhere).
 type Snapshotter interface {
-	LayeredSnapshot(ctx context.Context, baseName, baseBuildID, childBuildID string) error
+	LayeredSnapshot(ctx context.Context, baseName, baseBuildID, childBuildID string, commands []string) error
 }
 
 // Builder runs the build pipeline for one template at a time. run is the command executor,
@@ -93,6 +97,27 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 		baseBuildID, err = storage.ResolveAlias(context.Background(), b.storage, base)
 		if err != nil {
 			return fmt.Errorf("resolve base template %q: %w", base, err)
+		}
+		// Stage 22 E3: a LAYERED build WITH a snapshot is produced entirely by ONE in-guest run (E2B's
+		// model) -- no docker build, no build-rootfs-layered.sh, no PublishRootfsDiff. The live-VM producer
+		// resumes the base over a writable overlay, runs the recipe's RUN commands in the guest, and
+		// re-snapshots, publishing BOTH the rootfs diff (the overlay's dirtied blocks) and the memfile diff
+		// from one consistent snapshot. So parse the RUN commands and hand off here; the cold-start layered
+		// path (below) is the only one that still shells out to docker + debugfs.
+		if withSnapshot {
+			commands, err := runCommands(dockerfile)
+			if err != nil {
+				return fmt.Errorf("layered snapshot of %q: %w", name, err)
+			}
+			ctx := context.Background()
+			if err := b.snapshotter.LayeredSnapshot(ctx, base, baseBuildID, buildID, commands); err != nil {
+				return fmt.Errorf("layered snapshot over %s: %w", baseBuildID, err)
+			}
+			// Flip the alias last, so a resolver never sees a half-published build (matching publish()).
+			if err := storage.SetAlias(ctx, b.storage, name, buildID); err != nil {
+				return fmt.Errorf("set alias %s -> %s: %w", name, buildID, err)
+			}
+			return nil
 		}
 		// The layout-preserving builder diffs the child image against the image it was built FROM, so the
 		// child recipe must FROM the base template's image (Decision 3 in docs/STAGE19_DESIGN.md). Parse
@@ -167,7 +192,7 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 	//    orchestrator boots from the local dir we just wrote, which in s3 mode doubles as the
 	//    materialize cache (a same-box boot is a cache hit). See docs/STAGE15_DESIGN.md.
 	if b.storage != nil {
-		if err := b.publish(buildID, name, base, dir, baseBuildID, withSnapshot); err != nil {
+		if err := b.publish(buildID, name, dir, baseBuildID, withSnapshot); err != nil {
 			return err
 		}
 	}
@@ -181,11 +206,10 @@ func (b *Builder) Build(buildID, name, dockerfile, base string, withSnapshot boo
 //
 // The rootfs is stored differently depending on baseBuildID: a layered build (baseBuildID set) stores
 // only its copy-on-write diff over the base + a flattened {buildID}/rootfs.ext4.header (Stage 18); a
-// non-layered build uploads the whole rootfs (Stage 15). The SNAPSHOT diverges the same way (Stage 20): a
-// non-layered build uploads its fresh-boot vmstate + compacted memfile whole; a layered build has no local
-// snapshot (step 3 skipped it) and instead invokes the live-VM producer, which resumes the base, re-snapshots,
-// and stores the memfile as a COW diff over the base. The base name identifies the template to resume.
-func (b *Builder) publish(buildID, name, base, dir, baseBuildID string, withSnapshot bool) error {
+// non-layered build uploads the whole rootfs (Stage 15). Only NON-snapshot builds reach the snapshot
+// upload here: a layered build WITH a snapshot is produced by the Stage-22 in-guest-run producer in Build
+// (which publishes both diffs and flips the alias itself) and returns before publish.
+func (b *Builder) publish(buildID, name, dir, baseBuildID string, withSnapshot bool) error {
 	ctx := context.Background()
 	rootfsLocal := filepath.Join(dir, "rootfs.ext4")
 	if baseBuildID != "" {
@@ -196,23 +220,16 @@ func (b *Builder) publish(buildID, name, base, dir, baseBuildID string, withSnap
 		return fmt.Errorf("upload %s: %w", storage.ArtifactKey(buildID, storage.RootfsName), err)
 	}
 	if withSnapshot {
-		if baseBuildID == "" {
-			// Non-layered: upload the fresh-boot snapshot whole -- vmstate as {buildID}/snapfile, and the
-			// memfile compacted + indexed (Stage 17: present blocks only + {buildID}/memfile.header).
-			snap := filepath.Join(dir, "snapshot")
-			if err := uploadFile(ctx, b.storage, filepath.Join(snap, "vmstate"), storage.ArtifactKey(buildID, storage.SnapfileName)); err != nil {
-				return fmt.Errorf("upload %s: %w", storage.ArtifactKey(buildID, storage.SnapfileName), err)
-			}
-			if err := storage.PublishMemfile(ctx, b.storage, filepath.Join(snap, "memfile"), buildID); err != nil {
-				return err
-			}
-		} else {
-			// Layered: the live-VM producer resumes the base and re-snapshots, publishing {buildID}/snapfile
-			// + the COW memfile diff ({buildID}/memfile + .header) + the baked rootfs path (Stage 20). It runs
-			// before SetAlias, so a resolver never sees a half-published layered build.
-			if err := b.snapshotter.LayeredSnapshot(ctx, base, baseBuildID, buildID); err != nil {
-				return fmt.Errorf("layered snapshot over %s: %w", baseBuildID, err)
-			}
+		// Only the NON-layered path reaches here: a layered build WITH a snapshot is produced by the
+		// Stage-22 in-guest-run producer in Build (which publishes both diffs + flips the alias) and returns
+		// before publish. Upload the fresh-boot snapshot whole -- vmstate as {buildID}/snapfile, and the
+		// memfile compacted + indexed (Stage 17: present blocks only + {buildID}/memfile.header).
+		snap := filepath.Join(dir, "snapshot")
+		if err := uploadFile(ctx, b.storage, filepath.Join(snap, "vmstate"), storage.ArtifactKey(buildID, storage.SnapfileName)); err != nil {
+			return fmt.Errorf("upload %s: %w", storage.ArtifactKey(buildID, storage.SnapfileName), err)
+		}
+		if err := storage.PublishMemfile(ctx, b.storage, filepath.Join(snap, "memfile"), buildID); err != nil {
+			return err
 		}
 	}
 	if err := storage.SetAlias(ctx, b.storage, name, buildID); err != nil {
@@ -260,6 +277,35 @@ func firstFromImage(dockerfile string) (string, error) {
 		return "", fmt.Errorf("FROM with no image: %q", line)
 	}
 	return "", fmt.Errorf("recipe has no FROM instruction")
+}
+
+// runCommands returns the shell commands from a recipe's RUN instructions, in order -- the layer's build
+// steps the Stage-22 producer runs in-guest (docs/STAGE22_DESIGN.md D5). It supports the `RUN <cmd>` shell
+// form (this stage's only form) with backslash line-continuations; COPY/ADD/ENV and RUN's exec-array form
+// are out of scope (D5). A recipe with no RUN is allowed (an empty layer -- the producer still re-snapshots
+// the base, capturing only the resume delta).
+func runCommands(dockerfile string) ([]string, error) {
+	var cmds []string
+	lines := strings.Split(dockerfile, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if !strings.EqualFold(fields[0], "RUN") {
+			continue // FROM / ENV / COPY / ... -- not an in-guest command (D5)
+		}
+		cmd := strings.TrimSpace(line[len(fields[0]):]) // everything after the RUN keyword
+		for strings.HasSuffix(cmd, `\`) && i+1 < len(lines) {
+			cmd = strings.TrimSpace(strings.TrimSuffix(cmd, `\`)) + " " + strings.TrimSpace(lines[i+1])
+			i++
+		}
+		if cmd != "" {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return cmds, nil
 }
 
 // tail returns the trailing portion of s -- the useful end of a long build log.
