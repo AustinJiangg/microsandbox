@@ -336,15 +336,27 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   single-box speedup** — unpooled restore is *slower* (~3.5s vs ~1.6s) because the guest faults its working
   set over NBD on first access; the warm pool hides it. Real-VM e2e **44/44** in `--nbd` s3 mode (cold-start +
   restore + concurrent restores + layered template all boot over NBD). See `docs/STAGE21_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): **deepen the Stage-20 memfile producer to full
-  E2B fidelity** — an **in-guest command-execution subsystem** (start/ready commands) so a layer runs its
-  actual command in the guest, dirtying a per-child warm working set, plus the **writable-overlay `rw` rootfs**
-  (Stage 21b, built + wired + waiting) so that run's disk writes and RAM are captured by one self-consistent
-  re-snapshot (E2B's two-diffs-from-one-run model, replacing our docker+debugfs rootfs). Then production
-  fidelity — multi-host scheduling over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript
-  SDK; a cross-node chunk cache; and auth depth (a key-management API, token expiry/rotation, TLS). Note:
-  memfile/rootfs **compression IS an optional E2B mechanism** (V4/V5 headers, zstd/lz4 in 2 MiB frames, raw V3
-  still supported, orthogonal to COW); we still store raw, so it stays deferred optional depth.
+- **Done (Stage 22 — E2B's layered-snapshot producer: in-guest command, one re-snapshot → two COW diffs)**:
+  the live-VM memfile producer now matches E2B's model — a layered build with a snapshot **resumes the base
+  over a writable rootfs overlay, runs the layer's command IN THE GUEST** (envd `Run`), `sync`s, and takes one
+  **Full re-snapshot** from which BOTH the memfile (COW diff over the base, `BuildDiff` on the dumped memfile)
+  and the rootfs (the overlay's dirtied blocks, `ExportToDiff`) are derived — so the child's RAM and disk are
+  one consistent state, fixing the Stage-20 grafting bug. **The long blocker was a Firecracker regression, not
+  our code:** re-snapshotting a UFFD-restored VM's writable virtio devices produced an inconsistent
+  `(memfile, vmstate)` pair that **v1.16.0** rejects on restore (`InvalidAvailIdx` / RX-descriptor panic).
+  E2B runs plain upstream **v1.10.1** (its `v1.10.1_1fcdaec08` is just `<tag>_<commit>`, no patch), which does
+  **not** have the regression. **Pinning `vendor/firecracker` to v1.10.1 closes it** — three small changes made
+  it a clean drop-in: the UFFD handshake accepts v1.10.1's `page_size_kib` (renamed to `page_size` in v1.16.0,
+  same bytes; `pkg/uffd`), a layered child's stale local vmstate is refreshed per build (`prepareRestore`, a
+  latent cache bug), and `test_restore_is_fast`'s NBD bound. Kept from the vanilla-FC investigation:
+  `io_engine Async` + load-paused-then-resume (both are what E2B does on v1.10.1). Real-VM e2e **45/45** in
+  `--nbd` s3 mode (`test_layered_snapshot_via_api` now un-gated). See `docs/STAGE22_DESIGN.md` (§16 the
+  resolution; §13–15 the vanilla-v1.16.0 investigation that located the regression).
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): **production fidelity** — multi-host scheduling
+  over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript SDK; a cross-node chunk cache;
+  and auth depth (a key-management API, token expiry/rotation, TLS). Note: memfile/rootfs **compression IS an
+  optional E2B mechanism** (V4/V5 headers, zstd/lz4 in 2 MiB frames, raw V3 still supported, orthogonal to
+  COW); we still store raw, so it stays deferred optional depth.
 
 ## Development conventions
 

@@ -261,6 +261,18 @@ boot / API / SDK all **unchanged**. **Measured:** the same `derived` (default + 
 rootfs diff over the 576 MiB base (**0.0047%**, vs Stage 18's 278.8 MiB / 48% — ~10,000× smaller), asserted in the
 e2e via a Go probe (`msb-rootfs-stat`). e2e **44/44** in s3 mode. See `docs/STAGE19_DESIGN.md`.
 
+### Stage 22 — E2B's layered-snapshot producer (in-guest command → one re-snapshot → two COW diffs) ✅
+The live-VM memfile producer now matches E2B: a layered build with a snapshot resumes the base over a
+writable rootfs overlay, runs the layer's command **in the guest** (envd `Run`), `sync`s, and takes one Full
+re-snapshot from which both the memfile COW diff (`BuildDiff` on the dump) and the rootfs COW diff (the
+overlay's dirtied blocks, `ExportToDiff`) are derived — the child's RAM and disk are one consistent state.
+**The long blocker was a Firecracker regression, not our code:** re-snapshotting a UFFD-restored VM's
+writable virtio devices yields an inconsistent `(memfile, vmstate)` pair that **v1.16.0** rejects on restore.
+E2B runs plain upstream **v1.10.1** (its `v1.10.1_1fcdaec08` = `<tag>_<commit>`, no patch), which lacks the
+regression; **pinning `vendor/firecracker` to v1.10.1 closes it** (+ UFFD `page_size_kib` compat, a
+layered-child stale-vmstate refresh, `io_engine Async` + load-paused-then-resume to match E2B). Real-VM e2e
+**45/45** in `--nbd` s3 mode. See `docs/STAGE22_DESIGN.md` (§16 resolution; §13–15 the investigation).
+
 ### Still deferred
 - **More storage-mechanism depth (deeper E2B fidelity behind the same seam).** Verified against
   `e2b-dev/infra`, and building on the Stage-17/18/19 `pkg/storage/header` + COW algebra: E2B serves the **rootfs

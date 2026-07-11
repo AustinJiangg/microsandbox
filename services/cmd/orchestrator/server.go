@@ -440,6 +440,16 @@ func (s *server) prepareRestore(tmpl template.Template) (uffd.PageSource, error)
 		return nil, err
 	}
 	vmstate := filepath.Join(tmpl.SnapshotDir, "vmstate")
+	// A layered re-snapshot child (Stage 20) gets a FRESH buildID on every build, but the local vmstate
+	// cache is keyed by template NAME, so Materialize's skip-if-exists would reuse a prior build's (or a
+	// prior firecracker version's) vmstate -- a format mismatch that fails the load. Drop the stale local
+	// vmstate for layered children (OpenRootfsBakedPath != "" marks one) so this build's vmstate is fetched
+	// fresh. Layered children are never warm-pooled, so there is no concurrent-restore race on the file.
+	if bakedPath, err := storage.OpenRootfsBakedPath(ctx, s.storage, buildID); err != nil {
+		return nil, err
+	} else if bakedPath != "" {
+		_ = os.Remove(vmstate)
+	}
 	if err := storage.Materialize(ctx, s.storage, storage.ArtifactKey(buildID, storage.SnapfileName), vmstate); err != nil {
 		return nil, err
 	}

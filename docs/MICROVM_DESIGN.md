@@ -260,7 +260,7 @@ VM cases skip as a group when that privilege is missing, like they do for `/dev/
 sudo usermod -aG kvm "$USER"
 
 # 2) Put the artifacts under vendor/:
-#    - vendor/firecracker : the static binary (a GitHub release; this repo used v1.16.0)
+#    - vendor/firecracker : the static binary (a GitHub release; pin v1.10.1 -- see below)
 #    - vendor/vmlinux     : a guest kernel with virtio-net / virtio-blk / ext4 / devtmpfs
 #                           built in (=y) -- e.g. a Firecracker CI kernel (this repo used 6.1.155);
 #                           verify against its .config before downloading. (virtio-vsock is no
@@ -285,7 +285,9 @@ and need none of this. On machines without KVM, `pytest` therefore still complet
 
 It works; the key facts and the pitfalls hit (the part most valuable for learning):
 
-- **Materials**: firecracker v1.16.0 + Firecracker CI's vmlinux 6.1.155 (vsock /
+- **Materials**: firecracker **v1.10.1** (E2B's version; v1.16.0 regressed the re-snapshot of a
+  UFFD-restored VM's writable virtio devices, breaking Stage 22's layered-snapshot producer -- see
+  `docs/STAGE22_DESIGN.md` §16) + Firecracker CI's vmlinux 6.1.155 (vsock /
   virtio-blk / ext4 / devtmpfs all `=y`, checked against `.config`). The rootfs is
   built from the agent image via `docker export` + `mkfs.ext4 -d`, packaged without
   root (~250MB).

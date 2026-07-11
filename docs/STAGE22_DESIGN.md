@@ -583,3 +583,43 @@ load-paused-then-resume in `fc.go`. **Reverted (regresses / doesn't help on vani
 machinery (`uffd.TrackedSource`, `PublishMemfileDiffBlocks`, the `Snapshot` split), the local-backend
 experiments. `test_layered_snapshot_via_api` stays gated (now failing only on the net device, one step
 further than before).
+
+## 16. RESOLVED — the blocker was a Firecracker v1.16.0 regression; **Firecracker v1.10.1 closes Stage 22**
+
+The residual net-device (and Disable-block) failure was **never a custom-FC problem: E2B's Firecracker is
+plain upstream v1.10.1.** `packages/fc-versions/build.sh` clones the *official*
+`firecracker-microvm/firecracker` and checks out tags from `firecracker_versions.txt` (`v1.5.0`, `v1.10.1`,
+`v1.12.1`); the `version_name` is `<git-describe-tag>_<short-commit>`, so **`v1.10.1_1fcdaec08` is literally
+the upstream `v1.10.1` release** (`1fcdaec08` is that tag's commit) — no patch. The only difference from us
+was the **version**: E2B v1.10.1, us v1.16.0.
+
+**Swapping vendor/firecracker to upstream v1.10.1 makes the whole layered-snapshot producer work end to end.**
+`test_layered_snapshot_via_api` **passes**: the producer resumes the base over UFFD, runs the layer's command
+in-guest, re-snapshots, and the child restores cleanly (boots, carries the child's disk marker, runs code,
+and the memfile diff is a small fraction of the base). The virtio-net/-block re-snapshot inconsistency that
+`InvalidAvailIdx` / the RX-descriptor panic exposed is a **regression introduced between v1.10.1 and v1.16.0**
+in Firecracker's snapshot/restore of a UFFD-restored VM's writable virtio devices; v1.10.1 does not have it.
+
+**Three small changes made v1.10.1 a clean drop-in (kept):**
+1. **UFFD handshake compat** (`pkg/uffd`): v1.10.1 sends the page-size field as `page_size_kib` (v1.16.0
+   renamed it to `page_size`); same BYTES units (its own test data is `page_size_kib: 4096`). `GuestRegion`
+   now accepts both and `parseRegions` folds `page_size_kib` into `PageSize`.
+2. **Stale-vmstate refresh** (`orchestrator prepareRestore`): a layered re-snapshot child gets a fresh
+   buildID per build, but the local vmstate cache is keyed by template NAME, so `Materialize`'s
+   skip-if-exists would reuse a prior build's (or a prior FC version's) vmstate — a format mismatch that
+   fails the load (`serialization/deserialization: the size limit has been reached`). For layered children
+   (`OpenRootfsBakedPath != ""`, never warm-pooled → no race) the stale local vmstate is dropped so this
+   build's is fetched fresh. This was a **latent correctness bug** independent of the FC swap (a second build
+   of any layered snapshot would have reused the first's vmstate).
+3. **Test bound** (`test_restore_is_fast`): `--nbd` is the default since Stage 22b, so the NBD 6 s bound must
+   apply unless `--nbd=false` is set explicitly (it was keyed on `--nbd` being *present* in `MSB_ORCH_FLAGS`).
+
+Plus the already-committed `io_engine Async` + load-paused-then-resume (both are what E2B does on v1.10.1;
+kept for fidelity, and Async remains the correct block engine). **Also kept from Stage 22:** the whole E3
+producer (in-guest command, one re-snapshot → two COW diffs via `BuildDiff`), unchanged — it was correct all
+along; only the Firecracker version was wrong.
+
+**Result:** real-VM e2e **45/45** in the default `--nbd` s3 mode on Firecracker v1.10.1 (44 prior +
+`test_layered_snapshot_via_api` un-gated), all Go units green. **Stage 22 is complete.** The setup docs pin
+**Firecracker v1.10.1** (`docs/MICROVM_DESIGN.md`); v1.16.0 is not usable for the live-VM re-snapshot
+producer.

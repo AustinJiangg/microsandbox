@@ -119,17 +119,21 @@ const (
 )
 
 // GuestRegion is one entry of the guest memory layout firecracker sends (a JSON array) right
-// after the uffd fd. Field names are pinned to firecracker v1.16.0
-// (src/firecracker/examples/uffd/uffd_utils.rs); note page_size is in BYTES in 1.16.0.
+// after the uffd fd (src/firecracker/examples/uffd/uffd_utils.rs). The page-size field was RENAMED
+// across firecracker versions but keeps the same units (BYTES): v1.16.0 sends `page_size`, v1.10.1
+// (E2B's version) sends `page_size_kib` -- a misnomer, still bytes (its test data is `page_size_kib:
+// 4096`). We accept both so one handler serves either firecracker; parseRegions folds kib->PageSize.
 type GuestRegion struct {
 	BaseHostVirtAddr uint64 `json:"base_host_virt_addr"`
 	Size             uint64 `json:"size"`
 	Offset           uint64 `json:"offset"`
 	PageSize         uint64 `json:"page_size"`
+	PageSizeKib      uint64 `json:"page_size_kib"` // v1.10.1's name for the same bytes value; folded below
 }
 
 // parseRegions unmarshals firecracker's mappings handshake body. An empty array means we got
-// no layout to serve from -- a protocol error, not a VM with no memory.
+// no layout to serve from -- a protocol error, not a VM with no memory. It folds v1.10.1's
+// page_size_kib into PageSize (same bytes units), so resolveFault sees one field regardless of version.
 func parseRegions(body []byte) ([]GuestRegion, error) {
 	var regions []GuestRegion
 	if err := json.Unmarshal(body, &regions); err != nil {
@@ -137,6 +141,11 @@ func parseRegions(body []byte) ([]GuestRegion, error) {
 	}
 	if len(regions) == 0 {
 		return nil, fmt.Errorf("uffd mappings empty")
+	}
+	for i := range regions {
+		if regions[i].PageSize == 0 {
+			regions[i].PageSize = regions[i].PageSizeKib // v1.10.1: the value arrived under page_size_kib
+		}
 	}
 	return regions, nil
 }

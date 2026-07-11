@@ -201,11 +201,13 @@ func assembleMapping(ctx context.Context, sp StorageProvider, mapping header.Map
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	tmp := dst + ".tmp"
-	f, err := os.Create(tmp)
+	// A UNIQUE temp file per call (not a fixed dst+".tmp"), so concurrent materializations of the same dst
+	// don't clobber each other's temp and fail the rename (same race as downloadObject).
+	f, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	// Size the file to the full logical size up front; gaps and zero-owner runs are then served by the
 	// file's own zero fill, so only present runs cost a read + write.
 	if err := f.Truncate(size); err != nil {

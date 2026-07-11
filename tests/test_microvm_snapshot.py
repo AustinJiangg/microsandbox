@@ -51,7 +51,9 @@ def test_restore_is_fast(snapshot_ready) -> None:
     (vs reading a local materialized rootfs) -- measured ~3.5s -- hence a looser 6s bound in --nbd
     mode. The warm pool hides both (a pooled VM is pre-allocated and pre-faulted).
     """
-    nbd = "--nbd" in os.environ.get("MSB_ORCH_FLAGS", "")
+    # --nbd is the orchestrator default since Stage 22b, so an empty MSB_ORCH_FLAGS still runs over NBD;
+    # only an explicit --nbd=false turns it off (matching test_layered_snapshot_via_api's detection).
+    nbd = "--nbd=false" not in os.environ.get("MSB_ORCH_FLAGS", "")
     bound = 6.0 if nbd else 2.5
     t0 = time.time()
     sb = Sandbox(from_snapshot=True, base_url=snapshot_ready)

@@ -95,14 +95,6 @@ def test_layered_template_via_api(api_template_build):
 SNAP_MARKER = "/etc/microsandbox-derived-snap"
 
 
-@pytest.mark.skipif(
-    not os.environ.get("MSB_TEST_LAYERED_SNAPSHOT"),
-    reason="Stage 22 E3: the in-guest-command layer producer builds and publishes both COW diffs (small and "
-    "correct), but the child re-snapshot won't restore over our lazy object-storage NBD backend -- FC's Full "
-    "snapshot captures the writable virtio-blk queue mid-flight (InvalidAvailIdx). Root cause + the E2B "
-    "mechanism to match are in docs/STAGE22_DESIGN.md §13; closing it needs a fast/drained NBD backend. Set "
-    "MSB_TEST_LAYERED_SNAPSHOT=1 to run this once that lands.",
-)
 def test_layered_snapshot_via_api(api_template_build):
     """Stage 20: build a COW-layered template WITH a snapshot, restore it, and assert the memfile COW win.
 

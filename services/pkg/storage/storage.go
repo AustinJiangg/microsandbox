@@ -144,11 +144,15 @@ func downloadObject(ctx context.Context, sp StorageProvider, key, dst string) er
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	tmp := dst + ".tmp"
-	f, err := os.Create(tmp)
+	// A UNIQUE temp file per call (not a fixed dst+".tmp"): concurrent restores materializing the SAME dst
+	// (e.g. several unpooled from_snapshot creates racing on vendor/snapshot/vmstate) must not clobber each
+	// other's temp, or one's rename finds the temp already consumed ("no such file"). Each renames its own
+	// temp over dst -- still atomic, last writer wins with identical bytes.
+	f, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	if _, err := io.Copy(f, rc); err != nil {
 		f.Close()
 		os.Remove(tmp)
