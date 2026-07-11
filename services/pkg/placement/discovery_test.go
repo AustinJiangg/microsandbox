@@ -162,6 +162,52 @@ func TestReconcileSkipsFactoryErrorThenRetries(t *testing.T) {
 	}
 }
 
+func TestReconcileSyncsDrainStatus(t *testing.T) {
+	disco := &fakeDiscovery{}
+	disco.set(NodeInfo{ID: "a", Proxy: "pa"}, NodeInfo{ID: "b", Proxy: "pb"})
+	factory := func(in NodeInfo) (*Node, error) {
+		return NewNode(in.ID, in.Proxy, &fakeRPC{}, DefaultCapacity), nil
+	}
+	reg := NewRegistry(disco, factory, 5)
+	for _, n := range reg.Nodes() {
+		if n.Draining() {
+			t.Fatalf("node %s should start active", n.ID)
+		}
+	}
+
+	// b enters drain -- same membership, only its self-reported status changed. reconcile must
+	// flip the LIVE node in place (not re-create it) so BestOfK stops picking it (Stage 25).
+	disco.set(NodeInfo{ID: "a", Proxy: "pa"}, NodeInfo{ID: "b", Proxy: "pb", Status: StatusDraining})
+	reg.reconcile(context.Background())
+	if nb, _ := reg.NodeByProxy("pb"); nb == nil || !nb.Draining() {
+		t.Fatal("b should be draining after reconcile picks up its status")
+	}
+	if na, _ := reg.NodeByProxy("pa"); na == nil || na.Draining() {
+		t.Fatal("a's status was unchanged; it must stay active")
+	}
+
+	// b leaves drain -> reconcile clears it (drain is reversible).
+	disco.set(NodeInfo{ID: "a", Proxy: "pa"}, NodeInfo{ID: "b", Proxy: "pb"})
+	reg.reconcile(context.Background())
+	if nb, _ := reg.NodeByProxy("pb"); nb == nil || nb.Draining() {
+		t.Fatal("b left drain; reconcile should clear draining")
+	}
+}
+
+func TestReconcileHonorsInitialDrainStatus(t *testing.T) {
+	disco := &fakeDiscovery{}
+	disco.set(NodeInfo{ID: "a", Proxy: "pa", Status: StatusDraining})
+	factory := func(in NodeInfo) (*Node, error) {
+		return NewNode(in.ID, in.Proxy, &fakeRPC{}, DefaultCapacity), nil
+	}
+	reg := NewRegistry(disco, factory, 5)
+	// A node discovered already draining must be built draining, so a node that was draining before
+	// this api started (or before it first saw the node) isn't picked until it re-reports active.
+	if na, ok := reg.NodeByProxy("pa"); !ok || !na.Draining() {
+		t.Fatal("a was discovered already draining; the freshly built node must start draining")
+	}
+}
+
 func TestStaticDiscoveryReturnsIsolatedCopy(t *testing.T) {
 	src := []NodeInfo{{ID: "a", GRPC: "a", Proxy: "pa"}}
 	d := NewStaticDiscovery(src)

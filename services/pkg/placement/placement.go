@@ -70,6 +70,7 @@ type Node struct {
 	count      atomic.Int64 // cached sandbox count from the last successful List
 	inProgress atomic.Int64 // chosen-but-not-yet-settled placements on this node
 	ready      atomic.Bool  // last List succeeded (reachable); false drops it from sampling
+	draining   atomic.Bool  // self-reported drain (Stage 25); true drops it from NEW placements
 	closeFn    func()       // cleanup run on eviction (closes the gRPC conn); nil for test nodes
 }
 
@@ -110,6 +111,16 @@ func (n *Node) Release() { n.inProgress.Add(-1) }
 
 // Ready reports whether the node's last List succeeded (so it is eligible for sampling).
 func (n *Node) Ready() bool { return n.ready.Load() }
+
+// Draining reports whether the node has self-reported drain (Stage 25). A draining node keeps
+// serving its existing sandboxes -- Delete/List still route to it -- but BestOfK never picks it for
+// a new placement. It is set by the registry's reconcile from the discovered NodeInfo.Status.
+func (n *Node) Draining() bool { return n.draining.Load() }
+
+// setDraining records the node's self-reported drain state. reconcile calls it each poll with the
+// discovered NodeInfo.Status, so an orchestrator entering (or leaving) drain flips the live node on
+// the next reconcile tick.
+func (n *Node) setDraining(v bool) { n.draining.Store(v) }
 
 // Load is the node's placement score: lower means emptier means preferred. It is E2B's
 // Score specialized to homogeneous 1-vCPU sandboxes -- (reserved) / capacity, where reserved

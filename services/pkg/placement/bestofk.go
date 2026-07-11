@@ -6,8 +6,8 @@ import (
 	"math/rand"
 )
 
-// ErrNoNode is returned by Choose when no sampled node is eligible (all excluded or not
-// ready). It is E2B's FailedToPlaceSandboxError -- the api maps it to a 503-class failure.
+// ErrNoNode is returned by Choose when no sampled node is eligible (all excluded, not ready, or
+// draining). It is E2B's FailedToPlaceSandboxError -- the api maps it to a 503-class failure.
 var ErrNoNode = errors.New("placement: no eligible node available")
 
 // BestOfK is E2B's "power of K choices" placement: rather than argmin over the whole fleet
@@ -50,7 +50,7 @@ func (b *BestOfK) Choose(nodes []*Node, excluded map[string]struct{}) (*Node, er
 }
 
 // sample returns up to K nodes drawn uniformly at random from nodes, skipping any that are
-// excluded or not ready. It is a partial Fisher-Yates over an index slice (each node is drawn
+// excluded, not ready, or draining. It is a partial Fisher-Yates over an index slice (each node is drawn
 // at most once); a skipped node is consumed from the pool but does not count toward K, so the
 // loop keeps drawing until it has K eligible candidates or the pool is exhausted -- exactly
 // E2B's sample(). rnd is the injected RNG.
@@ -75,7 +75,10 @@ func (b *BestOfK) sample(nodes []*Node, excluded map[string]struct{}) []*Node {
 		if _, ex := excluded[n.ID]; ex {
 			continue
 		}
-		if !n.Ready() {
+		// Eligibility = reachable AND not draining -- the faithful reduction of E2B's single
+		// `Status() == NodeStatusReady` check (placement_best_of_K.go sample()): our ready flag is
+		// its reachability half (Unhealthy/Connecting), Draining its self-reported half (Stage 25).
+		if !n.Ready() || n.Draining() {
 			continue
 		}
 		out = append(out, n)

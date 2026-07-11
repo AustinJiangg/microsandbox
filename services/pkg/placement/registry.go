@@ -149,9 +149,13 @@ func (r *Registry) reconcile(ctx context.Context) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// Add: discovered but not yet in the fleet.
+	// Add or update: a discovered node not yet in the fleet is built and joined; one already
+	// present has its self-reported drain status synced (Stage 25) -- an orchestrator that entered
+	// (or left) drain since the last poll flips its live node here, so BestOfK stops (or resumes)
+	// picking it without any membership change.
 	for id, in := range discovered {
-		if _, ok := r.nodes[id]; ok {
+		if existing, ok := r.nodes[id]; ok {
+			existing.setDraining(in.Status == StatusDraining)
 			continue
 		}
 		node, ferr := r.factory(in)
@@ -159,6 +163,7 @@ func (r *Registry) reconcile(ctx context.Context) {
 			log.Printf("placement: connect to discovered node %s (%s): %v", id, in.GRPC, ferr)
 			continue
 		}
+		node.setDraining(in.Status == StatusDraining) // honor a node discovered already draining
 		r.nodes[id] = node
 		r.byProxy[node.Proxy] = node
 		log.Printf("placement: node joined: %s (proxy %s)", id, node.Proxy)

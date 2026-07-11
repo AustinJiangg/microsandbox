@@ -2,15 +2,33 @@ package placement
 
 import "context"
 
+// Node lifecycle statuses a discovered orchestrator can self-report (Stage 25). We model only the
+// two that matter for placement; E2B's fuller set (Ready/Draining/Unhealthy/Standby, plus a
+// Connecting derived from the live gRPC state) reduces to these here because reachability is
+// already tracked separately (Node.ready, from the List poll) -- see docs/STAGE25_DESIGN.md D2/D4.
+const (
+	// StatusActive is a node accepting new placements. It is the zero value of NodeInfo.Status, so
+	// an old registry key (Stage 24, pre-status) or the static --nodes flag deserializes to active.
+	StatusActive = ""
+	// StatusDraining is a node that is alive and still serving its existing sandboxes (Delete/List
+	// still route to it) but is excluded from NEW placements -- E2B's NodeStatusDraining.
+	StatusDraining = "draining"
+)
+
 // NodeInfo is one orchestrator as reported by a Discovery backend: its unique id, the gRPC
-// address the api calls Create/Delete on, and the data-proxy address written to the catalog as
-// Route.Node (where client-proxy routes that sandbox's data path). It mirrors E2B's
-// discovery.Node{ShortID, OrchestratorAddress} -- we carry Proxy too, because the api routes the
-// data path by it (E2B derives the proxy address elsewhere). See docs/STAGE24_DESIGN.md §3.
+// address the api calls Create/Delete on, the data-proxy address written to the catalog as
+// Route.Node (where client-proxy routes that sandbox's data path), and its self-reported lifecycle
+// Status (Stage 25). It mirrors E2B's discovery.Node{ShortID, OrchestratorAddress} -- we carry
+// Proxy too, because the api routes the data path by it (E2B derives the proxy address elsewhere),
+// and Status because, unlike E2B (which polls it over a separate ServiceInfo RPC), our orchestrator
+// self-reports it through the same registrar heartbeat that advertises membership. Status is empty
+// (StatusActive) unless the orchestrator has entered drain. See docs/STAGE24_DESIGN.md §3 +
+// docs/STAGE25_DESIGN.md D1.
 type NodeInfo struct {
-	ID    string
-	GRPC  string
-	Proxy string
+	ID     string
+	GRPC   string
+	Proxy  string
+	Status string
 }
 
 // Discovery enumerates the orchestrators the api currently knows about. It is E2B's

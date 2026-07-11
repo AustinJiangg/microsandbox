@@ -96,6 +96,28 @@ func TestChooseSkipsNotReady(t *testing.T) {
 	}
 }
 
+func TestChooseSkipsDraining(t *testing.T) {
+	a := nodeWith("a", 0) // emptiest, but...
+	a.setDraining(true)   // ...draining -> excluded from NEW placements (Stage 25)
+	b := nodeWith("b", 5)
+	best, err := chooseAll(t, []*Node{a, b}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if best.ID != "b" {
+		t.Fatalf("a is draining; expected b, got %s", best.ID)
+	}
+	// Drain is reversible: once a leaves drain it is the emptiest node again.
+	a.setDraining(false)
+	best, err = chooseAll(t, []*Node{a, b}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if best.ID != "a" {
+		t.Fatalf("a resumed; expected the emptier a, got %s", best.ID)
+	}
+}
+
 func TestChooseSkipsExcluded(t *testing.T) {
 	a := nodeWith("a", 0) // emptiest, but excluded (its Create just failed)
 	b := nodeWith("b", 5)
