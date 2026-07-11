@@ -48,6 +48,8 @@ func main() {
 	orchGRPC := flag.String("orchestrator-grpc", "127.0.0.1:9090", "single-node fallback: orchestrator gRPC address (SandboxService) when --nodes is empty")
 	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "single-node fallback: orchestrator data-proxy address (the catalog Route.Node) when --nodes is empty")
 	nodesFlag := flag.String("nodes", "", "orchestrator fleet as comma-separated grpc@proxy entries (Stage 23 multi-host); empty falls back to the single --orchestrator-grpc/--orchestrator-proxy node")
+	nodeDiscovery := flag.String("node-discovery", "static",
+		"orchestrator fleet discovery (Stage 24): 'static' (the --nodes/legacy flags, default) or 'redis' (the shared Redis service registry orchestrators self-register into via --register)")
 	redisAddr := flag.String("redis-addr", "127.0.0.1:6379", "Redis address holding the sandbox routing catalog (the api writes routes here on create/destroy)")
 	dataURL := flag.String("data-url", "http://127.0.0.1:8081", "public client-proxy data URL returned to the SDK as where to send the data path")
 	storeDSN := flag.String("store-dsn", "postgres://postgres@127.0.0.1:5432/microsandbox?sslmode=disable",
@@ -56,17 +58,30 @@ func main() {
 		"comma-separated key=team pairs to seed on startup (a bare key maps to team 'default'); empty seeds nothing (Stage 16)")
 	flag.Parse()
 
-	// Build the orchestrator fleet's discovery source. Stage 24: a StaticDiscovery wrapping the
-	// --nodes flag (or the single legacy node when it is empty) is the default, so the fleet is
-	// still the flag's and create/destroy is identical to Stage 23; the Redis service-registry
-	// discovery (dynamic join/leave) is wired in 24b behind --node-discovery.
+	// Build the orchestrator fleet's discovery source (Stage 24). 'static' wraps the --nodes flag
+	// (or the single legacy node when it is empty) in a StaticDiscovery, so the fleet is fixed and
+	// create/destroy is identical to Stage 23. 'redis' reads the shared service registry that
+	// orchestrators self-register into (--register), so the fleet changes at runtime with no api
+	// restart. --nodes still parses either way: it seeds static discovery and names the template
+	// build node (specs[0]).
 	specs, err := parseNodeSpecs(*nodesFlag, *orchGRPC, *orchProxy)
 	if err != nil {
 		log.Fatal(err)
 	}
-	infos := make([]placement.NodeInfo, len(specs))
-	for i, sp := range specs {
-		infos[i] = placement.NodeInfo{ID: sp.GRPC, GRPC: sp.GRPC, Proxy: sp.Proxy}
+	var discovery placement.Discovery
+	switch *nodeDiscovery {
+	case "static":
+		infos := make([]placement.NodeInfo, len(specs))
+		for i, sp := range specs {
+			infos[i] = placement.NodeInfo{ID: sp.GRPC, GRPC: sp.GRPC, Proxy: sp.Proxy}
+		}
+		discovery = placement.NewStaticDiscovery(infos)
+	case "redis":
+		rd := placement.NewRedisDiscovery(*redisAddr)
+		defer rd.Close()
+		discovery = rd
+	default:
+		log.Fatalf("unknown --node-discovery %q (want static|redis)", *nodeDiscovery)
 	}
 	// nodeFactory dials a node's gRPC client (NewClient is lazy -- it connects on the first RPC,
 	// not here -- and plaintext, like E2B on-cluster; TLS/auth is out of scope) and attaches a
@@ -84,7 +99,7 @@ func main() {
 	// The registry reconciles the fleet against discovery and keeps each node's cached load +
 	// readiness fresh (Start primes it once synchronously, then polls ~1s), picking a node per
 	// create via BestOfK.
-	registry := placement.NewRegistry(placement.NewStaticDiscovery(infos), nodeFactory, placement.DefaultK)
+	registry := placement.NewRegistry(discovery, nodeFactory, placement.DefaultK)
 	registry.Start()
 	defer registry.Stop()
 
@@ -132,6 +147,8 @@ func main() {
 	mux.HandleFunc("POST /sandboxes", a.withAuth(a.handleCreate))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.withAuth(a.handleDestroy))
 	mux.HandleFunc("GET /sandboxes", a.withAuth(a.handleList))
+	// Stage 24: the api's live view of the discovered orchestrator fleet (makes discovery observable).
+	mux.HandleFunc("GET /nodes", a.withAuth(a.handleNodes))
 	// Template builds (Stage 10): create kicks an async build in the orchestrator; the SDK
 	// polls the build status; list is the api's durable record.
 	mux.HandleFunc("POST /templates", a.withAuth(a.handleTemplateCreate))

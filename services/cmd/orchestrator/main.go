@@ -30,6 +30,7 @@ import (
 	pb "microsandbox/services/pkg/grpc/orchestrator"
 	pbtmpl "microsandbox/services/pkg/grpc/templatemanager"
 	"microsandbox/services/pkg/nbd"
+	"microsandbox/services/pkg/placement"
 	"microsandbox/services/pkg/storage"
 )
 
@@ -55,6 +56,9 @@ func main() {
 	s3AccessKey := flag.String("s3-access-key", "minioadmin", "S3 access key, for --storage s3")
 	s3SecretKey := flag.String("s3-secret-key", "minioadmin", "S3 secret key, for --storage s3")
 	s3SSL := flag.Bool("s3-ssl", false, "use https for the S3 endpoint, for --storage s3")
+	redisAddr := flag.String("redis-addr", "127.0.0.1:6379", "Redis service-registry address for --register (Stage 24 node discovery)")
+	register := flag.Bool("register", false,
+		"register this orchestrator in the Redis service registry so the api discovers it dynamically (Stage 24); off = the api uses its static --nodes list")
 	makeSnapshot := flag.String("make-snapshot", "",
 		"one-shot: create the named template's warm snapshot over the NBD stack and publish it, then exit (Stage 22 E1; the Go replacement for build-snapshot.sh under --nbd). Requires --nbd + --storage s3")
 	flag.Parse()
@@ -136,12 +140,28 @@ func main() {
 	log.Printf("orchestrator: gRPC on %s, data proxy on %s (vendor=%s, scripts=%s, pools=%v, storage=%s, uffd=%v, nbd=%v)",
 		*grpcAddr, *proxyAddr, *vendorDir, sd, poolSpecs, *storageMode, *useUffd, nbdPool != nil)
 
+	// Stage 24: when --register, advertise this orchestrator into the shared Redis service
+	// registry (heartbeat + TTL) so the api discovers it dynamically instead of via a static
+	// --nodes list. We advertise our own gRPC + data-proxy addresses (what the api calls / routes
+	// to). Started only after the listeners are up, so we never advertise a node that isn't serving.
+	var registrar *placement.Registrar
+	if *register {
+		self := placement.NodeInfo{ID: *grpcAddr, GRPC: *grpcAddr, Proxy: *proxyAddr}
+		registrar = placement.NewRegistrar(*redisAddr, self, placement.DefaultNodeTTL, placement.DefaultNodeHeartbeat)
+		registrar.Start()
+		log.Printf("orchestrator: registered in service registry at %s as %s (proxy %s)", *redisAddr, self.GRPC, self.Proxy)
+	}
+
 	// Graceful shutdown: stop accepting, then destroy every VM so we never leak
 	// firecracker processes (killing the process destroys the whole VM).
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Println("shutting down: destroying all sandboxes")
+	// Deregister first so the api stops placing new sandboxes here before we tear the fleet down.
+	if registrar != nil {
+		registrar.Stop()
+	}
 	grpcServer.GracefulStop()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

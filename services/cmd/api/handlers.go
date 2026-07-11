@@ -220,6 +220,22 @@ func (a *api) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sandboxes": list})
 }
 
+// handleNodes: GET /nodes -> 200 {"nodes":[{id,proxy,ready,load}...]} -- the api's live view of
+// the orchestrator fleet (Stage 24). It makes node discovery observable: a node that registered
+// appears here, and one that was killed drops out once its registry TTL lapses and the next
+// reconcile runs. Auth-gated like the rest, but not team-scoped -- the fleet is shared
+// infrastructure, not a team resource, so any authenticated caller may inspect it.
+func (a *api) handleNodes(w http.ResponseWriter, r *http.Request) {
+	nodes := a.registry.Nodes()
+	list := make([]map[string]any, 0, len(nodes))
+	for _, n := range nodes {
+		list = append(list, map[string]any{
+			"id": n.ID, "proxy": n.Proxy, "ready": n.Ready(), "load": n.Load(),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"nodes": list})
+}
+
 // writeGRPCError maps a gRPC status code back to the HTTP status the SDK expects,
 // preserving the {"error": ...} body shape the old control plane used. This is what
 // keeps the SDK's behavior byte-stable across the gRPC split: a bad template still
