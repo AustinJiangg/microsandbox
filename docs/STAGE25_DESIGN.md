@@ -113,9 +113,18 @@ orchestrator advertising its own state on a timer. So:
     `REDIS_ADDR`) proving api-Drain → heartbeat `draining` → discovery → Resume → active; hermetic
     api-handler guard tests for the 501 (static) and 404 (unknown node) paths.
 
-- **25c — e2e + docs finalize.** A gated real-VM/dynamic-discovery e2e: bring up two nodes under
-  `--node-discovery redis`, drain one, assert (a) new sandboxes avoid it, (b) a sandbox already on
-  it keeps working (List/Delete still route there). Finalize this doc's "measured" notes.
+- **25c — e2e + docs finalize. Done.** `tests/test_drain.py` (gated `MSB_TEST_DISCOVERY=1`, like
+  the Stage-24 discovery e2e) drives the whole channel through a **real VM** on the single real
+  orchestrator node: create a sandbox, drain the node (`POST /nodes/{id}/drain` → 202), wait for
+  `GET /nodes` to show `draining`, then assert **(a)** a new create returns **503** (the only node
+  is draining → no eligible node → it is excluded from new placements), **(b)** the existing
+  sandbox's stateful kernel still runs (drain ≠ eviction — the data path routes by the catalog,
+  independent of placement), and **(c)** `resume` returns the node to active and new creates boot
+  again. Running two real orchestrators on one box is not an E2B concept (Stage 23/24 rationale), so
+  multi-node *spread* stays covered by the in-process integration test; the 503-on-the-only-node
+  path is the faithful single-box proof that drain excludes a node from new placements. **Verified
+  on real VMs: `test_discovery.py` (2/2) + `test_drain.py` (1/1) green under `--node-discovery
+  redis`; the default static-mode `test_microvm.py` (6/6) unregressed.**
 
 ## 4. Honest scope
 
@@ -130,4 +139,6 @@ Stage 24 made for discovery.
 - Go units (`go test ./services/...`, KVM-free): the 25a placement/reconcile cases above, plus the
   existing `placement_test.go` / `discovery_test.go` stay green (the `Status` field defaults keep
   Stage 23/24 behavior identical).
-- e2e (gated, `MSB_TEST_DISCOVERY=1`, like Stage 24): the 25c drain scenario.
+- e2e (gated, `MSB_TEST_DISCOVERY=1`, like Stage 24): `tests/test_drain.py`, the 25c drain
+  scenario. Measured green on real VMs: `test_discovery.py` 2/2 + `test_drain.py` 1/1 in discovery
+  mode; static-mode `test_microvm.py` 6/6 unregressed.

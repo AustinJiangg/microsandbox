@@ -400,15 +400,41 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   green (incl. `-race`, + live-Redis round-trip & TTL tests); real-VM **dynamic-discovery e2e 2/2**,
   static-default lifecycle **13/13** (no regression), and the ordinary lifecycle suite passes in discovery mode
   too (`test_microvm` **6/6** under `--node-discovery redis`). See `docs/STAGE24_DESIGN.md`.
-- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): **production fidelity** — multi-host scheduling
-  landed its placement core in Stage 23 (`placement.BestOfK`) and **real (dynamic) node discovery** in Stage 24
-  (a Redis service registry behind E2B's `Discovery` seam); what remains is **rebalancing** already-placed
-  sandboxes off a joined/draining node, **graceful drain** (a node saying "no new placements" vs "gone"),
-  **per-node build placement** (template builds still route to one designated node), a real Nomad/Consul
-  `Discovery` impl, a TypeScript SDK, a cross-node chunk cache, and auth depth (a key-management API, token
-  expiry/rotation, TLS). Note: memfile/rootfs **compression IS an optional E2B mechanism** (V4/V5 headers,
-  zstd/lz4 in 2 MiB frames, raw V3 still supported, orthogonal to COW); we still store raw, so it stays
-  deferred optional depth.
+- **Done (Stage 25 — graceful drain: a node lifecycle of active / draining)**: the first item of the
+  post–Stage-24 production-fidelity plan (`docs/POST_STAGE24_PLAN.md`), giving a node a state beyond
+  reachable/unreachable — **draining** = alive and still serving its existing sandboxes, but excluded from
+  **new** placements (the foundation Stage 26 rebalancing builds on). **api-side + orchestrator-startup only** —
+  no proto / data-path / `envd` / rootfs change. Verified against `e2b-dev/infra`: node status is a
+  self-reported enum (`Ready`/`Draining`/`Unhealthy`/`Standby`) and placement's one load-bearing filter is
+  literally `if n.Status() != NodeStatusReady { continue }`; drain is api-initiated (E2B's
+  `ServiceStatusOverride`). **25a** modeled it in `pkg/placement`: `NodeInfo.Status` (backward-compatible —
+  empty = active), `Node.Draining()`, `BestOfK.sample` skips draining beside the existing not-ready skip
+  (eligibility = `Ready() && !Draining()`), and `reconcile` syncs the discovered status onto the live node.
+  **25b** wired the channel (`pkg/placement/drain.go`): the api `SET`s a durable `msb:drain:<id>` command in
+  the shared Redis, the orchestrator's `Registrar` reads it each heartbeat and self-reports
+  `StatusDraining`/`StatusActive`, so discovery + reconcile flip the node — **api-initiated,
+  orchestrator-authoritative** (survives an api restart), the low-churn faithful analogue of E2B's gRPC
+  override (a new gRPC method is high-churn without `protoc`, an admin endpoint on the public data port is a
+  security smell; Redis is the same substitution Stage 24 made for Consul/Nomad). api: `POST
+  /nodes/{id}/drain` + `.../resume` (→ **202**, effective on the next heartbeat + reconcile; static mode →
+  **501** since a fixed fleet has no status channel, Decision D5; unknown node → **404**), `GET /nodes`
+  reports `status`. **25c** added the gated real-VM e2e (`tests/test_drain.py`, `MSB_TEST_DISCOVERY=1`): on the
+  single real node, drain → a new create is **503** (the only node draining → excluded from new placements),
+  the existing sandbox's stateful kernel still runs (**drain ≠ eviction**), resume → creates boot again.
+  **Honest scope:** on one box this is **fidelity, not speed**; drain only stops NEW placements —
+  **evacuating existing sandboxes is Stage 26**; the override channel is Redis-mediated, not E2B's gRPC wire
+  (faithful in properties, not transport); `Standby` + a real `ServiceInfo` RPC are out of scope (D4/D5).
+  Go units green (incl. `-race` + a live-Redis drain round-trip); real-VM **drain e2e 1/1** +
+  **discovery 2/2** under `--node-discovery redis`, static-default `test_microvm` **6/6** unregressed. See
+  `docs/STAGE25_DESIGN.md`.
+- **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md` + `docs/POST_STAGE24_PLAN.md`): **production
+  fidelity** — multi-host scheduling landed its placement core in Stage 23 (`placement.BestOfK`), **real
+  (dynamic) node discovery** in Stage 24, and **graceful drain** in Stage 25; what remains (planned as Stages
+  26–31) is **rebalancing** already-placed sandboxes off a draining/joined node (Stage 26), **per-node build
+  placement** (template builds still route to one designated node), a real Nomad/Consul `Discovery` impl, a
+  cross-node chunk cache, auth depth (a key-management API, token expiry/rotation, TLS), and optional
+  **compression** (V4/V5 headers, zstd/lz4 in 2 MiB frames, orthogonal to COW — E2B makes it optional, so we
+  will too). **A TypeScript SDK is explicitly dropped (won't be done).**
 
 ## Development conventions
 

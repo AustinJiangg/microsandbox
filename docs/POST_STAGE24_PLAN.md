@@ -62,7 +62,12 @@ when that stage's design doc is written. This mirrors how Stages 20/22/23/24 wer
 
 # Scheduling track
 
-## Stage 25 — Graceful drain (node lifecycle: active / draining)
+## Stage 25 — Graceful drain (node lifecycle: active / draining) — DONE
+
+> Shipped: design + 25a/25b/25c. See `docs/STAGE25_DESIGN.md` and the CLAUDE.md "Done (Stage 25)"
+> entry. Real-VM drain e2e 1/1 + discovery 2/2 under `--node-discovery redis`; static-default
+> `test_microvm` 6/6 unregressed. The drain override is Redis-mediated (finalized D3), not E2B's
+> gRPC wire.
 
 **Problem.** In `pkg/placement` a node has only two operational dimensions today: `ready`
 (does its `List` RPC answer — `Node.refresh` in `placement.go`) and `Load` (the BestOfK score).
