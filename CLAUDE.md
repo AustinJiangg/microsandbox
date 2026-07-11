@@ -376,10 +376,36 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   partitioning — not an E2B concept — since each E2B orchestrator is a separate machine). Go units green
   (incl. `-race`); real-VM single-node lifecycle e2e **13/13** (`test_microvm`/`test_metadata`/`test_auth`).
   See `docs/STAGE23_DESIGN.md`.
+- **Done (Stage 24 — real node discovery: a pluggable `Discovery` source + a reconciling registry)**: Stage 23's
+  fleet was **static** (a `--nodes` flag parsed once into a fixed slice); this stage makes it **dynamic**,
+  mirroring E2B's `discovery.Discovery` interface + `keepInSync` reconcile loop (`e2b-dev/infra`
+  `packages/api/internal/orchestrator`). Still **api-side + orchestrator-startup only** — no proto / data-path /
+  `envd` / rootfs change. **24a** turned `pkg/placement.Registry` from a fixed `[]*Node` into a **reconciled
+  `map` guarded by a mutex**: a `Discovery` interface (`ListNodes`) + a `NodeFactory` (dials gRPC, api-injected
+  so the package stays dial-free), a `reconcile()` that adds discovered-absent nodes and removes
+  present-undiscovered ones (closing their conn), and a `StaticDiscovery` wrapping the Stage-23 `--nodes` flag
+  (so the static path is just one `Discovery` impl and behavior is identical to Stage 23). **24b** added the
+  **real dynamic backend**: a **Redis service registry** — the orchestrator's `Registrar` heartbeats
+  `msb:node:<id> → {grpc,proxy}` with a TTL (`SET … EX 3s`, refreshed ~1s; `DEL` on graceful stop) and
+  `RedisDiscovery.ListNodes` `SCAN`s + `MGET`s them, so a crashed node's key just **TTL-expires** out (the
+  single-box analogue of Consul/Nomad service registration; TTL = the health signal, no metrics RPC). Wired via
+  the orchestrator `--register`/`--redis-addr` and the api `--node-discovery static|redis` (default `static`,
+  backward-compatible), plus a `GET /nodes` endpoint (the api's live fleet view, making discovery observable).
+  **24c** added the gated real-VM e2e (`MSB_TEST_DISCOVERY=1` flips the fixture to orchestrator `--register` +
+  api `--node-discovery redis`; `tests/test_discovery.py`: a VM boots via a Redis-discovered node, and an
+  injected node that stops heartbeating is evicted by reconcile). **Honest scope:** genuinely dynamic on one box
+  (an orchestrator joins by registering and leaves by dying, no api restart — fully observable), but the
+  registry backend is **Redis-TTL, not Nomad/Consul** (swapping one in is just another `Discovery` impl), and
+  **rebalancing already-placed sandboxes / per-node build placement / graceful drain stay deferred**. Go units
+  green (incl. `-race`, + live-Redis round-trip & TTL tests); real-VM **dynamic-discovery e2e 2/2**,
+  static-default lifecycle **13/13** (no regression), and the ordinary lifecycle suite passes in discovery mode
+  too (`test_microvm` **6/6** under `--node-discovery redis`). See `docs/STAGE24_DESIGN.md`.
 - **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): **production fidelity** — multi-host scheduling
-  landed its placement core in Stage 23 (`placement.BestOfK` over a static `--nodes` fleet); what remains is
-  **real node discovery** (Nomad/Consul, or a dynamic register/deregister API) + rebalancing + per-node build
-  placement, a TypeScript SDK, a cross-node chunk cache, and auth depth (a key-management API, token
+  landed its placement core in Stage 23 (`placement.BestOfK`) and **real (dynamic) node discovery** in Stage 24
+  (a Redis service registry behind E2B's `Discovery` seam); what remains is **rebalancing** already-placed
+  sandboxes off a joined/draining node, **graceful drain** (a node saying "no new placements" vs "gone"),
+  **per-node build placement** (template builds still route to one designated node), a real Nomad/Consul
+  `Discovery` impl, a TypeScript SDK, a cross-node chunk cache, and auth depth (a key-management API, token
   expiry/rotation, TLS). Note: memfile/rootfs **compression IS an optional E2B mechanism** (V4/V5 headers,
   zstd/lz4 in 2 MiB frames, raw V3 still supported, orthogonal to COW); we still store raw, so it stays
   deferred optional depth.
@@ -466,7 +492,9 @@ scripts/build-template.sh example --no-snapshot                 # + each built t
   e2e COW-win probes for the layered rootfs (Stage 19) / memfile (Stage 20) — all dev/test glue),
   `pkg/{fc,pool,network,proxy,template,store,catalog,storage,build,uffd,nbd,block,placement}` the libraries
   (`nbd` = the Stage-21 NBD device pool + userspace server; `block` = the COW block stack served over it;
-  `placement` = the Stage-23 api-side node registry + BestOfK multi-host scheduler), `proto/` the gRPC
+  `placement` = the api-side node registry + BestOfK multi-host scheduler (Stage 23), now reconciling a
+  dynamic fleet against a pluggable `Discovery` source — a `StaticDiscovery` over `--nodes` or a Redis
+  service registry orchestrators self-register into via `--register` (Stage 24)), `proto/` the gRPC
   contract (`orchestrator` + `templatemanager`; generated stubs in `pkg/grpc/`, committed — rerun
   `scripts/gen-proto.sh` only when a `.proto` changes, which needs `protoc`). Host-side
   changes take effect at the next `scripts/build-services.sh`; no rootfs rebuild needed

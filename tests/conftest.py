@@ -9,6 +9,7 @@ own unit tests now live in Go (services/pkg/proxy/proxy_test.go -- TCP since Sta
 """
 
 import functools
+import json
 import os
 import pathlib
 import shlex
@@ -97,6 +98,32 @@ def ensure_rootfs() -> None:
 def _orch_flags() -> str:
     """The extra orchestrator flags for this run (MSB_ORCH_FLAGS). --nbd + --storage s3 are the defaults."""
     return os.environ.get("MSB_ORCH_FLAGS", "")
+
+
+def _discovery_mode() -> bool:
+    """True when MSB_TEST_DISCOVERY=1 (Stage 24): the fixture runs the orchestrator with --register
+    and the api with --node-discovery redis, so the api learns its fleet ONLY through the Redis
+    service registry (dynamic discovery) instead of the static --nodes flag. Default off, so the
+    ordinary suite is unchanged."""
+    return os.environ.get("MSB_TEST_DISCOVERY", "") not in ("", "0")
+
+
+def _wait_nodes_discovered(base_url: str, api_key: str, want_ready: int = 1) -> None:
+    """Block until the api has discovered at least want_ready ready orchestrator node(s) via the
+    Redis registry, so the first create in any test doesn't race the api's ~1s discovery poll. Used
+    only in discovery mode."""
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(base_url + "/nodes", headers={"X-API-Key": api_key})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                nodes = json.load(r).get("nodes", [])
+            if sum(1 for n in nodes if n.get("ready")) >= want_ready:
+                return
+        except OSError:
+            pass
+        time.sleep(0.2)
+    raise RuntimeError("api discovered no ready orchestrator node within 15s (discovery mode); see api.log")
 
 
 def _s3_mode() -> bool:
@@ -391,6 +418,10 @@ def control_plane(tmp_path_factory):
     # the sudoers drop-in grants SETENV + !secure_path for exactly this command.
     orch_cmd = [str(repo_root / "vendor" / "orchestrator"),
                 "--grpc-addr", grpc_addr, "--proxy-addr", proxy_addr, "--vendor-dir", vendor]
+    # Stage 24: in discovery mode the orchestrator self-registers into the Redis service registry
+    # so the api discovers it dynamically (rather than via a static --nodes/legacy flag).
+    if _discovery_mode():
+        orch_cmd += ["--register", "--redis-addr", redis_addr]
     # Stage 13b: MSB_ORCH_FLAGS passes extra orchestrator flags through to the binary -- set it
     # to "--uffd" to exercise the UFFD snapshot-restore backend with this same e2e suite. Default
     # empty keeps the File backend, so ordinary runs are unchanged. Appended before the sudo wrap
@@ -410,22 +441,27 @@ def control_plane(tmp_path_factory):
             stdout=cp_log, stderr=subprocess.STDOUT,
         )
         _wait_healthy(f"http://{cp_data_addr}/health", cp, logdir / "client-proxy.log")
-        api = subprocess.Popen(
-            [str(repo_root / "vendor" / "api"), "--addr", api_addr,
-             "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr,
-             "--redis-addr", redis_addr,
-             "--data-url", f"http://{cp_data_addr}",
-             "--store-dsn", pg_dsn,
-             # Stage 16: seed the dev key (default team) the whole suite authenticates with,
-             # plus a second team's key so test_auth.py can prove cross-team isolation.
-             "--seed-api-keys", "msb_dev_key=default,msb_team_b_key=team_b"],
-            stdout=api_log, stderr=subprocess.STDOUT,
-        )
+        api_cmd = [str(repo_root / "vendor" / "api"), "--addr", api_addr,
+                   "--orchestrator-grpc", grpc_addr, "--orchestrator-proxy", proxy_addr,
+                   "--redis-addr", redis_addr,
+                   "--data-url", f"http://{cp_data_addr}",
+                   "--store-dsn", pg_dsn,
+                   # Stage 16: seed the dev key (default team) the whole suite authenticates with,
+                   # plus a second team's key so test_auth.py can prove cross-team isolation.
+                   "--seed-api-keys", "msb_dev_key=default,msb_team_b_key=team_b"]
+        # Stage 24: discover the fleet from the Redis registry the orchestrator self-registered into.
+        if _discovery_mode():
+            api_cmd += ["--node-discovery", "redis"]
+        api = subprocess.Popen(api_cmd, stdout=api_log, stderr=subprocess.STDOUT)
         _wait_healthy(base_url + "/health", api, logdir / "api.log")
         # Stage 16: every lifecycle call now needs an X-API-Key. Export the seeded dev key so
         # the existing fixtures' plain Sandbox(...) constructions authenticate unchanged; the
         # auth tests override/clear it per case.
         os.environ["MICROSANDBOX_API_KEY"] = "msb_dev_key"
+        # Stage 24: in discovery mode, don't yield until the api has actually discovered the
+        # orchestrator through Redis, so no test races the first ~1s poll and gets a spurious 503.
+        if _discovery_mode():
+            _wait_nodes_discovered(base_url, "msb_dev_key")
         yield base_url
     finally:
         # SIGTERM the api first, then client-proxy, then the orchestrator (which destroys

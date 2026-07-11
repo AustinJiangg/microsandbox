@@ -1,6 +1,6 @@
 # Stage 24 design — real node discovery: a `Discovery` source + a reconciling registry
 
-> Status: **proposed.** This stage takes the next "production fidelity" item off the deferred list in
+> Status: **done (24a–24c).** This stage takes the next "production fidelity" item off the deferred list in
 > `docs/E2B_ALIGNMENT_ROADMAP.md` §Still-deferred ("real node discovery (Nomad/Consul, or a dynamic
 > register/deregister API)"). Stage 23 gave the api a **fleet** and E2B's `placement.BestOfK`, but the fleet
 > was **static** — a `--nodes grpc@proxy,…` flag parsed once at startup into a fixed slice that never changes.
@@ -11,6 +11,19 @@
 > It builds directly on Stage 23 and changes **only the api's registry and the orchestrator's startup**: no
 > proto change, no data-path change, no `envd`/rootfs change. Backward compatible — the default discovery
 > backend is `static` (the Stage-23 `--nodes` flag), so dev-up and the e2e fixture are unchanged.
+>
+> **Landed:** **24a** (the `Discovery` seam + a reconciling `Registry`: fixed slice → reconciled map, +
+> `StaticDiscovery`, +5 KVM-free reconcile unit tests), **24b** (`RedisDiscovery` + a `Registrar` heartbeating
+> into the Redis service registry + the orchestrator `--register` + the api `--node-discovery redis` + `GET
+> /nodes`; 2 gated live-Redis tests — round-trip + TTL crash-eviction), and **24c** (the gated real-VM e2e +
+> docs). **Verified:** Go units green incl. `-race` (and the live-Redis tests against a real server: round-trip
+> + TTL); real-VM **dynamic-discovery e2e 2/2** (`MSB_TEST_DISCOVERY=1`: a VM boots via a Redis-discovered node,
+> and an injected node that stops heartbeating is evicted by reconcile); the **static-default lifecycle e2e
+> stays 13/13** (no regression); and the **ordinary lifecycle suite passes in discovery mode too** (`test_microvm`
+> 6/6 under `--node-discovery redis`), confirming the fleet is learned purely from the registry. **Honest
+> headline:** genuinely dynamic on one box — an orchestrator joins by registering and leaves by dying (TTL) with
+> no api restart, observable end-to-end — but the registry backend is Redis-TTL, not Nomad/Consul, and
+> rebalancing / per-node build placement stay deferred (§7).
 
 ## 1. The problem (what "static fleet" bakes in)
 
