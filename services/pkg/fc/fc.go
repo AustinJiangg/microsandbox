@@ -200,6 +200,11 @@ func Spawn(id, vendorDir string, tmpl template.Template, netMgr *network.Manager
 			"path_on_host":   rootfsPath, // tmpl.Rootfs; over NBD the device binds over it (Stage 22 E1)
 			"is_root_device": true,
 			"is_read_only":   readOnly, // writable over NBD (private overlay); read-only for the shared file
+			// io_engine Async (io_uring) matches E2B's rootfs drive (fc/client.go setRootfsDrive). Baked into
+			// the cold-start snapshot here, it propagates through --make-snapshot -> the producer's re-snapshot
+			// -> the child restore, so the whole chain uses the same block engine E2B does (docs/STAGE22_DESIGN.md
+			// §14). The default (Sync) is what a UFFD-restored writable-virtio-blk re-snapshot won't restore on.
+			"io_engine": "Async",
 		}},
 		"machine-config": map[string]any{"vcpu_count": vcpus, "mem_size_mib": memMiB},
 		// A virtio-net NIC backed by the netns's TAP -- the daemon's only transport now (Stage 12c
@@ -357,11 +362,19 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 		memBackend = map[string]any{"backend_type": "Uffd", "backend_path": udsPath}
 	}
 
-	// Snapshot load + resume can't go through --config-file, so use the REST API.
+	// Snapshot load + resume can't go through --config-file, so use the REST API. Load PAUSED
+	// (resume_vm:false), then resume in a SEPARATE PATCH /vm {Resumed} below -- E2B's exact sequence
+	// (loadSnapshot ResumeVM:false -> resumeVM, fc/client.go). This matters for the Stage-22 producer:
+	// a load-with-resume kicks the virtio devices during the load itself, before the block device's
+	// serialized queue state is fully reconciled, which leaves a UFFD-restored writable virtio-blk VM in
+	// a state whose re-snapshot won't restore (InvalidAvailIdx; docs/STAGE22_DESIGN.md §14). Loading
+	// paused lets firecracker restore the full device state first; the separate resume then kicks the
+	// queues from a consistent point. It is also the right order for UFFD (load hands over the fd, we
+	// confirm the handshake, then resume so the first faults are served by a ready handler).
 	status, err := firecrackerAPI(apiSock, "PUT", "/snapshot/load", map[string]any{
 		"snapshot_path": vmstate,
 		"mem_backend":   memBackend,
-		"resume_vm":     true,
+		"resume_vm":     false,
 	}, 15*time.Second)
 	if err != nil || (status != 200 && status != 204) {
 		tail := vm.ConsoleTail()
@@ -377,6 +390,14 @@ func Restore(id, vendorDir string, tmpl template.Template, netMgr *network.Manag
 			vm.Destroy()
 			return nil, fmt.Errorf("uffd handler failed during snapshot load: %w; %s", herr, tail)
 		}
+	}
+	// Resume the loaded-paused VM (E2B's separate resumeVM step). Only now do the vcpus run and the
+	// devices get kicked -- from the fully-restored device state.
+	rstatus, rerr := firecrackerAPI(apiSock, "PATCH", "/vm", map[string]any{"state": "Resumed"}, 15*time.Second)
+	if rerr != nil || (rstatus != 200 && rstatus != 204) {
+		tail := vm.ConsoleTail()
+		vm.Destroy()
+		return nil, fmt.Errorf("resume after snapshot/load failed: status=%d err=%v; %s", rstatus, rerr, tail)
 	}
 	return vm, nil
 }

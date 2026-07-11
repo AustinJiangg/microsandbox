@@ -472,3 +472,114 @@ both diffs small) is committed; `test_layered_snapshot_via_api` is skipped by de
 `MSB_TEST_LAYERED_SNAPSHOT=1` (matching the `MSB_TEST_NBD` gate) with the blocker in its skip reason, so the
 suite stays green while the code is preserved for the backend-redesign follow-up. Unskip it once the NBD
 backend is fast/drained at pause.
+
+## 14. The backend-redesign is refuted — the blocker is FC-level (three KVM experiments)
+
+The §13.2 prescription ("a fast/drained NBD backend at pause") was implemented and **falsified on real KVM**.
+Three experiments, each a real `--nbd` s3 run of `test_layered_snapshot_via_api` (build `derived_snap` over
+`default` with a snapshot, then restore the child):
+
+1. **Fast local rootfs base.** The producer served the rootfs from the whole base materialized to a local
+   file (`block.OpenFileBase` + a `buildProducerRootfsBacking` that runs `MaterializeLayered` first), so
+   every NBD block read completes in microseconds — no MinIO fetch in the block path. **Result: still panics,
+   `InvalidAvailIdx { reported_len: 1824 }`.**
+2. **Fast local rootfs *and* memfile — entirely local backends.** On top of (1), the producer served guest
+   RAM from the base memfile materialized locally and mmapped (`prepareRestoreProducer` +
+   `MaterializeMemfileFull` + `uffd.MmapSource`), so **no bucket fetch is in flight anywhere** during the
+   resume→command→snapshot window. **Result: still panics, `reported_len: 607`.**
+3. **Child memfile published WHOLE (v1), not a COW diff.** To isolate our reconstruction, the producer
+   published the child's full compacted memfile (`storage.PublishMemfile`) instead of a COW diff over the
+   base (`PublishMemfileDiff`), so restore rebuilds the child's RAM directly with **no base fallback and no
+   multi-owner reconstruction**. **Result: still panics, `reported_len: 660`.**
+
+**What this rules out, definitively:**
+- **Not backend speed / in-flight I/O (§13.2 refuted).** Experiments 1–2 make the block *and* memory paths
+  fully local (microsecond completions); the panic persists and `reported_len` still *varies* run-to-run
+  (1824 / 607 / 660) and is still **> the 256-entry queue** — a torn avail-vs-used, not a bounded in-flight
+  backlog. Backend latency is not the cause.
+- **Not our COW reconstruction.** Experiment 3 reconstructs the child's *own* full dumped memfile (no diff);
+  it still panics. So the `(memfile, vmstate)` pair FC produces from the re-snapshot is **already
+  inconsistent at the source**, before any header/`BuildDiff`/multi-owner read.
+
+**Why porting E2B's `memory.Disable()` will not fix this block panic.** E2B's `Disable()`
+(`block/tracker.go`: serve zeros + dirty-track during the snapshot, then diff by the not-requested bitset)
+only changes (a) what the dumped memfile holds for *non-resident* pages and (b) how the *diff* is selected.
+The virtio-blk **avail-ring page is resident** (the guest wrote it advancing `avail_idx`), so FC dumps it
+directly from KVM — **identically** with our handler or E2B's. Experiment 3 already restored from the *whole*
+dumped memfile (the most faithful case, no diff selection at all) and still panicked, so a diff-production
+change cannot help. `Disable()` is a faithful improvement to *memfile-diff* production, orthogonal to this
+block-queue panic.
+
+**Localization: FC's snapshot of a UFFD-restored, writable-virtio-blk VM.** Combining this with §11
+Experiment C (a read-only *device* re-snapshots + restores fine; a writable device does not, independent of
+writes and mount mode), the remaining variable is the **writable virtio-blk device** being Full-snapshotted
+on a **UFFD-restored** VM. Vanilla **Firecracker v1.16.0** (ours, `vendor/firecracker --version`) serializes a
+`(memfile, vmstate)` pair whose virtio-blk avail/used rings are mutually inconsistent on the next load. E2B
+runs a **pinned custom build `v1.10.1_1fcdaec08`** (`e2b-dev/infra` `benchmark_test.go:57`); the
+block-drain/virtqueue behavior at pause is baked into that binary, and this class of problem is most likely
+handled there — not in E2B's orchestration code (which does nothing special to the block device at snapshot,
+§13.2).
+
+**Consequence.** This is not closable by a backend redesign, a diff-production change, or any host-side code
+we own: it sits in Firecracker's snapshot/restore of a writable virtio-blk device. The experiment code (local
+rootfs/memfile backends, whole-v1 publish) is **reverted** — none of it fixed the panic and it adds cost
+without benefit; the findings are banked here. `test_layered_snapshot_via_api` stays gated. Remaining viable
+directions, none a quick fix:
+- **Try a different Firecracker build/version** — closer to E2B's `v1.10.x`, or E2B's actual pinned build if
+  obtainable — to test whether the inconsistency is version-specific (the highest-leverage single lever, but
+  needs a kernel/snapshot-compat sweep).
+- **A producer that never re-snapshots a writable device** — snapshot with the block device read-only (which
+  restores cleanly), capturing the rootfs writes via the overlay diff *separately* and the RAM via the
+  read-only-device snapshot. Sidesteps the FC issue but diverges from E2B's one-run-two-consistent-diffs
+  model; needs a way to hold the device read-only through the snapshot while the guest ran rw.
+- **Deep FC instrumentation** — dump `avail_idx` (child memfile) vs `used_idx` (child vmstate) at the pause
+  instant to pinpoint exactly which ring FC serializes inconsistently, before committing to either fix above.
+
+## 15. Faithful E2B replication — `io_engine Async` fixes the block panic; `memory.Disable()` regresses it; the net device needs the custom FC
+
+Following "modify it like E2B," the *entire* E2B host-side snapshot path was read from `e2b-dev/infra` and
+replicated, each change tested on real KVM. This **partly closed the blocker and definitively located the
+residual in Firecracker itself.**
+
+**What E2B does (read from source):** rootfs drive `IoEngine: "Async"` (io_uring) + `IsReadOnly: false`
+(`fc/client.go setRootfsDrive`); `LoadSnapshot{ResumeVM: false}` then a **separate** `PATCH /vm {Resumed}`
+(load-paused-then-resume, `fc/client.go`); at pause, `pauseVM -> memory.Disable() -> createSnapshot(Full)`
+where `Disable()` (`block/tracker.go`) serves zeros + dirty-tracks so the memfile diff is the guest's
+resident working set (`MemoryDiffCreator` + `header.WriteDiffWithTrace`); envd runs over the **network**
+(`proxy.SandboxProxy` HTTP), not vsock; `SyncChangesToDisk` is a plain guest `sync`. E2B runs a **pinned
+custom Firecracker `v1.10.1_1fcdaec08`**; we run vanilla **v1.16.0**.
+
+**Results, each a real `--nbd` s3 run of `test_layered_snapshot_via_api`:**
+1. **`io_engine: "Async"` on the rootfs drive (baked from cold-start via `--make-snapshot`, so it propagates
+   base → producer → child) FIXES the block-device `InvalidAvailIdx` panic.** This **overturns §13.2's "Async
+   made it worse"** — that earlier test set Async inconsistently (not from base creation); applied E2B's way
+   (consistently, from the cold-start drive), it is the fix. The block device now restores cleanly.
+2. **`load-paused-then-resume` (E2B's `resume_vm:false` + separate `PATCH /vm {Resumed}`)** was also
+   replicated (all restores). No regression: cold-start + snapshot-restore + fast + concurrent e2e **9/9**.
+3. **With the block fixed, the NET device now panics** on the child restore: `net: Could not parse an RX
+   descriptor: Tried to create an 'IoVecMut' from a read-only descriptor chain` + `65513 > 256` — the same
+   re-snapshot virtqueue inconsistency, moved to eth0. The net config matches E2B (+MMDS), envd is on the net
+   (like E2B), `sync` is done — no host-side lever fixes it (there is no `io_engine` analogue for net).
+4. **E2B's `memory.Disable()` dirty-tracking, faithfully implemented (`uffd.TrackedSource` + a dirty-bitset
+   memfile diff `storage.PublishMemfileDiffBlocks`, splitting `fc.Snapshot` into `Pause`/`SnapshotCreate` to
+   slip `Disable()` between them), REGRESSES the block panic** (`reported_len: 660`). Reason: `Disable`
+   makes every *resident* page **child-owned** (read from the child object), including the block avail-ring
+   page; vanilla FC then restores the child's serialized ring inconsistently — the same failure as the
+   whole-v1 experiment (§14). Our COW **`BuildDiff`, which base-owns unchanged pages**, is what keeps the
+   block avail page consistent; E2B's dirty-tracking depends on the **custom FC** to restore a child-owned
+   ring page correctly. So `Disable()` is *not* portable to vanilla FC — it was **reverted**.
+
+**Definitive conclusion.** On vanilla Firecracker v1.16.0 the best reachable state is **`io_engine Async` +
+load-paused-then-resume + our `BuildDiff` (base-owned unchanged) → the block device re-snapshots and restores
+cleanly, but the writable virtio-**net** device does not.** Re-snapshotting a UFFD-restored VM's writable
+virtio devices is only fully consistent on E2B's pinned custom FC; `io_engine Async` happens to make the
+*block* device tolerant on vanilla FC, but there is no equivalent for net, and E2B's memfile-diff mechanism
+(`Disable`) actively depends on the custom FC. **Closing Stage 22 fully needs E2B's Firecracker build (or a
+vanilla version that fixes virtio-net snapshot RX-descriptor handling) — it is not reachable with host-side
+code on v1.16.0.**
+
+**Kept as real progress (E2B-faithful, no regression, fixes the block re-snapshot):** `io_engine Async` +
+load-paused-then-resume in `fc.go`. **Reverted (regresses / doesn't help on vanilla FC):** the `Disable()`
+machinery (`uffd.TrackedSource`, `PublishMemfileDiffBlocks`, the `Snapshot` split), the local-backend
+experiments. `test_layered_snapshot_via_api` stays gated (now failing only on the net device, one step
+further than before).
