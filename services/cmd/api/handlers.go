@@ -230,10 +230,58 @@ func (a *api) handleNodes(w http.ResponseWriter, r *http.Request) {
 	list := make([]map[string]any, 0, len(nodes))
 	for _, n := range nodes {
 		list = append(list, map[string]any{
+			// status is the Stage-25 lifecycle: "draining" (excluded from new placements, still
+			// serving) or "active". ready (reachability) + load are reported alongside it.
 			"id": n.ID, "proxy": n.Proxy, "ready": n.Ready(), "load": n.Load(),
+			"status": nodeStatus(n),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": list})
+}
+
+// nodeStatus renders a node's Stage-25 lifecycle as the string the /nodes view and drain flow use.
+func nodeStatus(n *placement.Node) string {
+	if n.Draining() {
+		return "draining"
+	}
+	return "active"
+}
+
+// handleDrain: POST /nodes/{id}/drain -> stop placing new sandboxes on the node (it keeps serving
+// its existing ones). handleResume: POST /nodes/{id}/resume -> reverse it. Auth-gated but not
+// team-scoped, like handleNodes -- the fleet is shared infrastructure, not a team resource.
+func (a *api) handleDrain(w http.ResponseWriter, r *http.Request)  { a.setDrain(w, r, true) }
+func (a *api) handleResume(w http.ResponseWriter, r *http.Request) { a.setDrain(w, r, false) }
+
+// setDrain issues (draining=true) or clears (=false) a node's Redis drain command, which the
+// orchestrator's registrar reflects in its next heartbeat (~1s) so the api's reconcile then flips
+// the live node. It rejects the call in static mode (Decision D5 -- no heartbeat to carry the
+// status) and for a node not currently in the fleet. The command is durable and orchestrator-honored,
+// so this returns 202 Accepted: recorded, taking effect on the next heartbeat, not synchronously.
+func (a *api) setDrain(w http.ResponseWriter, r *http.Request, draining bool) {
+	if a.drain == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "node drain requires --node-discovery redis (a static fleet has no status channel)"})
+		return
+	}
+	id := r.PathValue("id")
+	if _, ok := a.registry.NodeByID(id); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such node: " + id})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	var err error
+	if draining {
+		err = a.drain.Drain(ctx, id)
+	} else {
+		err = a.drain.Resume(ctx, id)
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not update drain state: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "draining": draining})
 }
 
 // writeGRPCError maps a gRPC status code back to the HTTP status the SDK expects,

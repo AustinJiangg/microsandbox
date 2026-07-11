@@ -96,6 +96,15 @@ func (r *Registry) NodeByProxy(proxy string) (*Node, bool) {
 	return n, ok
 }
 
+// NodeByID returns the live node with this id (its gRPC address), so the drain handler can reject a
+// command against a node the api doesn't currently know about (Stage 25).
+func (r *Registry) NodeByID(id string) (*Node, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n, ok := r.nodes[id]
+	return n, ok
+}
+
 // Start primes the fleet's load/readiness once (so the first create sees fresh data) and then
 // reconciles + refreshes on pollInterval until Stop. Safe to call once.
 func (r *Registry) Start() {

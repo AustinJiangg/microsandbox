@@ -60,11 +60,22 @@ orchestrator advertising its own state on a timer. So:
   from the gRPC state) and add a `Draining()` skip beside it. Net: a node is picked iff it is
   reachable **and** not draining — the exact reduction of E2B's `Status() == NodeStatusReady`.
 
-- **Decision D3 — drain is api-initiated, orchestrator-authoritative.** `POST /nodes/{id}/drain`
-  on the api → the api tells the orchestrator to enter drain (mirroring `ServiceStatusOverride`) →
-  the orchestrator flips its self-reported status → the next registrar heartbeat carries
-  `draining` → `reconcile` propagates it → `BestOfK` skips it. The orchestrator holds the truth, so
-  the drain survives an api restart and is seen by every api — same property as E2B.
+- **Decision D3 — drain is api-initiated, orchestrator-authoritative, over a Redis command.**
+  `POST /nodes/{id}/drain` on the api SETs a durable (no-TTL) command key `msb:drain:<id>` in the
+  shared Redis; the orchestrator's `Registrar` reads that key on **every heartbeat** and reflects it
+  in the `Status` it self-reports; `RedisDiscovery` + `reconcile` (25a) then flip the live node and
+  `BestOfK` skips it. `POST /nodes/{id}/resume` DELetes the key. This is the **finalized channel**
+  (the design's "pick at implementation time"): E2B pushes the override over an
+  `orchestrator-info` gRPC `ServiceStatusOverride` RPC, but hand-editing a whole new gRPC method is
+  high-churn without `protoc` (present only as a hand-edited stub since Stage 18) and an admin
+  endpoint on the orchestrator's **public data-proxy port** is a security smell — so we route the
+  override through the Redis both sides already share, exactly as Stage 24 routes discovery through
+  Redis rather than Consul/Nomad. It preserves E2B's two load-bearing properties: **api-initiated**
+  (the operator drains through the api) and **orchestrator-authoritative** (the orchestrator decides
+  its heartbeated status by reading the command, so drain survives an api restart, outlives it as a
+  durable instruction, and is seen by every api). `pkg/placement/drain.go` holds the api side
+  (`DrainCommands`) and the orchestrator-side read (`isDraining`), keeping the key convention in one
+  place beside the `msb:node:` registry keys.
 
 - **Decision D4 — `Standby` is out of scope.** E2B's `Standby` (a pre-warmed node not yet taking
   load) has no analogue in our fleet model; we model only `active`/`draining`. `Unhealthy` is
@@ -89,14 +100,18 @@ orchestrator advertising its own state on a timer. So:
   - Unit tests: a `draining` node is never returned by `Choose`; flipping it back to active makes
     it eligible again; a reconcile that changes only status (same membership) updates the live node.
 
-- **25b — the drain channel (orchestrator self-reports + api initiates).**
-  - Orchestrator: hold a self-reported status; the `Registrar` heartbeats it as `NodeInfo.Status`.
-    Enter drain via the api-driven override (D3). Finalize the api→orchestrator channel here
-    (candidate: a small gRPC override on the orchestrator, hand-editing the stub as Stage 18 did,
-    since `protoc` is absent; or a minimal orchestrator control endpoint) — pick the least-churn
-    faithful option at implementation time.
-  - api: `POST /nodes/{id}/drain` (auth-gated, not team-scoped, like `handleNodes`); `GET /nodes`
-    reports `status`. Static mode returns the D5 error.
+- **25b — the drain channel (orchestrator self-reports + api initiates). Done.**
+  - `pkg/placement/drain.go`: `DrainCommands.Drain`/`Resume` (api side — `SET`/`DEL msb:drain:<id>`)
+    + `isDraining` (orchestrator side). The `Registrar.register` now reads the drain key each
+    heartbeat and self-reports `StatusDraining`/`StatusActive` accordingly (D3).
+  - api: `POST /nodes/{id}/drain` + `.../resume` (auth-gated, not team-scoped, like `handleNodes`),
+    wired only under `--node-discovery redis` (nil `DrainCommands` in static mode → 501, Decision
+    D5); an unknown node id → 404. `GET /nodes` now reports `status` (`active`/`draining`). The
+    drain endpoint returns **202 Accepted**: the command is durable and orchestrator-honored, taking
+    effect on the next heartbeat (~1s) + reconcile, not synchronously.
+  - Tests: a live-Redis round-trip (`TestDrainCommandReflectedInHeartbeat`, self-skips without
+    `REDIS_ADDR`) proving api-Drain → heartbeat `draining` → discovery → Resume → active; hermetic
+    api-handler guard tests for the 501 (static) and 404 (unknown node) paths.
 
 - **25c — e2e + docs finalize.** A gated real-VM/dynamic-discovery e2e: bring up two nodes under
   `--node-discovery redis`, drain one, assert (a) new sandboxes avoid it, (b) a sandbox already on

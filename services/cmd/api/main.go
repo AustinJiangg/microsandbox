@@ -41,6 +41,10 @@ type api struct {
 	store     store.Store
 	catalog   catalog.Catalog
 	dataURL   string // the public client-proxy data URL handed back to the SDK (where to send data)
+	// drain is the Redis-mediated node-drain channel (Stage 25); non-nil only under
+	// --node-discovery redis. In static mode it is nil and POST /nodes/{id}/drain returns the
+	// Decision-D5 error (a fixed fleet has no heartbeat to carry a status change).
+	drain *placement.DrainCommands
 }
 
 func main() {
@@ -69,6 +73,10 @@ func main() {
 		log.Fatal(err)
 	}
 	var discovery placement.Discovery
+	// drainCmds is the api's node-drain channel (Stage 25), wired only under redis discovery: it
+	// SETs a Redis command the orchestrator's registrar reflects in its heartbeat status. Static
+	// mode leaves it nil, so POST /nodes/{id}/drain returns the D5 "needs redis discovery" error.
+	var drainCmds *placement.DrainCommands
 	switch *nodeDiscovery {
 	case "static":
 		infos := make([]placement.NodeInfo, len(specs))
@@ -80,6 +88,8 @@ func main() {
 		rd := placement.NewRedisDiscovery(*redisAddr)
 		defer rd.Close()
 		discovery = rd
+		drainCmds = placement.NewDrainCommands(*redisAddr)
+		defer drainCmds.Close()
 	default:
 		log.Fatalf("unknown --node-discovery %q (want static|redis)", *nodeDiscovery)
 	}
@@ -129,6 +139,7 @@ func main() {
 		store:     st,
 		catalog:   cat,
 		dataURL:   *dataURL,
+		drain:     drainCmds,
 	}
 
 	// Stage 16: seed the configured API keys (default a well-known dev key -> default team) so
@@ -149,6 +160,10 @@ func main() {
 	mux.HandleFunc("GET /sandboxes", a.withAuth(a.handleList))
 	// Stage 24: the api's live view of the discovered orchestrator fleet (makes discovery observable).
 	mux.HandleFunc("GET /nodes", a.withAuth(a.handleNodes))
+	// Stage 25: drain / resume a node (stop / resume new placements on it). Auth-gated but not
+	// team-scoped -- the fleet is shared infrastructure, like GET /nodes. Redis discovery only (D5).
+	mux.HandleFunc("POST /nodes/{id}/drain", a.withAuth(a.handleDrain))
+	mux.HandleFunc("POST /nodes/{id}/resume", a.withAuth(a.handleResume))
 	// Template builds (Stage 10): create kicks an async build in the orchestrator; the SDK
 	// polls the build status; list is the api's durable record.
 	mux.HandleFunc("POST /templates", a.withAuth(a.handleTemplateCreate))

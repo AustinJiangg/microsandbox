@@ -91,10 +91,21 @@ func (r *Registrar) Stop() {
 	_ = r.rdb.Close()
 }
 
-// register writes the node's NodeInfo to its key with the TTL (SET … EX ttl).
+// register writes the node's NodeInfo to its key with the TTL (SET … EX ttl), self-reporting its
+// current drain status. It reads the api's drain command for this node first (Stage 25) so entering
+// or leaving drain flows api -> Redis command -> our heartbeat -> the api's discovery/reconcile,
+// which is what makes the orchestrator authoritative for its own status. A drain-read error leaves
+// the last reported status unchanged (a transient blip must not flip drain state).
 func (r *Registrar) register() error {
 	ctx, cancel := context.WithTimeout(context.Background(), redisOpTimeout)
 	defer cancel()
+	if draining, err := isDraining(ctx, r.rdb, r.self.ID); err != nil {
+		log.Printf("registrar: drain-status read failed: %v", err)
+	} else if draining {
+		r.self.Status = StatusDraining
+	} else {
+		r.self.Status = StatusActive
+	}
 	blob, err := json.Marshal(r.self)
 	if err != nil {
 		return err
