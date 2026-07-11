@@ -30,9 +30,18 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
+	// Pick a node for this sandbox (Stage 23: BestOfK over the fleet; a one-node fleet always
+	// returns that node, so this is a no-op refactor there). ErrNoNode means the whole fleet is
+	// unreachable/at capacity -- a 503, distinct from a bad request.
+	node, err := a.registry.Pick(nil)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no orchestrator node available: " + err.Error()})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	resp, err := a.client.Create(ctx, &pb.SandboxCreateRequest{
+	resp, err := node.RPC.Create(ctx, &pb.SandboxCreateRequest{
 		Config: &pb.SandboxConfig{Template: req.Template, FromSnapshot: req.FromSnapshot},
 	})
 	if err != nil {
@@ -41,12 +50,12 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Mint the per-sandbox data-plane access token (Stage 16). The rollback helper tears the
-	// just-built VM down on any failure between here and a successful route register, so a
-	// booted-but-unusable VM never leaks.
+	// just-built VM down (on the node that built it) on any failure between here and a
+	// successful route register, so a booted-but-unusable VM never leaks.
 	rollback := func() {
 		rb, cancelRB := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelRB()
-		if _, derr := a.client.Delete(rb, &pb.SandboxDeleteRequest{SandboxId: resp.GetSandboxId()}); derr != nil {
+		if _, derr := node.RPC.Delete(rb, &pb.SandboxDeleteRequest{SandboxId: resp.GetSandboxId()}); derr != nil {
 			log.Printf("rollback: delete %s: %v", resp.GetSandboxId(), derr)
 		}
 	}
@@ -62,7 +71,7 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// sandbox with no route is unreachable -- so on failure (e.g. Redis down) we roll the
 	// just-built VM back rather than return a booted-but-unroutable zombie. This is a direct
 	// Redis write now (Stage 14a), exactly like E2B's api; before 14a it went over an RPC.
-	if err := a.catalog.Set(resp.GetSandboxId(), catalog.Route{Node: a.nodeAddr, Token: token}); err != nil {
+	if err := a.catalog.Set(resp.GetSandboxId(), catalog.Route{Node: node.Proxy, Token: token}); err != nil {
 		rollback()
 		writeJSON(w, http.StatusBadGateway,
 			map[string]string{"error": "could not register sandbox route: " + err.Error()})
@@ -106,7 +115,7 @@ func (a *api) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	if _, err := a.client.Delete(ctx, &pb.SandboxDeleteRequest{SandboxId: id}); err != nil {
+	if err := a.deleteOnHoldingNode(ctx, id); err != nil {
 		writeGRPCError(w, err)
 		return
 	}
@@ -119,6 +128,31 @@ func (a *api) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		log.Printf("store: delete %s: %v", id, err)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteOnHoldingNode routes a Delete to the orchestrator node that holds the sandbox. The
+// catalog records it as Route.Node (the node's data-proxy address), so we resolve that to the
+// node and Delete there. If the route is missing/unresolvable (a stale catalog, or Redis is
+// down), we fall back to broadcasting Delete to every node: only the holder deletes it, the
+// rest answer NotFound harmlessly, and the call succeeds if any node held it. At a one-node
+// fleet the primary path always resolves, so this is behavior-identical to the pre-Stage-23
+// single-client Delete.
+func (a *api) deleteOnHoldingNode(ctx context.Context, id string) error {
+	if route, ok, err := a.catalog.Get(id); err == nil && ok {
+		if node, found := a.registry.NodeByProxy(route.Node); found {
+			_, derr := node.RPC.Delete(ctx, &pb.SandboxDeleteRequest{SandboxId: id})
+			return derr
+		}
+	}
+	lastErr := error(status.Error(codes.NotFound, "no such sandbox: "+id))
+	for _, node := range a.registry.Nodes() {
+		if _, derr := node.RPC.Delete(ctx, &pb.SandboxDeleteRequest{SandboxId: id}); derr == nil {
+			return nil
+		} else {
+			lastErr = derr
+		}
+	}
+	return lastErr
 }
 
 // handleList: GET /sandboxes -> 200 {"sandboxes":[{id,template,status,created_at}...]}, scoped

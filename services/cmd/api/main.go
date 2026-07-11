@@ -26,26 +26,28 @@ import (
 	"microsandbox/services/pkg/catalog"
 	pb "microsandbox/services/pkg/grpc/orchestrator"
 	pbt "microsandbox/services/pkg/grpc/templatemanager"
+	"microsandbox/services/pkg/placement"
 	"microsandbox/services/pkg/store"
 )
 
-// api holds the gRPC client to the orchestrator (lifecycle), the metadata store (durable
-// record), the catalog (writes each sandbox's data-path route to the shared Redis that
-// client-proxy reads), and the node value it registers. As of Stage 9c the api is
-// lifecycle-only -- it no longer proxies the data path.
+// api holds the orchestrator fleet (a placement.Registry picking a node per create, Stage 23 --
+// before this it was a single gRPC client + a single node address), the template-build client
+// (routed to one designated node), the metadata store (durable record), and the catalog (writes
+// each sandbox's data-path route to the shared Redis that client-proxy reads). As of Stage 9c
+// the api is lifecycle-only -- it never proxies the data path.
 type api struct {
-	client    pb.SandboxServiceClient
+	registry  *placement.Registry // the orchestrator fleet + BestOfK placement (Stage 23)
 	templates pbt.TemplateServiceClient
 	store     store.Store
 	catalog   catalog.Catalog
-	nodeAddr  string // the node (orchestrator data-proxy addr) registered for each sandbox
 	dataURL   string // the public client-proxy data URL handed back to the SDK (where to send data)
 }
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "host:port for the public REST API (the SDK's base URL)")
-	orchGRPC := flag.String("orchestrator-grpc", "127.0.0.1:9090", "orchestrator gRPC address (SandboxService)")
-	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "orchestrator data-proxy address: the node value registered in the catalog for each sandbox")
+	orchGRPC := flag.String("orchestrator-grpc", "127.0.0.1:9090", "single-node fallback: orchestrator gRPC address (SandboxService) when --nodes is empty")
+	orchProxy := flag.String("orchestrator-proxy", "127.0.0.1:5007", "single-node fallback: orchestrator data-proxy address (the catalog Route.Node) when --nodes is empty")
+	nodesFlag := flag.String("nodes", "", "orchestrator fleet as comma-separated grpc@proxy entries (Stage 23 multi-host); empty falls back to the single --orchestrator-grpc/--orchestrator-proxy node")
 	redisAddr := flag.String("redis-addr", "127.0.0.1:6379", "Redis address holding the sandbox routing catalog (the api writes routes here on create/destroy)")
 	dataURL := flag.String("data-url", "http://127.0.0.1:8081", "public client-proxy data URL returned to the SDK as where to send the data path")
 	storeDSN := flag.String("store-dsn", "postgres://postgres@127.0.0.1:5432/microsandbox?sslmode=disable",
@@ -54,14 +56,33 @@ func main() {
 		"comma-separated key=team pairs to seed on startup (a bare key maps to team 'default'); empty seeds nothing (Stage 16)")
 	flag.Parse()
 
-	// gRPC client to the orchestrator. NewClient is lazy (it connects on the first RPC,
-	// not here) and plaintext (insecure creds), like E2B on-cluster -- TLS/auth is out
-	// of scope for this learning project.
-	conn, err := grpc.NewClient(*orchGRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Build the orchestrator fleet from --nodes (Stage 23), or the single legacy node when it
+	// is empty. Each node gets its own gRPC client (NewClient is lazy -- it connects on the
+	// first RPC, not here -- and plaintext, like E2B on-cluster; TLS/auth is out of scope).
+	specs, err := parseNodeSpecs(*nodesFlag, *orchGRPC, *orchProxy)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
+	var nodes []*placement.Node
+	var conns []*grpc.ClientConn
+	for _, sp := range specs {
+		conn, err := grpc.NewClient(sp.GRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Fatalf("dial orchestrator %s: %v", sp.GRPC, err)
+		}
+		conns = append(conns, conn)
+		nodes = append(nodes, placement.NewNode(sp.GRPC, sp.Proxy, pb.NewSandboxServiceClient(conn), placement.DefaultCapacity))
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	// The registry keeps each node's cached load + readiness fresh (Start primes it once
+	// synchronously, then polls List ~1s) and picks a node per create via BestOfK.
+	registry := placement.NewRegistry(nodes, placement.DefaultK)
+	registry.Start()
+	defer registry.Stop()
 
 	st, err := store.Open(*storeDSN)
 	if err != nil {
@@ -74,11 +95,12 @@ func main() {
 	defer cat.Close()
 
 	a := &api{
-		client:    pb.NewSandboxServiceClient(conn),
-		templates: pbt.NewTemplateServiceClient(conn),
+		registry: registry,
+		// Template builds route to one designated node (node[0]): artifacts land in shared
+		// object storage keyed by build id (Stage 15), so any node restores from any build.
+		templates: pbt.NewTemplateServiceClient(conns[0]),
 		store:     st,
 		catalog:   cat,
-		nodeAddr:  *orchProxy,
 		dataURL:   *dataURL,
 	}
 
@@ -115,8 +137,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("api listening on %s (orchestrator grpc=%s proxy=%s, redis=%s, data-url=%s, store=%s)",
-		*addr, *orchGRPC, *orchProxy, *redisAddr, *dataURL, *storeDSN)
+	log.Printf("api listening on %s (%d orchestrator node(s), redis=%s, data-url=%s, store=%s)",
+		*addr, len(nodes), *redisAddr, *dataURL, *storeDSN)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
