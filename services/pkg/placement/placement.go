@@ -70,6 +70,20 @@ type Node struct {
 	count      atomic.Int64 // cached sandbox count from the last successful List
 	inProgress atomic.Int64 // chosen-but-not-yet-settled placements on this node
 	ready      atomic.Bool  // last List succeeded (reachable); false drops it from sampling
+	closeFn    func()       // cleanup run on eviction (closes the gRPC conn); nil for test nodes
+}
+
+// SetCloser attaches a cleanup invoked when the node is evicted from the registry -- reconcile
+// drops it because discovery no longer reports it (Stage 24). The api's node factory sets it to
+// close the node's gRPC conn; prebuilt test nodes leave it nil, so Close is then a no-op.
+func (n *Node) SetCloser(fn func()) { n.closeFn = fn }
+
+// Close runs the node's cleanup, if any. The registry calls it when the node leaves the fleet
+// (dynamic discovery) so a departed node's gRPC conn is released rather than leaked.
+func (n *Node) Close() {
+	if n.closeFn != nil {
+		n.closeFn()
+	}
 }
 
 // NewNode builds a node. It starts ready=true (optimistic): a freshly configured node is

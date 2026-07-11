@@ -111,7 +111,7 @@ func TestPlaceCreateSpreadsAcrossNodes(t *testing.T) {
 		addr, _ := startFakeOrch(t, fmt.Sprintf("n%d", i), codes.OK)
 		nodes = append(nodes, nodeTo(t, addr))
 	}
-	reg := placement.NewRegistry(nodes, nNodes) // K = N -> sample all; do NOT Start() (no poll)
+	reg := placement.NewStaticRegistry(nodes, nNodes) // K = N -> sample all; do NOT Start() (no poll)
 	a := &api{registry: reg}
 
 	tally := map[string]int{}
@@ -144,7 +144,7 @@ func TestPlaceCreateFailsOverPastAFailingNode(t *testing.T) {
 	nodeBad, nodeGood := nodeTo(t, badAddr), nodeTo(t, goodAddr)
 	nodeGood.Reserve() // bias: good looks busier, so the empty bad node is always picked first
 	nodeGood.Reserve()
-	reg := placement.NewRegistry([]*placement.Node{nodeBad, nodeGood}, 2)
+	reg := placement.NewStaticRegistry([]*placement.Node{nodeBad, nodeGood}, 2)
 	a := &api{registry: reg}
 
 	const n = 10
@@ -178,7 +178,7 @@ func TestPlaceCreateFailsOverPastAFailingNode(t *testing.T) {
 func TestPlaceCreateReturnsLastErrorWhenAllNodesFail(t *testing.T) {
 	a1, _ := startFakeOrch(t, "bad1", codes.Internal)
 	a2, _ := startFakeOrch(t, "bad2", codes.Internal)
-	reg := placement.NewRegistry([]*placement.Node{nodeTo(t, a1), nodeTo(t, a2)}, 2)
+	reg := placement.NewStaticRegistry([]*placement.Node{nodeTo(t, a1), nodeTo(t, a2)}, 2)
 	a := &api{registry: reg}
 
 	_, _, err := a.placeCreate(context.Background(), &pb.SandboxConfig{})
@@ -196,7 +196,7 @@ func TestPlaceCreateDoesNotFailOverOnInvalidArgument(t *testing.T) {
 	nodeBad, nodeGood := nodeTo(t, badAddr), nodeTo(t, goodAddr)
 	nodeGood.Reserve() // bias so the InvalidArgument node is picked first
 	nodeGood.Reserve()
-	reg := placement.NewRegistry([]*placement.Node{nodeBad, nodeGood}, 2)
+	reg := placement.NewStaticRegistry([]*placement.Node{nodeBad, nodeGood}, 2)
 	a := &api{registry: reg}
 
 	_, _, err := a.placeCreate(context.Background(), &pb.SandboxConfig{})

@@ -205,7 +205,7 @@ func TestNodeRefresh(t *testing.T) {
 func TestRegistryNodeByProxy(t *testing.T) {
 	a := NewNode("grpc-a", "proxy-a", &fakeRPC{}, DefaultCapacity)
 	b := NewNode("grpc-b", "proxy-b", &fakeRPC{}, DefaultCapacity)
-	reg := NewRegistry([]*Node{a, b}, DefaultK)
+	reg := NewStaticRegistry([]*Node{a, b}, DefaultK)
 	if n, ok := reg.NodeByProxy("proxy-b"); !ok || n.ID != "grpc-b" {
 		t.Fatalf("NodeByProxy(proxy-b) = %v, %v; want grpc-b", n, ok)
 	}
@@ -218,7 +218,7 @@ func TestRegistryStartPrimesLoad(t *testing.T) {
 	// Start does a synchronous prime poll before returning, so the first Pick sees real counts.
 	a := NewNode("grpc-a", "proxy-a", &fakeRPC{ids: []string{"x", "y"}}, DefaultCapacity)
 	b := NewNode("grpc-b", "proxy-b", &fakeRPC{ids: []string{"z"}}, DefaultCapacity)
-	reg := NewRegistry([]*Node{a, b}, len([]*Node{a, b})+1)
+	reg := NewStaticRegistry([]*Node{a, b}, len([]*Node{a, b})+1)
 	reg.Start()
 	defer reg.Stop()
 	best, err := reg.Pick(nil)

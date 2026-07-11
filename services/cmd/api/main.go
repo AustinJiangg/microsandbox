@@ -56,33 +56,47 @@ func main() {
 		"comma-separated key=team pairs to seed on startup (a bare key maps to team 'default'); empty seeds nothing (Stage 16)")
 	flag.Parse()
 
-	// Build the orchestrator fleet from --nodes (Stage 23), or the single legacy node when it
-	// is empty. Each node gets its own gRPC client (NewClient is lazy -- it connects on the
-	// first RPC, not here -- and plaintext, like E2B on-cluster; TLS/auth is out of scope).
+	// Build the orchestrator fleet's discovery source. Stage 24: a StaticDiscovery wrapping the
+	// --nodes flag (or the single legacy node when it is empty) is the default, so the fleet is
+	// still the flag's and create/destroy is identical to Stage 23; the Redis service-registry
+	// discovery (dynamic join/leave) is wired in 24b behind --node-discovery.
 	specs, err := parseNodeSpecs(*nodesFlag, *orchGRPC, *orchProxy)
 	if err != nil {
 		log.Fatal(err)
 	}
-	var nodes []*placement.Node
-	var conns []*grpc.ClientConn
-	for _, sp := range specs {
-		conn, err := grpc.NewClient(sp.GRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Fatalf("dial orchestrator %s: %v", sp.GRPC, err)
-		}
-		conns = append(conns, conn)
-		nodes = append(nodes, placement.NewNode(sp.GRPC, sp.Proxy, pb.NewSandboxServiceClient(conn), placement.DefaultCapacity))
+	infos := make([]placement.NodeInfo, len(specs))
+	for i, sp := range specs {
+		infos[i] = placement.NodeInfo{ID: sp.GRPC, GRPC: sp.GRPC, Proxy: sp.Proxy}
 	}
-	defer func() {
-		for _, c := range conns {
-			c.Close()
+	// nodeFactory dials a node's gRPC client (NewClient is lazy -- it connects on the first RPC,
+	// not here -- and plaintext, like E2B on-cluster; TLS/auth is out of scope) and attaches a
+	// closer that releases the conn when the registry evicts the node (dynamic discovery). The
+	// api owns dialing so pkg/placement stays dial-free.
+	nodeFactory := func(in placement.NodeInfo) (*placement.Node, error) {
+		conn, derr := grpc.NewClient(in.GRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if derr != nil {
+			return nil, derr
 		}
-	}()
-	// The registry keeps each node's cached load + readiness fresh (Start primes it once
-	// synchronously, then polls List ~1s) and picks a node per create via BestOfK.
-	registry := placement.NewRegistry(nodes, placement.DefaultK)
+		node := placement.NewNode(in.ID, in.Proxy, pb.NewSandboxServiceClient(conn), placement.DefaultCapacity)
+		node.SetCloser(func() { _ = conn.Close() })
+		return node, nil
+	}
+	// The registry reconciles the fleet against discovery and keeps each node's cached load +
+	// readiness fresh (Start primes it once synchronously, then polls ~1s), picking a node per
+	// create via BestOfK.
+	registry := placement.NewRegistry(placement.NewStaticDiscovery(infos), nodeFactory, placement.DefaultK)
 	registry.Start()
 	defer registry.Stop()
+
+	// Template builds route to one designated node (specs[0]): artifacts land in shared object
+	// storage keyed by build id (Stage 15), so any node restores from any build regardless of who
+	// built it. A dedicated conn (not a registry node's) keeps the build client stable even if
+	// that node is later reconciled out of the fleet.
+	tmplConn, err := grpc.NewClient(specs[0].GRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("dial template node %s: %v", specs[0].GRPC, err)
+	}
+	defer tmplConn.Close()
 
 	st, err := store.Open(*storeDSN)
 	if err != nil {
@@ -95,10 +109,8 @@ func main() {
 	defer cat.Close()
 
 	a := &api{
-		registry: registry,
-		// Template builds route to one designated node (node[0]): artifacts land in shared
-		// object storage keyed by build id (Stage 15), so any node restores from any build.
-		templates: pbt.NewTemplateServiceClient(conns[0]),
+		registry:  registry,
+		templates: pbt.NewTemplateServiceClient(tmplConn),
 		store:     st,
 		catalog:   cat,
 		dataURL:   *dataURL,
@@ -138,7 +150,7 @@ func main() {
 	}()
 
 	log.Printf("api listening on %s (%d orchestrator node(s), redis=%s, data-url=%s, store=%s)",
-		*addr, len(nodes), *redisAddr, *dataURL, *storeDSN)
+		*addr, len(registry.Nodes()), *redisAddr, *dataURL, *storeDSN)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
