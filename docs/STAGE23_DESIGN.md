@@ -1,12 +1,24 @@
 # Stage 23 design — multi-host scheduling: a node registry + `placement.BestOfK`
 
-> Status: **design.** This stage takes the first "production fidelity across hosts" item off the deferred
-> list in `docs/E2B_ALIGNMENT_ROADMAP.md` §5 / §Still-deferred: the api stops assuming **one** orchestrator
-> and instead holds a **set** of nodes and picks one per create with E2B's **power-of-K-choices** placement
-> (`placement.BestOfK`). Everything the multi-host data path needs was already built — the routing catalog
-> has been **per-sandbox `Route{Node}`** since Stage 14a, so client-proxy already routes each sandbox to
-> whichever node holds it. This stage is therefore **api-side only**: node registry + placement + failover.
+> Status: **done (23a–23d).** This stage takes the first "production fidelity across hosts" item off the
+> deferred list in `docs/E2B_ALIGNMENT_ROADMAP.md` §5 / §Still-deferred: the api stops assuming **one**
+> orchestrator and instead holds a **set** of nodes and picks one per create with E2B's **power-of-K-choices**
+> placement (`placement.BestOfK`). Everything the multi-host data path needs was already built — the routing
+> catalog has been **per-sandbox `Route{Node}`** since Stage 14a, so client-proxy already routes each sandbox
+> to whichever node holds it. This stage is therefore **api-side only**: node registry + placement + failover.
 > No proto change, no data-path change, no `envd`/rootfs change.
+>
+> **Landed:** **23a** (`services/pkg/placement` — `Node`/`BestOfK`/`Registry`, 12 unit tests incl. `-race`),
+> **23b** (the api wired to the registry via `--nodes`, backward-compatible at one node — real single-node VM
+> e2e green), **23c** (failover past node-fault errors + in-progress load balancing, an in-process
+> fake-orchestrator integration test: deterministic spread across 4 nodes, failover, error discipline), and
+> **23d** (this doc + `CLAUDE.md`/roadmap; the final real-VM single-node lifecycle e2e — **13/13** across
+> `test_microvm`/`test_metadata`/`test_auth`, confirming the refactored `handleCreate`/`placeCreate` path still
+> boots real VMs and stays team-scoped at one node). **Honest headline:**
+> on one box this is **fidelity, not speed** — the api genuinely holds a fleet and spreads load with real
+> power-of-K-choices, but node discovery is a static flag (Nomad stays deferred) and the verification of the
+> *multi-node* behavior is the in-process integration test, not two real orchestrators (which would test our
+> single-box resource partitioning, not E2B's scheduling — §7).
 
 ## 1. The problem (what "one orchestrator" is baked into)
 

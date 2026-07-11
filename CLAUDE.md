@@ -352,11 +352,37 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   `io_engine Async` + load-paused-then-resume (both are what E2B does on v1.10.1). Real-VM e2e **45/45** in
   `--nbd` s3 mode (`test_layered_snapshot_via_api` now un-gated). See `docs/STAGE22_DESIGN.md` (§16 the
   resolution; §13–15 the vanilla-v1.16.0 investigation that located the regression).
+- **Done (Stage 23 — multi-host scheduling: a node registry + `placement.BestOfK`)**: the first
+  "production fidelity across hosts" item — the api stops assuming **one** orchestrator and instead holds a
+  **fleet**, picking a node per create with E2B's **power-of-K-choices** placement. This is **api-side only**:
+  the data path was already multi-host since Stage 14a (the catalog stores a per-sandbox `Route{Node}`, so
+  client-proxy already routes each sandbox to whichever node holds it), so there is **no proto / data-path /
+  `envd` / rootfs change**. 23a added `services/pkg/placement` (`Node` + `BestOfK` + `Registry`): E2B's
+  `Score` specialized to our homogeneous 1-vCPU sandboxes collapses to `(inProgress + cachedCount) /
+  capacity`, where `cachedCount = len(List())` refreshed by a ~1s background poll (E2B's `Metrics()`) and
+  `inProgress` is a per-node reserve counter (E2B's `PlacementMetrics.InProgress()`) — so the existing
+  `SandboxService.List` RPC is the load signal and **no metrics RPC / proto edit** was needed. 23b wired the
+  api to the registry via a static `--nodes grpc@proxy,…` flag (empty → the single legacy
+  `--orchestrator-grpc/--orchestrator-proxy` node, so the e2e fixture and dev-up are unchanged); `handleCreate`
+  picks a node and routes Create + the catalog `Route.Node` to it, `handleDestroy` routes Delete to the
+  holding node (catalog `Route.Node` → `registry.NodeByProxy`, broadcast fallback). 23c added **failover**
+  (a node-fault Create error excludes that node and retries another — E2B's `excludedNodes`; a request-fault
+  `InvalidArgument` is returned immediately without failover, so a bad template stays a **400** not a 503, and
+  a single-node `Internal` still surfaces as **500**, not 503) + **in-progress load balancing**, verified by an
+  in-process fake-orchestrator integration test (deterministic spread across 4 nodes, failover, error
+  discipline — no KVM). **Honest scope:** on one box this is **fidelity, not speed**; **node discovery is a
+  static flag, not Nomad/Consul** (deferred); and the *multi-node* behavior is verified by the in-process
+  integration test, **not** two real orchestrators (which would test our single-box slot/device/path
+  partitioning — not an E2B concept — since each E2B orchestrator is a separate machine). Go units green
+  (incl. `-race`); real-VM single-node lifecycle e2e **13/13** (`test_microvm`/`test_metadata`/`test_auth`).
+  See `docs/STAGE23_DESIGN.md`.
 - **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md`): **production fidelity** — multi-host scheduling
-  over the now-shared catalog/store/bucket (`placement.BestOfK`), a TypeScript SDK; a cross-node chunk cache;
-  and auth depth (a key-management API, token expiry/rotation, TLS). Note: memfile/rootfs **compression IS an
-  optional E2B mechanism** (V4/V5 headers, zstd/lz4 in 2 MiB frames, raw V3 still supported, orthogonal to
-  COW); we still store raw, so it stays deferred optional depth.
+  landed its placement core in Stage 23 (`placement.BestOfK` over a static `--nodes` fleet); what remains is
+  **real node discovery** (Nomad/Consul, or a dynamic register/deregister API) + rebalancing + per-node build
+  placement, a TypeScript SDK, a cross-node chunk cache, and auth depth (a key-management API, token
+  expiry/rotation, TLS). Note: memfile/rootfs **compression IS an optional E2B mechanism** (V4/V5 headers,
+  zstd/lz4 in 2 MiB frames, raw V3 still supported, orthogonal to COW); we still store raw, so it stays
+  deferred optional depth.
 
 ## Development conventions
 
@@ -438,8 +464,9 @@ scripts/build-template.sh example --no-snapshot                 # + each built t
   `cmd/{api,client-proxy,orchestrator,msb-seed,msb-rootfs-stat,msb-memfile-stat}` are the binaries (`msb-seed`
   publishes the baked default/script-built templates into the object store; `msb-{rootfs,memfile}-stat` are the
   e2e COW-win probes for the layered rootfs (Stage 19) / memfile (Stage 20) — all dev/test glue),
-  `pkg/{fc,pool,network,proxy,template,store,catalog,storage,build,uffd,nbd,block}` the libraries (`nbd` = the
-  Stage-21 NBD device pool + userspace server; `block` = the COW block stack served over it), `proto/` the gRPC
+  `pkg/{fc,pool,network,proxy,template,store,catalog,storage,build,uffd,nbd,block,placement}` the libraries
+  (`nbd` = the Stage-21 NBD device pool + userspace server; `block` = the COW block stack served over it;
+  `placement` = the Stage-23 api-side node registry + BestOfK multi-host scheduler), `proto/` the gRPC
   contract (`orchestrator` + `templatemanager`; generated stubs in `pkg/grpc/`, committed — rerun
   `scripts/gen-proto.sh` only when a `.proto` changes, which needs `protoc`). Host-side
   changes take effect at the next `scripts/build-services.sh`; no rootfs rebuild needed

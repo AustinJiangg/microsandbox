@@ -273,6 +273,24 @@ regression; **pinning `vendor/firecracker` to v1.10.1 closes it** (+ UFFD `page_
 layered-child stale-vmstate refresh, `io_engine Async` + load-paused-then-resume to match E2B). Real-VM e2e
 **45/45** in `--nbd` s3 mode. See `docs/STAGE22_DESIGN.md` (§16 resolution; §13–15 the investigation).
 
+### Stage 23 — multi-host scheduling: a node registry + `placement.BestOfK` ✅
+The first "production fidelity across hosts" item: the api stops assuming **one** orchestrator and holds a
+**fleet**, picking a node per create with E2B's **power-of-K-choices** placement. **api-side only** — the data
+path was already multi-host since Stage 14a (the catalog stores a per-sandbox `Route{Node}`), so no proto /
+data-path / `envd` / rootfs change. `services/pkg/placement` (`Node` + `BestOfK` + `Registry`) specializes
+E2B's CPU-weighted `Score` to our homogeneous 1-vCPU sandboxes → `(inProgress + cachedCount) / capacity`,
+with `cachedCount = len(List())` refreshed by a ~1s background poll (E2B's `Metrics()`) and `inProgress` a
+per-node reserve counter (E2B's `InProgress()`) — so the existing `SandboxService.List` is the load signal and
+**no metrics RPC / proto edit** was needed. The api takes a static `--nodes grpc@proxy,…` flag (empty → the
+single legacy node, backward-compatible); `handleCreate` picks + routes Create/catalog to the chosen node,
+`handleDestroy` routes Delete to the holding node; **failover** excludes a node-fault Create error and retries
+(request-fault `InvalidArgument` returned immediately → 400 preserved, single-node `Internal` → 500 preserved),
+plus **in-progress load balancing**. **Honest scope:** fidelity, not speed; node discovery is a static flag
+(Nomad deferred); the multi-node behavior is verified by an in-process fake-orchestrator integration test
+(deterministic spread, failover), **not** two real orchestrators (which would test single-box resource
+partitioning, not E2B scheduling). Go units green (incl. `-race`); real-VM single-node lifecycle e2e **13/13**.
+See `docs/STAGE23_DESIGN.md`.
+
 ### Still deferred
 - **More storage-mechanism depth (deeper E2B fidelity behind the same seam).** Verified against
   `e2b-dev/infra`, and building on the Stage-17/18/19 `pkg/storage/header` + COW algebra: E2B serves the **rootfs
@@ -288,9 +306,10 @@ layered-child stale-vmstate refresh, `io_engine Async` + load-paused-then-resume
   > zstd/lz4 (`shared/pkg/storage/compress_encode.go`, per-build `FrameTable`), flag-gated, with raw V3 still
   > supported. Compression is **orthogonal to COW** and off its critical path; we still store raw (our v1/v2
   > headers ≈ E2B's V3), so it is **deferred optional E2B depth**, not "not-E2B." See `docs/STAGE20_DESIGN.md` §2.
-- **Later — production fidelity.** Auth landed in Stage 16 (above); what remains: multi-host
-  scheduling (real node discovery + `placement.BestOfK`), a TypeScript SDK, per-template resource
-  limits and start/ready commands, plus auth depth (a key-management API, token expiry/rotation, TLS).
+- **Later — production fidelity.** Auth landed in Stage 16; multi-host **placement** landed in Stage 23
+  (`placement.BestOfK` over a static `--nodes` fleet). What remains: **real node discovery** (Nomad/Consul, or
+  a dynamic register/deregister API) + rebalancing + per-node build placement, a TypeScript SDK, per-template
+  resource limits and start/ready commands, plus auth depth (a key-management API, token expiry/rotation, TLS).
 
 ## 6. Repo layout after Stage 10
 
