@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"microsandbox/services/pkg/catalog"
 	pb "microsandbox/services/pkg/grpc/orchestrator"
+	"microsandbox/services/pkg/placement"
 )
 
 // handleHealth is the api's own liveness (the test fixture waits on it before running).
@@ -30,24 +32,27 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	// Pick a node for this sandbox (Stage 23: BestOfK over the fleet; a one-node fleet always
-	// returns that node, so this is a no-op refactor there). ErrNoNode means the whole fleet is
-	// unreachable/at capacity -- a 503, distinct from a bad request.
-	node, err := a.registry.Pick(nil)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no orchestrator node available: " + err.Error()})
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	resp, err := node.RPC.Create(ctx, &pb.SandboxCreateRequest{
-		Config: &pb.SandboxConfig{Template: req.Template, FromSnapshot: req.FromSnapshot},
-	})
+
+	// Place the sandbox on a node (Stage 23: BestOfK over the fleet, failing over past a node
+	// whose Create fails with a node-fault error; a one-node fleet just uses that node). The
+	// returned node is Reserved -- its in-progress load is +1 so concurrent creates spread --
+	// and we Release once the placement settles (deferred, covering every return path below).
+	node, resp, err := a.placeCreate(ctx, &pb.SandboxConfig{Template: req.Template, FromSnapshot: req.FromSnapshot})
 	if err != nil {
-		writeGRPCError(w, err)
+		if errors.Is(err, placement.ErrNoNode) {
+			// The whole fleet was unreachable/at capacity before any Create was attempted -- 503.
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no orchestrator node available: " + err.Error()})
+		} else {
+			// A create-time error that survived failover: a request fault (bad template ->
+			// InvalidArgument -> 400) or the last node-fault error (-> 500). writeGRPCError maps
+			// it exactly as the pre-Stage-23 single-node path did.
+			writeGRPCError(w, err)
+		}
 		return
 	}
+	defer node.Release()
 
 	// Mint the per-sandbox data-plane access token (Stage 16). The rollback helper tears the
 	// just-built VM down (on the node that built it) on any failure between here and a
@@ -94,6 +99,47 @@ func (a *api) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// the SDK must send (X-Access-Token) on data calls to the in-VM control services (Stage 16).
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"id": resp.GetSandboxId(), "data_url": a.dataURL, "token": token})
+}
+
+// placeCreate picks a node (BestOfK) and creates the sandbox on it, failing over to another
+// node when a node's Create fails with a node-fault error (the failed node is excluded and the
+// pick retried, mirroring E2B's excludedNodes). It returns the chosen node -- already RESERVED,
+// so its in-progress load reflects this placement; the caller MUST Release once the placement
+// settles -- and the create response.
+//
+// Error discipline (backward-compatible with the pre-Stage-23 single-node path):
+//   - codes.InvalidArgument is the request's fault (e.g. a bad template name), not the node's,
+//     so it is returned immediately WITHOUT failover -> the api maps it to 400.
+//   - any other Create error is treated as a node fault: the node is excluded and another is
+//     tried. If the fleet is then exhausted, the LAST such error is returned (so a single-node
+//     Internal failure still surfaces as 500, exactly as before) -- not ErrNoNode.
+//   - ErrNoNode is returned only when the registry has no eligible node to even attempt (all
+//     not-ready/at-capacity) -> the api maps it to 503.
+func (a *api) placeCreate(ctx context.Context, cfg *pb.SandboxConfig) (*placement.Node, *pb.SandboxCreateResponse, error) {
+	excluded := map[string]struct{}{}
+	var lastErr error
+	for {
+		node, err := a.registry.Pick(excluded)
+		if err != nil {
+			if lastErr != nil {
+				return nil, nil, lastErr // surface the real create failure, not "no node"
+			}
+			return nil, nil, err // never attempted a node -> ErrNoNode (503)
+		}
+		node.Reserve()
+		resp, cerr := node.RPC.Create(ctx, &pb.SandboxCreateRequest{Config: cfg})
+		if cerr != nil {
+			node.Release()
+			if status.Code(cerr) == codes.InvalidArgument {
+				return nil, nil, cerr // request's fault -> don't fail over
+			}
+			lastErr = cerr
+			excluded[node.ID] = struct{}{}
+			log.Printf("placement: create on node %s failed (%v); excluding and retrying", node.ID, cerr)
+			continue
+		}
+		return node, resp, nil // reserved; the caller releases once settled
+	}
 }
 
 // handleDestroy: DELETE /sandboxes/{id} -> authorise (the sandbox must belong to the caller's
