@@ -427,14 +427,46 @@ runs*. Keep these axes separate, and keep the client/protocol boundary clean.
   Go units green (incl. `-race` + a live-Redis drain round-trip); real-VM **drain e2e 1/1** +
   **discovery 2/2** under `--node-discovery redis`, static-default `test_microvm` **6/6** unregressed. See
   `docs/STAGE25_DESIGN.md`.
+- **Done (Stage 26 — rebalancing: relocate a sandbox off a draining node via pause→resume)**: the follow-on
+  to Stage 25 (which only *stopped new* placements on a draining node) — the sandboxes **already on** it.
+  **The core question was resolved against `e2b-dev/infra` @ main before any code, and it overturned the
+  plan's "leaning A" (orchestrator-to-orchestrator live hand-off): E2B has NO server-driven migration loop**
+  (no `rebalance`/`evacuate` code; the api's node-sync loop only *reads* status/instances; the orchestrator
+  drain phase just marks itself draining and waits). A sandbox relocates ONLY through the **pause → resume
+  lifecycle**: `Pause` checkpoints the VM to object storage recording its `OriginNodeID`, and on `Resume`
+  `create_instance.go` prefers the origin node **but drops that affinity when the origin is not `Ready`**
+  (draining) → `PlaceSandbox` re-places via BestOfK (which already excludes draining nodes). So the faithful
+  Stage 26 is **drain-aware resume affinity**, not a live hand-off. Scope chosen (given our repo had no
+  per-sandbox pause/resume and a real live pause is the fragile Stage 20/22 re-snapshot path): **faithful
+  api-side scheduling, verified in process, no FC-saga risk**. **26a** added the placement primitive
+  (`BestOfK.ChoosePreferred` / `Registry.PickPreferred`: honor a preferred node iff `Ready() && !Draining()`
+  and not excluded, else BestOfK — the reduction of E2B's affinity-drop). **26b** built the control plane:
+  proto `SandboxService.Pause`/`Resume` (clean regen); the real orchestrator returns **`Unimplemented`** (a
+  real per-sandbox live snapshot reuses the Stage 20/22 producer — deferred, D4 — so a real-VM pause surfaces
+  as **501**), the **fake orchestrator** implements them as list moves; `pkg/store` gained an `origin_node`
+  column (idempotent ALTER, both backends) + `PauseSandbox`/`PausedSandbox`/`ResumeSandbox` (`paused`/`running`
+  status, verified on live Postgres); the api gained `POST /sandboxes/{id}/pause` (route to the holding node →
+  Pause → record paused+origin → drop the catalog route) + `/resume` (read origin → `PickPreferred` → Resume
+  on the target → **rewrite the catalog route to the new node** → mark running), `placeResume` mirroring
+  `placeCreate`'s failover discipline (`InvalidArgument` no-failover→400, `ErrNoNode`→503). **26c** finalized
+  docs. **Verified in process** (`cmd/api`, real gRPC over localhost, no KVM): a sandbox created on node A,
+  paused, then resumed after A drains comes back on **node B** with the catalog+store following the move
+  (`TestSandboxRelocatesOffDrainingNode`); an *active* origin is honored over load
+  (`TestSandboxResumeHonorsActiveOrigin`). **Honest scope:** on one box **fidelity, not speed**; **no
+  server-driven evacuation loop** (E2B has none either) and **no real-VM live pause** (Unimplemented, D4 — the
+  relocation *scheduling* is the deliverable, which is what E2B's mechanism actually is); no SDK pause button
+  (it would imply the real-VM mechanic works). Go units green (incl. `-race`, live Postgres+Redis); no new
+  Python e2e (no real-VM path added). See `docs/STAGE26_DESIGN.md`.
 - **Possible next** (per `docs/E2B_ALIGNMENT_ROADMAP.md` + `docs/POST_STAGE24_PLAN.md`): **production
   fidelity** — multi-host scheduling landed its placement core in Stage 23 (`placement.BestOfK`), **real
-  (dynamic) node discovery** in Stage 24, and **graceful drain** in Stage 25; what remains (planned as Stages
-  26–31) is **rebalancing** already-placed sandboxes off a draining/joined node (Stage 26), **per-node build
-  placement** (template builds still route to one designated node), a real Nomad/Consul `Discovery` impl, a
-  cross-node chunk cache, auth depth (a key-management API, token expiry/rotation, TLS), and optional
-  **compression** (V4/V5 headers, zstd/lz4 in 2 MiB frames, orthogonal to COW — E2B makes it optional, so we
-  will too). **A TypeScript SDK is explicitly dropped (won't be done).**
+  (dynamic) node discovery** in Stage 24, **graceful drain** in Stage 25, and **rebalancing** (drain-aware
+  pause→resume relocation) in Stage 26; what remains (planned as Stages 27–31) is **per-node build placement**
+  (template builds still route to one designated node), a real Nomad/Consul `Discovery` impl, a cross-node
+  chunk cache, auth depth (a key-management API, token expiry/rotation, TLS), and optional **compression**
+  (V4/V5 headers, zstd/lz4 in 2 MiB frames, orthogonal to COW — E2B makes it optional, so we will too). **A
+  TypeScript SDK is explicitly dropped (won't be done).** (A real per-sandbox live pause — wiring the Stage
+  20/22 producer behind the Stage-26 `Pause`/`Resume` RPCs — is the deferred follow-on that would make the
+  relocation move real VMs, not just its scheduling.)
 
 ## Development conventions
 
@@ -520,7 +552,9 @@ scripts/build-template.sh example --no-snapshot                 # + each built t
   (`nbd` = the Stage-21 NBD device pool + userspace server; `block` = the COW block stack served over it;
   `placement` = the api-side node registry + BestOfK multi-host scheduler (Stage 23), now reconciling a
   dynamic fleet against a pluggable `Discovery` source — a `StaticDiscovery` over `--nodes` or a Redis
-  service registry orchestrators self-register into via `--register` (Stage 24)), `proto/` the gRPC
+  service registry orchestrators self-register into via `--register` (Stage 24) — with drain-aware
+  resume affinity `PickPreferred`/`ChoosePreferred` for sandbox relocation (Stage 26); the api's Stage-26
+  pause/resume handlers live in `cmd/api/relocate.go`), `proto/` the gRPC
   contract (`orchestrator` + `templatemanager`; generated stubs in `pkg/grpc/`, committed — rerun
   `scripts/gen-proto.sh` only when a `.proto` changes, which needs `protoc`). Host-side
   changes take effect at the next `scripts/build-services.sh`; no rootfs rebuild needed

@@ -97,7 +97,17 @@ sandboxes keep running.
 **Honest scope.** Drain only means "no new placements"; existing sandboxes run to natural
 end — **actively evacuating them is Stage 26.** Single-box: fidelity, not speed.
 
-## Stage 26 — Rebalancing (evacuate sandboxes off a draining / over-full node)
+## Stage 26 — Rebalancing (relocate a sandbox off a draining node) — DONE
+
+> Shipped: design + 26a/26b/26c. See `docs/STAGE26_DESIGN.md` and the CLAUDE.md "Done (Stage 26)"
+> entry. **The source read overturned the plan's "leaning A":** E2B has no server-driven migration
+> loop; a sandbox relocates only through **pause → resume with drain-aware resume affinity**
+> (`create_instance.go` drops the origin pin when the origin is not `Ready`). So Stage 26 built that
+> — `placement.PickPreferred` + api `POST /sandboxes/{id}/pause`+`/resume` + a catalog route rewrite
+> — verified **in process** (the fake-orchestrator harness): a sandbox created on A, paused, then
+> resumed after A drains comes back on B. The real per-sandbox live pause reuses the Stage 20/22
+> producer and is **deferred** (the real orchestrator's `Pause`/`Resume` return `Unimplemented`);
+> "no FC-saga risk, fidelity not speed."
 
 The hardest stage here, and the one that **most needs the source read first**, because what moves is
 a *live microVM*.
