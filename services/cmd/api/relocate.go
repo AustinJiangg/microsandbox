@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"log"
 	"net/http"
@@ -14,6 +16,20 @@ import (
 	pb "microsandbox/services/pkg/grpc/orchestrator"
 	"microsandbox/services/pkg/placement"
 )
+
+// newSnapshotBuildID mints the build id a pause checkpoint's artifacts are stored under
+// (Stage 26R). The api owns this identity -- it mints the id, hands it to the orchestrator to
+// write the diffs under, and persists it for resume -- matching E2B's UpsertSnapshot ->
+// SandboxPauseRequest{BuildId} (the orchestrator never names its own snapshot). Same
+// "bld_<hex>" shape as a template build id: a paused snapshot is just another build in the
+// bucket, restored like any other.
+func newSnapshotBuildID() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "bld_" + hex.EncodeToString(b[:]), nil
+}
 
 // Sandbox relocation (Stage 26). E2B moves a sandbox off a node not with a server-driven migration
 // loop (there is none) but through the pause -> resume lifecycle: Pause checkpoints the VM to
@@ -59,16 +75,25 @@ func (a *api) handleSandboxPause(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "node holding the sandbox is not in the fleet: " + route.Node})
 		return
 	}
+	// Mint the checkpoint's identity BEFORE the RPC (Stage 26R, D2): the api owns the build id,
+	// the orchestrator writes the snapshot's artifacts under it, and the store remembers it for
+	// resume -- E2B's UpsertSnapshot -> SandboxPauseRequest{BuildId}.
+	snapshotBuild, err := newSnapshotBuildID()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not mint snapshot build id: " + err.Error()})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	if _, err := node.RPC.Pause(ctx, &pb.SandboxPauseRequest{SandboxId: id}); err != nil {
-		writeGRPCError(w, err) // Unimplemented on the real orchestrator (D4) -> 500; the fake pauses
+	if _, err := node.RPC.Pause(ctx, &pb.SandboxPauseRequest{SandboxId: id, BuildId: snapshotBuild}); err != nil {
+		writeGRPCError(w, err) // FailedPrecondition outside --nbd s3 mode (D3); the fake pauses
 		return
 	}
 	// The VM is checkpointed and gone from its node: record the pause (origin = the node it was on,
-	// so resume can prefer it) and drop the route so the data path stops resolving to a node that no
-	// longer holds it. Both are best-effort/logged, consistent with create/destroy.
-	if err := a.store.PauseSandbox(id, route.Node); err != nil {
+	// so resume can prefer it; snapshot_build = where the checkpoint lives, so resume restores it)
+	// and drop the route so the data path stops resolving to a node that no longer holds it. Both
+	// are best-effort/logged, consistent with create/destroy.
+	if err := a.store.PauseSandbox(id, route.Node, snapshotBuild); err != nil {
 		log.Printf("store: pause %s: %v", id, err)
 	}
 	if err := a.catalog.Delete(id); err != nil {
@@ -95,7 +120,7 @@ func (a *api) handleSandboxResume(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such sandbox: " + id})
 		return
 	}
-	origin, tmpl, paused, err := a.store.PausedSandbox(id)
+	origin, tmpl, snapshotBuild, paused, err := a.store.PausedSandbox(id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "paused-state lookup failed: " + err.Error()})
 		return
@@ -111,7 +136,7 @@ func (a *api) handleSandboxResume(w http.ResponseWriter, r *http.Request) {
 	cfg := &pb.SandboxConfig{Template: tmpl, FromSnapshot: true}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	node, _, err := a.placeResume(ctx, id, preferred, cfg)
+	node, _, err := a.placeResume(ctx, id, preferred, cfg, snapshotBuild)
 	if err != nil {
 		if errors.Is(err, placement.ErrNoNode) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no orchestrator node available to resume on: " + err.Error()})
@@ -160,7 +185,8 @@ func (a *api) handleSandboxResume(w http.ResponseWriter, r *http.Request) {
 // (-> 400); any other Resume error excludes the node and retries; ErrNoNode surfaces (-> 503) only
 // when nothing is eligible to even attempt. Excluding a failed node's ID also drops it as the
 // preferred on the next PickPreferred, so a broken origin doesn't get retried forever.
-func (a *api) placeResume(ctx context.Context, id string, preferred *placement.Node, cfg *pb.SandboxConfig) (*placement.Node, *pb.SandboxResumeResponse, error) {
+// snapshotBuild names the checkpoint to restore from (recorded at pause, Stage 26R).
+func (a *api) placeResume(ctx context.Context, id string, preferred *placement.Node, cfg *pb.SandboxConfig, snapshotBuild string) (*placement.Node, *pb.SandboxResumeResponse, error) {
 	excluded := map[string]struct{}{}
 	var lastErr error
 	for {
@@ -172,7 +198,7 @@ func (a *api) placeResume(ctx context.Context, id string, preferred *placement.N
 			return nil, nil, err // never attempted a node -> ErrNoNode (503)
 		}
 		node.Reserve()
-		resp, rerr := node.RPC.Resume(ctx, &pb.SandboxResumeRequest{SandboxId: id, Config: cfg})
+		resp, rerr := node.RPC.Resume(ctx, &pb.SandboxResumeRequest{SandboxId: id, Config: cfg, SnapshotBuildId: snapshotBuild})
 		if rerr != nil {
 			node.Release()
 			if status.Code(rerr) == codes.InvalidArgument {

@@ -86,7 +86,7 @@ type TemplateCreateRequest struct {
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`                                      // template name (validated; "default" is rejected -- it is the stock image)
 	Dockerfile    string                 `protobuf:"bytes,2,opt,name=dockerfile,proto3" json:"dockerfile,omitempty"`                          // the recipe contents (FROM microsandbox-agent + RUN ...)
 	WithSnapshot  bool                   `protobuf:"varint,3,opt,name=with_snapshot,json=withSnapshot,proto3" json:"with_snapshot,omitempty"` // also build the warm snapshot (for from_snapshot starts)
-	Base          string                 `protobuf:"bytes,4,opt,name=base,proto3" json:"base,omitempty"`                                      // Stage 18 (COW): build this rootfs as a diff over base template's; empty = a flat build
+	Base          string                 `protobuf:"bytes,4,opt,name=base,proto3" json:"base,omitempty"`                                      // Stage 18 (COW): build this rootfs as a diff over base template's; empty = a flat (non-layered) build
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

@@ -26,9 +26,11 @@ type fakeOrch struct {
 	name      string
 	createErr codes.Code // OK = Create succeeds; else Create returns this code (a failing node)
 
-	mu      sync.Mutex
-	ids     []string
-	creates int // total Create attempts (proves a failing node was tried before exclusion)
+	mu           sync.Mutex
+	ids          []string
+	creates      int               // total Create attempts (proves a failing node was tried before exclusion)
+	pauseBuilds  map[string]string // sandbox id -> the build id its pause checkpoint was written under (26R)
+	resumeBuilds map[string]string // sandbox id -> the snapshot build id its resume restored from (26R)
 }
 
 func (f *fakeOrch) Create(context.Context, *pb.SandboxCreateRequest) (*pb.SandboxCreateResponse, error) {
@@ -62,21 +64,25 @@ func (f *fakeOrch) List(context.Context, *emptypb.Empty) (*pb.SandboxListRespons
 }
 
 // Pause frees the sandbox from this node (it drops out of the list, so the node's load falls) --
-// the state move behind relocation. Called on the node that holds it, so an absent id is NotFound.
+// the state move behind relocation. It records the api-minted build id the checkpoint would be
+// written under (26R), so tests can assert resume restores that same id. Called on the node that
+// holds it, so an absent id is NotFound.
 func (f *fakeOrch) Pause(_ context.Context, req *pb.SandboxPauseRequest) (*emptypb.Empty, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, id := range f.ids {
 		if id == req.GetSandboxId() {
 			f.ids = append(f.ids[:i], f.ids[i+1:]...)
+			f.pauseBuilds[id] = req.GetBuildId()
 			return &emptypb.Empty{}, nil
 		}
 	}
 	return nil, status.Error(codes.NotFound, "no such sandbox")
 }
 
-// Resume restores the sandbox on THIS node under the same id (it joins the list). A node configured
-// with createErr refuses resume too, so failover-on-resume is testable the same way as create.
+// Resume restores the sandbox on THIS node under the same id (it joins the list), recording the
+// snapshot build id it was asked to restore from (26R). A node configured with createErr refuses
+// resume too, so failover-on-resume is testable the same way as create.
 func (f *fakeOrch) Resume(_ context.Context, req *pb.SandboxResumeRequest) (*pb.SandboxResumeResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -84,6 +90,7 @@ func (f *fakeOrch) Resume(_ context.Context, req *pb.SandboxResumeRequest) (*pb.
 		return nil, status.Error(f.createErr, "fake "+f.name+" refusing resume")
 	}
 	f.ids = append(f.ids, req.GetSandboxId())
+	f.resumeBuilds[req.GetSandboxId()] = req.GetSnapshotBuildId()
 	return &pb.SandboxResumeResponse{SandboxId: req.GetSandboxId()}, nil
 }
 
@@ -111,6 +118,20 @@ func (f *fakeOrch) attempts() int {
 	return f.creates
 }
 
+// pauseBuild / resumeBuild report the build id this node saw for a sandbox's Pause / Resume
+// (26R: proves the api-minted checkpoint id is threaded pause -> store -> resume intact).
+func (f *fakeOrch) pauseBuild(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pauseBuilds[id]
+}
+
+func (f *fakeOrch) resumeBuild(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resumeBuilds[id]
+}
+
 // startFakeOrch stands up a fakeOrch on a real localhost gRPC listener and returns its address
 // and the server (for assertions). The listener/server are torn down at test end.
 func startFakeOrch(t *testing.T, name string, createErr codes.Code) (string, *fakeOrch) {
@@ -119,7 +140,8 @@ func startFakeOrch(t *testing.T, name string, createErr codes.Code) (string, *fa
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeOrch{name: name, createErr: createErr}
+	f := &fakeOrch{name: name, createErr: createErr,
+		pauseBuilds: map[string]string{}, resumeBuilds: map[string]string{}}
 	s := grpc.NewServer()
 	pb.RegisterSandboxServiceServer(s, f)
 	go func() { _ = s.Serve(lis) }()

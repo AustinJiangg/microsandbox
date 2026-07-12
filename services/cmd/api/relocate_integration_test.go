@@ -129,8 +129,14 @@ func TestSandboxRelocatesOffDrainingNode(t *testing.T) {
 	if _, ok, _ := a.catalog.Get(id); ok {
 		t.Fatal("after pause the catalog route should be gone")
 	}
-	if origin, _, paused, _ := a.store.PausedSandbox(id); !paused || origin != nodeA.Proxy {
+	origin, _, snapBuild, paused, _ := a.store.PausedSandbox(id)
+	if !paused || origin != nodeA.Proxy {
 		t.Fatalf("after pause store: paused=%v origin=%s, want true %s", paused, origin, nodeA.Proxy)
+	}
+	// 26R: the api minted the checkpoint's build id, handed it to the pausing node, and persisted
+	// the same one -- the identity resume will restore from.
+	if snapBuild == "" || fakeA.pauseBuild(id) != snapBuild {
+		t.Fatalf("snapshot build id not threaded: store=%q, node saw %q (want equal, non-empty)", snapBuild, fakeA.pauseBuild(id))
 	}
 
 	// A enters drain (discovery -> reconcile). Start()'s synchronous first poll applies it.
@@ -148,12 +154,17 @@ func TestSandboxRelocatesOffDrainingNode(t *testing.T) {
 	if fakeA.holds(id) || !fakeB.holds(id) {
 		t.Fatalf("resume should have relocated to B: A.holds=%v B.holds=%v", fakeA.holds(id), fakeB.holds(id))
 	}
+	// 26R: B restored from exactly the checkpoint A's pause wrote (the id round-tripped through
+	// the store across the node move).
+	if fakeB.resumeBuild(id) != snapBuild {
+		t.Fatalf("resume restored build %q, want the pause checkpoint %q", fakeB.resumeBuild(id), snapBuild)
+	}
 	// The catalog route is rewritten to B, so the data path follows the sandbox to its new node.
 	if route, ok, _ := a.catalog.Get(id); !ok || route.Node != nodeB.Proxy {
 		t.Fatalf("resume route: got %+v (ok=%v), want node=%s", route, ok, nodeB.Proxy)
 	}
 	// The store shows it running again.
-	if _, _, paused, _ := a.store.PausedSandbox(id); paused {
+	if _, _, _, paused, _ := a.store.PausedSandbox(id); paused {
 		t.Fatal("after resume the sandbox should no longer be paused")
 	}
 }

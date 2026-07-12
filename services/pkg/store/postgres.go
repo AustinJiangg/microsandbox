@@ -51,11 +51,13 @@ func openPostgres(dsn string) (Store, error) {
 			return nil, errSchema(err)
 		}
 	}
-	// Stage 26: add sandboxes.origin_node the same idempotent way (ADD COLUMN IF NOT EXISTS).
-	if _, err := db.Exec(
-		`ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS origin_node TEXT NOT NULL DEFAULT ''`); err != nil {
-		db.Close()
-		return nil, errSchema(err)
+	// Stage 26 + 26R: add the pause/resume columns the same idempotent way (ADD COLUMN IF NOT EXISTS).
+	for _, col := range pauseColumns {
+		if _, err := db.Exec(
+			`ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+			db.Close()
+			return nil, errSchema(err)
+		}
 	}
 	return &postgresStore{db: db}, nil
 }
@@ -118,27 +120,31 @@ func (s *postgresStore) ListSandboxes(teamID string) ([]Sandbox, error) {
 }
 
 // PauseSandbox marks a sandbox paused and records origin_node (the data-proxy addr it was paused
-// from), so a later resume can prefer that node. Zero rows for an absent id is not an error; the
-// api checks ownership via SandboxTeam first.
-func (s *postgresStore) PauseSandbox(id, originNode string) error {
+// from) + snapshot_build (the build id its checkpoint is stored under, Stage 26R), so a later
+// resume can prefer that node and restore that exact checkpoint. Zero rows for an absent id is
+// not an error; the api checks ownership via SandboxTeam first.
+func (s *postgresStore) PauseSandbox(id, originNode, snapshotBuild string) error {
 	_, err := s.db.Exec(
-		`UPDATE sandboxes SET status = 'paused', origin_node = $1 WHERE id = $2`, originNode, id)
+		`UPDATE sandboxes SET status = 'paused', origin_node = $1, snapshot_build = $2 WHERE id = $3`,
+		originNode, snapshotBuild, id)
 	return err
 }
 
 // PausedSandbox reports whether a sandbox exists and is currently paused, and (for resume) its
-// recorded origin_node + template. A running or missing sandbox is ("", "", false, nil).
-func (s *postgresStore) PausedSandbox(id string) (string, string, bool, error) {
-	var origin, template string
+// recorded origin_node + template + snapshot_build. A running or missing sandbox is
+// ("", "", "", false, nil).
+func (s *postgresStore) PausedSandbox(id string) (string, string, string, bool, error) {
+	var origin, template, snapshotBuild string
 	err := s.db.QueryRow(
-		`SELECT origin_node, template FROM sandboxes WHERE id = $1 AND status = 'paused'`, id).Scan(&origin, &template)
+		`SELECT origin_node, template, snapshot_build FROM sandboxes WHERE id = $1 AND status = 'paused'`,
+		id).Scan(&origin, &template, &snapshotBuild)
 	if err == sql.ErrNoRows {
-		return "", "", false, nil
+		return "", "", "", false, nil
 	}
 	if err != nil {
-		return "", "", false, err
+		return "", "", "", false, err
 	}
-	return origin, template, true, nil
+	return origin, template, snapshotBuild, true, nil
 }
 
 // ResumeSandbox marks a paused sandbox running again. origin_node is left as-is (stale but unread

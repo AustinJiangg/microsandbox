@@ -278,9 +278,14 @@ func (x *SandboxListResponse) GetSandboxIds() []string {
 	return nil
 }
 
+// Pause writes the checkpoint's artifacts under build_id -- an api-minted fresh build id, so
+// the id authority stays with the api (which owns the catalog + store), matching E2B's
+// UpsertSnapshot -> SandboxPauseRequest{BuildId} (Stage 26R). A paused sandbox is then just
+// another build id in object storage, restored like any other.
 type SandboxPauseRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	BuildId       string                 `protobuf:"bytes,2,opt,name=build_id,json=buildId,proto3" json:"build_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -322,14 +327,23 @@ func (x *SandboxPauseRequest) GetSandboxId() string {
 	return ""
 }
 
+func (x *SandboxPauseRequest) GetBuildId() string {
+	if x != nil {
+		return x.BuildId
+	}
+	return ""
+}
+
 // Resume restores a specific id (kept stable across pause/resume, so the catalog route and the
-// api's metadata row stay keyed by it) under the sandbox's config (template + resources).
+// api's metadata row stay keyed by it) under the sandbox's config (template + resources), from
+// the checkpoint the api recorded at pause time (snapshot_build_id, Stage 26R).
 type SandboxResumeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	Config        *SandboxConfig         `protobuf:"bytes,2,opt,name=config,proto3" json:"config,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId       string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	Config          *SandboxConfig         `protobuf:"bytes,2,opt,name=config,proto3" json:"config,omitempty"`
+	SnapshotBuildId string                 `protobuf:"bytes,3,opt,name=snapshot_build_id,json=snapshotBuildId,proto3" json:"snapshot_build_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SandboxResumeRequest) Reset() {
@@ -374,6 +388,13 @@ func (x *SandboxResumeRequest) GetConfig() *SandboxConfig {
 		return x.Config
 	}
 	return nil
+}
+
+func (x *SandboxResumeRequest) GetSnapshotBuildId() string {
+	if x != nil {
+		return x.SnapshotBuildId
+	}
+	return ""
 }
 
 type SandboxResumeResponse struct {
@@ -440,14 +461,16 @@ const file_orchestrator_orchestrator_proto_rawDesc = "" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"6\n" +
 	"\x13SandboxListResponse\x12\x1f\n" +
 	"\vsandbox_ids\x18\x01 \x03(\tR\n" +
-	"sandboxIds\"4\n" +
+	"sandboxIds\"O\n" +
 	"\x13SandboxPauseRequest\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"j\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x19\n" +
+	"\bbuild_id\x18\x02 \x01(\tR\abuildId\"\x96\x01\n" +
 	"\x14SandboxResumeRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x123\n" +
-	"\x06config\x18\x02 \x01(\v2\x1b.orchestrator.SandboxConfigR\x06config\"6\n" +
+	"\x06config\x18\x02 \x01(\v2\x1b.orchestrator.SandboxConfigR\x06config\x12*\n" +
+	"\x11snapshot_build_id\x18\x03 \x01(\tR\x0fsnapshotBuildId\"6\n" +
 	"\x15SandboxResumeResponse\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId2\x83\x03\n" +

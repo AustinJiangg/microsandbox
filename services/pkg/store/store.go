@@ -56,11 +56,13 @@ type Store interface {
 	DeleteSandbox(id string) error                             // unscoped; called after the ownership check
 	ListSandboxes(teamID string) ([]Sandbox, error)
 	// pause/resume relocation (Stage 26): a paused sandbox is on no node. PauseSandbox marks it
-	// paused and records origin_node (the data-proxy addr it was paused from); PausedSandbox reads
-	// that back so resume can prefer the origin (dropping to placement when it drains); ResumeSandbox
-	// marks it running again. All unscoped -- the api checks ownership (SandboxTeam) first, like delete.
-	PauseSandbox(id, originNode string) error
-	PausedSandbox(id string) (originNode, template string, paused bool, err error)
+	// paused and records origin_node (the data-proxy addr it was paused from) plus snapshot_build
+	// (Stage 26R: the api-minted build id the checkpoint's artifacts live under in object storage);
+	// PausedSandbox reads them back so resume can prefer the origin (dropping to placement when it
+	// drains) and restore from that exact checkpoint. ResumeSandbox marks it running again. All
+	// unscoped -- the api checks ownership (SandboxTeam) first, like delete.
+	PauseSandbox(id, originNode, snapshotBuild string) error
+	PausedSandbox(id string) (originNode, template, snapshotBuild string, paused bool, err error)
 	ResumeSandbox(id string) error
 	// template builds -- team-scoped
 	InsertBuild(buildID, name, teamID string) error
@@ -119,6 +121,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
 // an old DB stays consistent. Each backend adds the column idempotently (see migrateTeamColumns
 // in sqlite.go / postgres.go) because the two engines spell "add a column if absent" differently.
 var teamColumnTables = []string{"sandboxes", "builds"}
+
+// pauseColumns are the sandboxes columns behind pause/resume relocation, added the same
+// idempotent way: origin_node (Stage 26, the paused-from node a resume prefers) and
+// snapshot_build (Stage 26R, the build id the pause checkpoint's artifacts are stored under).
+var pauseColumns = []string{"origin_node", "snapshot_build"}
 
 // splitSchema breaks the multi-statement schema into individual statements. Postgres's
 // extended query protocol (pgx's default) rejects more than one command per Exec, so its
