@@ -51,3 +51,22 @@ func (g *sandboxService) Delete(ctx context.Context, req *pb.SandboxDeleteReques
 func (g *sandboxService) List(ctx context.Context, _ *emptypb.Empty) (*pb.SandboxListResponse, error) {
 	return &pb.SandboxListResponse{SandboxIds: g.srv.list()}, nil
 }
+
+// Pause / Resume are the RPCs behind sandbox relocation (Stage 26). The api-side scheduling --
+// pause a sandbox, then resume it on another node when its origin is draining -- is fully
+// implemented and verified in process (cmd/api). The real per-sandbox live snapshot is
+// deliberately NOT wired here: the only way to checkpoint a running VM is fc.MicroVM.Snapshot,
+// the Stage 20/22 live-VM re-snapshot path (consistent only under v1.10.1 + --nbd + a writable
+// overlay, and so far used only for build-time template snapshots). Wiring it per-sandbox is a
+// clean follow-on that reuses that producer (fc.MicroVM.Snapshot + storage.PublishMemfileDiff /
+// PublishRootfsDiff) behind these same RPCs; until then the real orchestrator answers a clear
+// Unimplemented rather than pretend to persist state it hasn't. See docs/STAGE26_DESIGN.md D4.
+func (g *sandboxService) Pause(ctx context.Context, req *pb.SandboxPauseRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented,
+		"per-sandbox live pause is not wired on this orchestrator; it reuses the Stage 20/22 snapshot producer (deferred) -- see docs/STAGE26_DESIGN.md")
+}
+
+func (g *sandboxService) Resume(ctx context.Context, req *pb.SandboxResumeRequest) (*pb.SandboxResumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented,
+		"per-sandbox resume is not wired on this orchestrator; it reuses the Stage 20/22 snapshot producer (deferred) -- see docs/STAGE26_DESIGN.md")
+}

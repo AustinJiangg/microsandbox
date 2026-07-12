@@ -30,6 +30,12 @@ func (f *fakeRPC) List(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb
 	}
 	return &pb.SandboxListResponse{SandboxIds: f.ids}, nil
 }
+func (f *fakeRPC) Pause(context.Context, *pb.SandboxPauseRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+func (f *fakeRPC) Resume(context.Context, *pb.SandboxResumeRequest, ...grpc.CallOption) (*pb.SandboxResumeResponse, error) {
+	return &pb.SandboxResumeResponse{SandboxId: "sb_fake"}, nil
+}
 
 // nodeWith builds a ready node preloaded with a settled sandbox count (white-box: the load
 // fields are unexported, so only this package's tests can seed them directly).

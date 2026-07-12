@@ -61,6 +61,44 @@ func (f *fakeOrch) List(context.Context, *emptypb.Empty) (*pb.SandboxListRespons
 	return &pb.SandboxListResponse{SandboxIds: append([]string(nil), f.ids...)}, nil
 }
 
+// Pause frees the sandbox from this node (it drops out of the list, so the node's load falls) --
+// the state move behind relocation. Called on the node that holds it, so an absent id is NotFound.
+func (f *fakeOrch) Pause(_ context.Context, req *pb.SandboxPauseRequest) (*emptypb.Empty, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, id := range f.ids {
+		if id == req.GetSandboxId() {
+			f.ids = append(f.ids[:i], f.ids[i+1:]...)
+			return &emptypb.Empty{}, nil
+		}
+	}
+	return nil, status.Error(codes.NotFound, "no such sandbox")
+}
+
+// Resume restores the sandbox on THIS node under the same id (it joins the list). A node configured
+// with createErr refuses resume too, so failover-on-resume is testable the same way as create.
+func (f *fakeOrch) Resume(_ context.Context, req *pb.SandboxResumeRequest) (*pb.SandboxResumeResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createErr != codes.OK {
+		return nil, status.Error(f.createErr, "fake "+f.name+" refusing resume")
+	}
+	f.ids = append(f.ids, req.GetSandboxId())
+	return &pb.SandboxResumeResponse{SandboxId: req.GetSandboxId()}, nil
+}
+
+// holds reports whether this node currently lists the sandbox id (used to assert where it landed).
+func (f *fakeOrch) holds(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, got := range f.ids {
+		if got == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *fakeOrch) held() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

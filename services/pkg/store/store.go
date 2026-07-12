@@ -52,9 +52,16 @@ type Build struct {
 type Store interface {
 	// sandboxes -- team-scoped
 	InsertSandbox(id, template, teamID string) error
-	SandboxTeam(id string) (teamID string, ok bool, err error) // ownership lookup (for delete)
+	SandboxTeam(id string) (teamID string, ok bool, err error) // ownership lookup (for delete/pause/resume)
 	DeleteSandbox(id string) error                             // unscoped; called after the ownership check
 	ListSandboxes(teamID string) ([]Sandbox, error)
+	// pause/resume relocation (Stage 26): a paused sandbox is on no node. PauseSandbox marks it
+	// paused and records origin_node (the data-proxy addr it was paused from); PausedSandbox reads
+	// that back so resume can prefer the origin (dropping to placement when it drains); ResumeSandbox
+	// marks it running again. All unscoped -- the api checks ownership (SandboxTeam) first, like delete.
+	PauseSandbox(id, originNode string) error
+	PausedSandbox(id string) (originNode, template string, paused bool, err error)
+	ResumeSandbox(id string) error
 	// template builds -- team-scoped
 	InsertBuild(buildID, name, teamID string) error
 	BuildTeam(buildID string) (teamID string, ok bool, err error)
@@ -81,7 +88,8 @@ type Store interface {
 // conftest reuses a Postgres already on :5432, so a prior session's DB lacks the column), so
 // the column has to be added with an idempotent ALTER instead. Keeping it out of the CREATE
 // above leaves one source of truth for that column (the migration), exercised on fresh and
-// existing DBs alike.
+// existing DBs alike. Stage 26 adds sandboxes.origin_node the same way (migrateOriginNode), for
+// the same reason -- it records the node a paused sandbox was paused from, so resume can prefer it.
 const schema = `
 CREATE TABLE IF NOT EXISTS sandboxes (
     id         TEXT PRIMARY KEY,

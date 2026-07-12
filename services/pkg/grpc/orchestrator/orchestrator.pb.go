@@ -278,6 +278,148 @@ func (x *SandboxListResponse) GetSandboxIds() []string {
 	return nil
 }
 
+type SandboxPauseRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SandboxPauseRequest) Reset() {
+	*x = SandboxPauseRequest{}
+	mi := &file_orchestrator_orchestrator_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SandboxPauseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SandboxPauseRequest) ProtoMessage() {}
+
+func (x *SandboxPauseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_orchestrator_orchestrator_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SandboxPauseRequest.ProtoReflect.Descriptor instead.
+func (*SandboxPauseRequest) Descriptor() ([]byte, []int) {
+	return file_orchestrator_orchestrator_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *SandboxPauseRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+// Resume restores a specific id (kept stable across pause/resume, so the catalog route and the
+// api's metadata row stay keyed by it) under the sandbox's config (template + resources).
+type SandboxResumeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	Config        *SandboxConfig         `protobuf:"bytes,2,opt,name=config,proto3" json:"config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SandboxResumeRequest) Reset() {
+	*x = SandboxResumeRequest{}
+	mi := &file_orchestrator_orchestrator_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SandboxResumeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SandboxResumeRequest) ProtoMessage() {}
+
+func (x *SandboxResumeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_orchestrator_orchestrator_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SandboxResumeRequest.ProtoReflect.Descriptor instead.
+func (*SandboxResumeRequest) Descriptor() ([]byte, []int) {
+	return file_orchestrator_orchestrator_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *SandboxResumeRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *SandboxResumeRequest) GetConfig() *SandboxConfig {
+	if x != nil {
+		return x.Config
+	}
+	return nil
+}
+
+type SandboxResumeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SandboxResumeResponse) Reset() {
+	*x = SandboxResumeResponse{}
+	mi := &file_orchestrator_orchestrator_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SandboxResumeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SandboxResumeResponse) ProtoMessage() {}
+
+func (x *SandboxResumeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_orchestrator_orchestrator_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SandboxResumeResponse.ProtoReflect.Descriptor instead.
+func (*SandboxResumeResponse) Descriptor() ([]byte, []int) {
+	return file_orchestrator_orchestrator_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *SandboxResumeResponse) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
 var File_orchestrator_orchestrator_proto protoreflect.FileDescriptor
 
 const file_orchestrator_orchestrator_proto_rawDesc = "" +
@@ -298,11 +440,23 @@ const file_orchestrator_orchestrator_proto_rawDesc = "" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"6\n" +
 	"\x13SandboxListResponse\x12\x1f\n" +
 	"\vsandbox_ids\x18\x01 \x03(\tR\n" +
-	"sandboxIds2\xec\x01\n" +
+	"sandboxIds\"4\n" +
+	"\x13SandboxPauseRequest\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"j\n" +
+	"\x14SandboxResumeRequest\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x123\n" +
+	"\x06config\x18\x02 \x01(\v2\x1b.orchestrator.SandboxConfigR\x06config\"6\n" +
+	"\x15SandboxResumeResponse\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId2\x83\x03\n" +
 	"\x0eSandboxService\x12Q\n" +
 	"\x06Create\x12\".orchestrator.SandboxCreateRequest\x1a#.orchestrator.SandboxCreateResponse\x12D\n" +
 	"\x06Delete\x12\".orchestrator.SandboxDeleteRequest\x1a\x16.google.protobuf.Empty\x12A\n" +
-	"\x04List\x12\x16.google.protobuf.Empty\x1a!.orchestrator.SandboxListResponseB-Z+microsandbox/services/pkg/grpc/orchestratorb\x06proto3"
+	"\x04List\x12\x16.google.protobuf.Empty\x1a!.orchestrator.SandboxListResponse\x12B\n" +
+	"\x05Pause\x12!.orchestrator.SandboxPauseRequest\x1a\x16.google.protobuf.Empty\x12Q\n" +
+	"\x06Resume\x12\".orchestrator.SandboxResumeRequest\x1a#.orchestrator.SandboxResumeResponseB-Z+microsandbox/services/pkg/grpc/orchestratorb\x06proto3"
 
 var (
 	file_orchestrator_orchestrator_proto_rawDescOnce sync.Once
@@ -316,28 +470,36 @@ func file_orchestrator_orchestrator_proto_rawDescGZIP() []byte {
 	return file_orchestrator_orchestrator_proto_rawDescData
 }
 
-var file_orchestrator_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_orchestrator_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_orchestrator_orchestrator_proto_goTypes = []any{
 	(*SandboxConfig)(nil),         // 0: orchestrator.SandboxConfig
 	(*SandboxCreateRequest)(nil),  // 1: orchestrator.SandboxCreateRequest
 	(*SandboxCreateResponse)(nil), // 2: orchestrator.SandboxCreateResponse
 	(*SandboxDeleteRequest)(nil),  // 3: orchestrator.SandboxDeleteRequest
 	(*SandboxListResponse)(nil),   // 4: orchestrator.SandboxListResponse
-	(*emptypb.Empty)(nil),         // 5: google.protobuf.Empty
+	(*SandboxPauseRequest)(nil),   // 5: orchestrator.SandboxPauseRequest
+	(*SandboxResumeRequest)(nil),  // 6: orchestrator.SandboxResumeRequest
+	(*SandboxResumeResponse)(nil), // 7: orchestrator.SandboxResumeResponse
+	(*emptypb.Empty)(nil),         // 8: google.protobuf.Empty
 }
 var file_orchestrator_orchestrator_proto_depIdxs = []int32{
 	0, // 0: orchestrator.SandboxCreateRequest.config:type_name -> orchestrator.SandboxConfig
-	1, // 1: orchestrator.SandboxService.Create:input_type -> orchestrator.SandboxCreateRequest
-	3, // 2: orchestrator.SandboxService.Delete:input_type -> orchestrator.SandboxDeleteRequest
-	5, // 3: orchestrator.SandboxService.List:input_type -> google.protobuf.Empty
-	2, // 4: orchestrator.SandboxService.Create:output_type -> orchestrator.SandboxCreateResponse
-	5, // 5: orchestrator.SandboxService.Delete:output_type -> google.protobuf.Empty
-	4, // 6: orchestrator.SandboxService.List:output_type -> orchestrator.SandboxListResponse
-	4, // [4:7] is the sub-list for method output_type
-	1, // [1:4] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	0, // 1: orchestrator.SandboxResumeRequest.config:type_name -> orchestrator.SandboxConfig
+	1, // 2: orchestrator.SandboxService.Create:input_type -> orchestrator.SandboxCreateRequest
+	3, // 3: orchestrator.SandboxService.Delete:input_type -> orchestrator.SandboxDeleteRequest
+	8, // 4: orchestrator.SandboxService.List:input_type -> google.protobuf.Empty
+	5, // 5: orchestrator.SandboxService.Pause:input_type -> orchestrator.SandboxPauseRequest
+	6, // 6: orchestrator.SandboxService.Resume:input_type -> orchestrator.SandboxResumeRequest
+	2, // 7: orchestrator.SandboxService.Create:output_type -> orchestrator.SandboxCreateResponse
+	8, // 8: orchestrator.SandboxService.Delete:output_type -> google.protobuf.Empty
+	4, // 9: orchestrator.SandboxService.List:output_type -> orchestrator.SandboxListResponse
+	8, // 10: orchestrator.SandboxService.Pause:output_type -> google.protobuf.Empty
+	7, // 11: orchestrator.SandboxService.Resume:output_type -> orchestrator.SandboxResumeResponse
+	7, // [7:12] is the sub-list for method output_type
+	2, // [2:7] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_orchestrator_orchestrator_proto_init() }
@@ -351,7 +513,7 @@ func file_orchestrator_orchestrator_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_orchestrator_orchestrator_proto_rawDesc), len(file_orchestrator_orchestrator_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

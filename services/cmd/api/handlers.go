@@ -295,6 +295,10 @@ func writeGRPCError(w http.ResponseWriter, err error) {
 		httpStatus = http.StatusBadRequest
 	case codes.NotFound:
 		httpStatus = http.StatusNotFound
+	case codes.Unimplemented:
+		// An RPC a node doesn't implement (Stage 26: the real orchestrator's Pause/Resume, whose
+		// live per-sandbox snapshot is deferred -- D4) -> 501, not a generic 500.
+		httpStatus = http.StatusNotImplemented
 	}
 	msg := err.Error()
 	if st, ok := status.FromError(err); ok {

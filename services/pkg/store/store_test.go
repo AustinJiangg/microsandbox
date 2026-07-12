@@ -28,6 +28,7 @@ func TestSQLiteStore(t *testing.T) {
 		t.Fatalf("fresh sqlite: want 0 rows (err=%v), got %d", err, len(rows))
 	}
 	runSandboxContract(t, st)
+	runPauseResumeContract(t, st)
 	runBuildsContract(t, st)
 	runAuthContract(t, st)
 }
@@ -67,8 +68,59 @@ func TestPostgresStore(t *testing.T) {
 	}
 	defer st.Close()
 	runSandboxContract(t, st)
+	runPauseResumeContract(t, st)
 	runBuildsContract(t, st)
 	runAuthContract(t, st)
+}
+
+// runPauseResumeContract covers the Stage 26 pause/resume metadata: a paused sandbox reports its
+// origin_node and status "paused" (visible in the list), and resume restores status "running".
+func runPauseResumeContract(t *testing.T, st Store) {
+	t.Helper()
+	const id, team = "sb_pause_contract", "team_pause"
+	clean := func() { _ = st.DeleteSandbox(id) }
+	clean()
+	defer clean()
+
+	if err := st.InsertSandbox(id, "ml-env", team); err != nil {
+		t.Fatalf("insert %s: %v", id, err)
+	}
+	// A fresh (running) sandbox is not paused.
+	if origin, tmpl, paused, err := st.PausedSandbox(id); err != nil || paused || origin != "" || tmpl != "" {
+		t.Fatalf("PausedSandbox(running) = (%q,%q,%v,%v), want (\"\",\"\",false,nil)", origin, tmpl, paused, err)
+	}
+
+	// Pause records the origin node and flips the status; the list reflects it.
+	const origin = "proxy-node-a:5007"
+	if err := st.PauseSandbox(id, origin); err != nil {
+		t.Fatalf("PauseSandbox: %v", err)
+	}
+	// PausedSandbox returns the origin node AND the template resume needs.
+	if got, tmpl, paused, err := st.PausedSandbox(id); err != nil || !paused || got != origin || tmpl != "ml-env" {
+		t.Fatalf("PausedSandbox(paused) = (%q,%q,%v,%v), want (%q,\"ml-env\",true,nil)", got, tmpl, paused, err, origin)
+	}
+	if row, ok := sandboxIDs(t, st, team)[id]; !ok || row.Status != "paused" {
+		t.Fatalf("after pause: want status=paused in the list, got %+v (ok=%v)", row, ok)
+	}
+
+	// Resume flips it back to running; it is no longer reported as paused.
+	if err := st.ResumeSandbox(id); err != nil {
+		t.Fatalf("ResumeSandbox: %v", err)
+	}
+	if _, _, paused, err := st.PausedSandbox(id); err != nil || paused {
+		t.Fatalf("PausedSandbox(after resume) paused=%v err=%v, want false,nil", paused, err)
+	}
+	if row, ok := sandboxIDs(t, st, team)[id]; !ok || row.Status != "running" {
+		t.Fatalf("after resume: want status=running, got %+v (ok=%v)", row, ok)
+	}
+
+	// Pausing/resuming an absent id is idempotent (zero rows, not an error).
+	if err := st.PauseSandbox("sb_pause_missing", origin); err != nil {
+		t.Errorf("idempotent PauseSandbox(missing) errored: %v", err)
+	}
+	if err := st.ResumeSandbox("sb_pause_missing"); err != nil {
+		t.Errorf("idempotent ResumeSandbox(missing) errored: %v", err)
+	}
 }
 
 // sandboxIDs returns the set of ids a team currently lists.

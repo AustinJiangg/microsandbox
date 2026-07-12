@@ -30,16 +30,19 @@ const (
 	SandboxService_Create_FullMethodName = "/orchestrator.SandboxService/Create"
 	SandboxService_Delete_FullMethodName = "/orchestrator.SandboxService/Delete"
 	SandboxService_List_FullMethodName   = "/orchestrator.SandboxService/List"
+	SandboxService_Pause_FullMethodName  = "/orchestrator.SandboxService/Pause"
+	SandboxService_Resume_FullMethodName = "/orchestrator.SandboxService/Resume"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// SandboxService is the VM lifecycle API the api calls over gRPC. E2B's real service
-// also has Pause / Resume / Checkpoint / ListCachedBuilds; those need runtime
-// checkpointing of a *running* VM, so they arrive in a later stage. Stage 8 ports the
-// three lifecycle verbs the HTTP control plane already had.
+// SandboxService is the VM lifecycle API the api calls over gRPC. Stage 8 ported the three
+// lifecycle verbs the HTTP control plane already had; Stage 26 adds Pause / Resume, the pair
+// E2B uses to move a sandbox off a node -- there is no server-driven migration loop, a sandbox
+// relocates by being paused (checkpointed to object storage) and resumed elsewhere. (E2B also
+// has Checkpoint / ListCachedBuilds; those stay out.)
 type SandboxServiceClient interface {
 	// Create boots a sandbox (cold start, or snapshot restore which is warm-pool
 	// eligible) and returns only once it has been health-probed -- "ready on delivery".
@@ -48,6 +51,18 @@ type SandboxServiceClient interface {
 	Delete(ctx context.Context, in *SandboxDeleteRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// List returns the ids of the sandboxes this orchestrator currently holds.
 	List(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*SandboxListResponse, error)
+	// Pause checkpoints a running sandbox to object storage and frees its node, so it can be
+	// Resumed later -- possibly on a DIFFERENT node (Stage 26). E2B's real Pause snapshots the
+	// live VM (memfile + rootfs diff); ours reuses the Stage 20/22 producer and is deferred, so
+	// the real orchestrator returns Unimplemented -- what Stage 26 delivers is the relocation
+	// SCHEDULING (the api-side pause/resume + drain-aware re-placement), verified in process.
+	// Unknown id is an error.
+	Pause(ctx context.Context, in *SandboxPauseRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Resume restores a previously paused sandbox on THIS node from its object-storage checkpoint,
+	// under the same id, and returns once it is healthy. The api chooses which node to call --
+	// origin-affinity with a drain-aware fallback -- so a sandbox paused on a now-draining node
+	// resumes elsewhere.
+	Resume(ctx context.Context, in *SandboxResumeRequest, opts ...grpc.CallOption) (*SandboxResumeResponse, error)
 }
 
 type sandboxServiceClient struct {
@@ -88,14 +103,35 @@ func (c *sandboxServiceClient) List(ctx context.Context, in *emptypb.Empty, opts
 	return out, nil
 }
 
+func (c *sandboxServiceClient) Pause(ctx context.Context, in *SandboxPauseRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, SandboxService_Pause_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) Resume(ctx context.Context, in *SandboxResumeRequest, opts ...grpc.CallOption) (*SandboxResumeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxResumeResponse)
+	err := c.cc.Invoke(ctx, SandboxService_Resume_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SandboxServiceServer is the server API for SandboxService service.
 // All implementations must embed UnimplementedSandboxServiceServer
 // for forward compatibility.
 //
-// SandboxService is the VM lifecycle API the api calls over gRPC. E2B's real service
-// also has Pause / Resume / Checkpoint / ListCachedBuilds; those need runtime
-// checkpointing of a *running* VM, so they arrive in a later stage. Stage 8 ports the
-// three lifecycle verbs the HTTP control plane already had.
+// SandboxService is the VM lifecycle API the api calls over gRPC. Stage 8 ported the three
+// lifecycle verbs the HTTP control plane already had; Stage 26 adds Pause / Resume, the pair
+// E2B uses to move a sandbox off a node -- there is no server-driven migration loop, a sandbox
+// relocates by being paused (checkpointed to object storage) and resumed elsewhere. (E2B also
+// has Checkpoint / ListCachedBuilds; those stay out.)
 type SandboxServiceServer interface {
 	// Create boots a sandbox (cold start, or snapshot restore which is warm-pool
 	// eligible) and returns only once it has been health-probed -- "ready on delivery".
@@ -104,6 +140,18 @@ type SandboxServiceServer interface {
 	Delete(context.Context, *SandboxDeleteRequest) (*emptypb.Empty, error)
 	// List returns the ids of the sandboxes this orchestrator currently holds.
 	List(context.Context, *emptypb.Empty) (*SandboxListResponse, error)
+	// Pause checkpoints a running sandbox to object storage and frees its node, so it can be
+	// Resumed later -- possibly on a DIFFERENT node (Stage 26). E2B's real Pause snapshots the
+	// live VM (memfile + rootfs diff); ours reuses the Stage 20/22 producer and is deferred, so
+	// the real orchestrator returns Unimplemented -- what Stage 26 delivers is the relocation
+	// SCHEDULING (the api-side pause/resume + drain-aware re-placement), verified in process.
+	// Unknown id is an error.
+	Pause(context.Context, *SandboxPauseRequest) (*emptypb.Empty, error)
+	// Resume restores a previously paused sandbox on THIS node from its object-storage checkpoint,
+	// under the same id, and returns once it is healthy. The api chooses which node to call --
+	// origin-affinity with a drain-aware fallback -- so a sandbox paused on a now-draining node
+	// resumes elsewhere.
+	Resume(context.Context, *SandboxResumeRequest) (*SandboxResumeResponse, error)
 	mustEmbedUnimplementedSandboxServiceServer()
 }
 
@@ -122,6 +170,12 @@ func (UnimplementedSandboxServiceServer) Delete(context.Context, *SandboxDeleteR
 }
 func (UnimplementedSandboxServiceServer) List(context.Context, *emptypb.Empty) (*SandboxListResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method List not implemented")
+}
+func (UnimplementedSandboxServiceServer) Pause(context.Context, *SandboxPauseRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method Pause not implemented")
+}
+func (UnimplementedSandboxServiceServer) Resume(context.Context, *SandboxResumeRequest) (*SandboxResumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Resume not implemented")
 }
 func (UnimplementedSandboxServiceServer) mustEmbedUnimplementedSandboxServiceServer() {}
 func (UnimplementedSandboxServiceServer) testEmbeddedByValue()                        {}
@@ -198,6 +252,42 @@ func _SandboxService_List_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_Pause_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SandboxPauseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).Pause(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_Pause_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).Pause(ctx, req.(*SandboxPauseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_Resume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SandboxResumeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).Resume(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_Resume_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).Resume(ctx, req.(*SandboxResumeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SandboxService_ServiceDesc is the grpc.ServiceDesc for SandboxService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -216,6 +306,14 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "List",
 			Handler:    _SandboxService_List_Handler,
+		},
+		{
+			MethodName: "Pause",
+			Handler:    _SandboxService_Pause_Handler,
+		},
+		{
+			MethodName: "Resume",
+			Handler:    _SandboxService_Resume_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

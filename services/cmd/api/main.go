@@ -158,6 +158,10 @@ func main() {
 	mux.HandleFunc("POST /sandboxes", a.withAuth(a.handleCreate))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.withAuth(a.handleDestroy))
 	mux.HandleFunc("GET /sandboxes", a.withAuth(a.handleList))
+	// Stage 26: pause a sandbox (checkpoint + free its node) and resume it (restore, relocating off a
+	// draining origin). Team-scoped like destroy (the ownership check precedes any VM action).
+	mux.HandleFunc("POST /sandboxes/{id}/pause", a.withAuth(a.handleSandboxPause))
+	mux.HandleFunc("POST /sandboxes/{id}/resume", a.withAuth(a.handleSandboxResume))
 	// Stage 24: the api's live view of the discovered orchestrator fleet (makes discovery observable).
 	mux.HandleFunc("GET /nodes", a.withAuth(a.handleNodes))
 	// Stage 25: drain / resume a node (stop / resume new placements on it). Auth-gated but not

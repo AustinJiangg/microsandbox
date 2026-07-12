@@ -49,6 +49,10 @@ type SandboxRPC interface {
 	Create(ctx context.Context, in *pb.SandboxCreateRequest, opts ...grpc.CallOption) (*pb.SandboxCreateResponse, error)
 	Delete(ctx context.Context, in *pb.SandboxDeleteRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	List(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*pb.SandboxListResponse, error)
+	// Pause / Resume relocate a sandbox across nodes (Stage 26): the api Pauses it on its holding
+	// node and Resumes it on a node PickPreferred chooses. pb.SandboxServiceClient satisfies these.
+	Pause(ctx context.Context, in *pb.SandboxPauseRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	Resume(ctx context.Context, in *pb.SandboxResumeRequest, opts ...grpc.CallOption) (*pb.SandboxResumeResponse, error)
 }
 
 // Node is one orchestrator the api can place sandboxes on. It couples the gRPC client (RPC)

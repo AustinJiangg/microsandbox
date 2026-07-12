@@ -15,10 +15,11 @@ option go_package = "microsandbox/services/pkg/grpc/orchestrator";
 
 import "google/protobuf/empty.proto"; // the well-known empty message, for RPCs with no useful payload
 
-// SandboxService is the VM lifecycle API the api calls over gRPC. E2B's real service
-// also has Pause / Resume / Checkpoint / ListCachedBuilds; those need runtime
-// checkpointing of a *running* VM, so they arrive in a later stage. Stage 8 ports the
-// three lifecycle verbs the HTTP control plane already had.
+// SandboxService is the VM lifecycle API the api calls over gRPC. Stage 8 ported the three
+// lifecycle verbs the HTTP control plane already had; Stage 26 adds Pause / Resume, the pair
+// E2B uses to move a sandbox off a node -- there is no server-driven migration loop, a sandbox
+// relocates by being paused (checkpointed to object storage) and resumed elsewhere. (E2B also
+// has Checkpoint / ListCachedBuilds; those stay out.)
 service SandboxService {
   // Create boots a sandbox (cold start, or snapshot restore which is warm-pool
   // eligible) and returns only once it has been health-probed -- "ready on delivery".
@@ -29,6 +30,20 @@ service SandboxService {
 
   // List returns the ids of the sandboxes this orchestrator currently holds.
   rpc List(google.protobuf.Empty) returns (SandboxListResponse);
+
+  // Pause checkpoints a running sandbox to object storage and frees its node, so it can be
+  // Resumed later -- possibly on a DIFFERENT node (Stage 26). E2B's real Pause snapshots the
+  // live VM (memfile + rootfs diff); ours reuses the Stage 20/22 producer and is deferred, so
+  // the real orchestrator returns Unimplemented -- what Stage 26 delivers is the relocation
+  // SCHEDULING (the api-side pause/resume + drain-aware re-placement), verified in process.
+  // Unknown id is an error.
+  rpc Pause(SandboxPauseRequest) returns (google.protobuf.Empty);
+
+  // Resume restores a previously paused sandbox on THIS node from its object-storage checkpoint,
+  // under the same id, and returns once it is healthy. The api chooses which node to call --
+  // origin-affinity with a drain-aware fallback -- so a sandbox paused on a now-draining node
+  // resumes elsewhere.
+  rpc Resume(SandboxResumeRequest) returns (SandboxResumeResponse);
 }
 
 // SandboxConfig is what the api hands the orchestrator to shape a new sandbox.
@@ -47,3 +62,12 @@ message SandboxCreateRequest { SandboxConfig config = 1; }
 message SandboxCreateResponse { string sandbox_id = 1; } // the "sb_..." id, already healthy
 message SandboxDeleteRequest { string sandbox_id = 1; }
 message SandboxListResponse { repeated string sandbox_ids = 1; } // repeated = a list/slice
+
+message SandboxPauseRequest { string sandbox_id = 1; }
+// Resume restores a specific id (kept stable across pause/resume, so the catalog route and the
+// api's metadata row stay keyed by it) under the sandbox's config (template + resources).
+message SandboxResumeRequest {
+  string sandbox_id = 1;
+  SandboxConfig config = 2;
+}
+message SandboxResumeResponse { string sandbox_id = 1; } // the restored, already-healthy id

@@ -42,7 +42,26 @@ func openSQLite(path string) (Store, error) {
 		db.Close()
 		return nil, errSchema(err)
 	}
+	// Stage 26: add sandboxes.origin_node the same idempotent way.
+	if err := sqliteMigrateOriginNode(db); err != nil {
+		db.Close()
+		return nil, errSchema(err)
+	}
 	return &sqliteStore{db: db}, nil
+}
+
+// sqliteMigrateOriginNode adds sandboxes.origin_node (empty default) if absent -- the paused-from
+// node a resume prefers (Stage 26). Idempotent via the same PRAGMA-check as the team migration.
+func sqliteMigrateOriginNode(db *sql.DB) error {
+	has, err := sqliteHasColumn(db, "sandboxes", "origin_node")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE sandboxes ADD COLUMN origin_node TEXT NOT NULL DEFAULT ''`)
+	return err
 }
 
 // sqliteMigrateTeamColumns adds team_id to each table that needs it, idempotently: PRAGMA
@@ -140,6 +159,37 @@ func (s *sqliteStore) ListSandboxes(teamID string) ([]Sandbox, error) {
 		out = append(out, sb)
 	}
 	return out, rows.Err()
+}
+
+// PauseSandbox marks a sandbox paused and records origin_node (the data-proxy addr it was paused
+// from), so a later resume can prefer that node. Updating an absent id affects zero rows (not an
+// error); the api checks ownership via SandboxTeam first.
+func (s *sqliteStore) PauseSandbox(id, originNode string) error {
+	_, err := s.db.Exec(
+		`UPDATE sandboxes SET status = 'paused', origin_node = ? WHERE id = ?`, originNode, id)
+	return err
+}
+
+// PausedSandbox reports whether a sandbox exists and is currently paused, and (for resume) its
+// recorded origin_node + template. A running or missing sandbox is ("", "", false, nil).
+func (s *sqliteStore) PausedSandbox(id string) (string, string, bool, error) {
+	var origin, template string
+	err := s.db.QueryRow(
+		`SELECT origin_node, template FROM sandboxes WHERE id = ? AND status = 'paused'`, id).Scan(&origin, &template)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return origin, template, true, nil
+}
+
+// ResumeSandbox marks a paused sandbox running again. origin_node is left as-is (stale but unread
+// while running; the next pause overwrites it). Zero rows for an absent id is not an error.
+func (s *sqliteStore) ResumeSandbox(id string) error {
+	_, err := s.db.Exec(`UPDATE sandboxes SET status = 'running' WHERE id = ?`, id)
+	return err
 }
 
 // InsertBuild records a newly started build owned by teamID. state starts as "building";
