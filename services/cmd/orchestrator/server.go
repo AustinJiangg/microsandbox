@@ -39,9 +39,25 @@ type server struct {
 	useNBD    bool                    // Stage 21c: serve the rootfs over NBD (nbdPool != nil; s3 mode only)
 	nbdPool   *nbd.Pool               // Stage 21c: /dev/nbdX device pool; nil unless --nbd (s3 mode)
 
-	mu        sync.Mutex             // guards sandboxes
-	sandboxes map[string]*fc.MicroVM // sandbox id -> running VM
+	mu        sync.Mutex              // guards sandboxes
+	sandboxes map[string]*liveSandbox // sandbox id -> running VM + what pausing it needs
 }
+
+// liveSandbox is one running VM plus what a later per-sandbox Pause needs (Stage 26R): the
+// writable rootfs overlay buildRootfsBacking bound for it (nil outside --nbd s3 mode) and the
+// build id its artifacts were served from -- the diff base a pause snapshot is computed against
+// ("" in local-fs / non-NBD mode, where Pause is refused anyway). Both were always created; the
+// registry just used to discard them (restoreHealthy returned only the *fc.MicroVM).
+type liveSandbox struct {
+	vm          *fc.MicroVM
+	overlay     *block.Overlay // the VM's writable rootfs overlay; owned by the VM (closed by Destroy via the backing's Close)
+	baseBuildID string         // the build whose artifacts this VM booted from (ResolveAlias at create; the snapshot id after a resume)
+}
+
+// Destroy tears down the VM (satisfying pool.VM). The overlay needs no separate teardown --
+// it is closed by the VM's rootfs-backing Close inside vm.Destroy; this handle is only for
+// reaching it (ExportToDiff) while the VM is alive.
+func (ls *liveSandbox) Destroy() { ls.vm.Destroy() }
 
 // nbdDevices sizes the NBD device pool (Stage 21c): the max rootfs devices live at once, like the
 // network slot cap. 64 is ample for one box; modprobe honors it on a fresh load (see pkg/nbd caveat).
@@ -60,7 +76,7 @@ func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool, sp stor
 	s := &server{
 		vendorDir: vendorDir,
 		storage:   sp,
-		sandboxes: map[string]*fc.MicroVM{},
+		sandboxes: map[string]*liveSandbox{},
 		pools:     map[string]*pool.Pool{},
 		net:       network.NewManager(networkSlots),
 		useUffd:   useUffd,
@@ -72,11 +88,11 @@ func newServer(vendorDir string, poolSpecs map[string]int, useUffd bool, sp stor
 		// fresh per-iteration variable, so each closure captures its own template.
 		tmpl, _ := template.Resolve(vendorDir, name)
 		p := pool.New(k, func() (pool.VM, error) {
-			vm, err := s.restoreHealthy(tmpl)
+			ls, err := s.restoreHealthy(tmpl)
 			if err != nil {
 				return nil, err
 			}
-			return vm, nil
+			return ls, nil
 		})
 		s.pools[name] = p
 		p.Start()
@@ -138,39 +154,39 @@ func parsePoolSpecs(poolFlags []string, poolSize int) (map[string]int, error) {
 // create boots a sandbox of the given template (cold start, or snapshot restore which
 // is warm-pool eligible), registers it, and returns it already health-probed. This is
 // the old handleCreate switch, minus the HTTP plumbing.
-func (s *server) create(fromSnapshot bool, tmpl template.Template) (*fc.MicroVM, error) {
+func (s *server) create(fromSnapshot bool, tmpl template.Template) (*liveSandbox, error) {
 	// Serve from a warm pool only if this template has one; otherwise restore/spawn
 	// its own image inline. A pooled VM is always the right image -- each pool restores
 	// from its template's own snapshot (newServer).
 	p := s.poolFor(tmpl)
-	var vm *fc.MicroVM
+	var ls *liveSandbox
 	var err error
 	switch {
 	case fromSnapshot && p != nil:
 		var v pool.VM
 		v, err = p.Get()
 		if err == nil {
-			vm = v.(*fc.MicroVM) // the pool only ever holds *fc.MicroVM (newServer's restore)
+			ls = v.(*liveSandbox) // the pool only ever holds *liveSandbox (newServer's restore)
 		}
 	case fromSnapshot:
-		vm, err = s.restoreHealthy(tmpl)
+		ls, err = s.restoreHealthy(tmpl)
 	default:
-		vm, err = s.spawnHealthy(tmpl)
+		ls, err = s.spawnHealthy(tmpl)
 	}
 	if err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
-	s.sandboxes[vm.ID] = vm
+	s.sandboxes[ls.vm.ID] = ls
 	s.mu.Unlock()
-	return vm, nil
+	return ls, nil
 }
 
 // destroy kills a sandbox by id and drops it from the registry; it reports whether the
 // id existed (a false lets the gRPC layer answer NotFound).
 func (s *server) destroy(id string) bool {
 	s.mu.Lock()
-	vm, ok := s.sandboxes[id]
+	ls, ok := s.sandboxes[id]
 	if ok {
 		delete(s.sandboxes, id)
 	}
@@ -178,7 +194,7 @@ func (s *server) destroy(id string) bool {
 	if !ok {
 		return false
 	}
-	vm.Destroy()
+	ls.Destroy()
 	return true
 }
 
@@ -193,12 +209,13 @@ func (s *server) list() []string {
 	return ids
 }
 
-// lookup returns the VM for an id, if known (used by the data proxy to find the VM's network slot).
-func (s *server) lookup(id string) (*fc.MicroVM, bool) {
+// lookup returns the live sandbox for an id, if known (the data proxy reaches the VM's network
+// slot through it; Pause reaches the VM + overlay + base build id).
+func (s *server) lookup(id string) (*liveSandbox, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	vm, ok := s.sandboxes[id]
-	return vm, ok
+	ls, ok := s.sandboxes[id]
+	return ls, ok
 }
 
 // healthyOrDestroy probes a freshly created VM and returns it once its in-VM daemon
@@ -227,54 +244,41 @@ func healthyOrDestroy(vm *fc.MicroVM, err error) (*fc.MicroVM, error) {
 
 // restoreHealthy / spawnHealthy mint an id, prepare the template's artifacts (Stage 15: materialize
 // from object storage in s3 mode), create the VM (restored / cold-started), and block until healthy.
-func (s *server) restoreHealthy(tmpl template.Template) (*fc.MicroVM, error) {
+// Both return the VM as a liveSandbox: the writable overlay + base build id ride along (Stage 26R),
+// so a later per-sandbox Pause can diff against them. (Stage 22's layer producer used to get the
+// overlay from a separate restoreHealthyWritable; retaining it on every sandbox subsumed that.)
+func (s *server) restoreHealthy(tmpl template.Template) (*liveSandbox, error) {
 	memSource, err := s.prepareRestore(tmpl)
 	if err != nil {
 		return nil, fmt.Errorf("prepare restore artifacts for %q: %w", tmpl.Name, err)
 	}
-	rootfs, _, err := s.buildRootfsBacking(tmpl) // NBD device (Stage 21c), or a zero backing (legacy file)
+	rootfs, overlay, buildID, err := s.buildRootfsBacking(tmpl) // NBD device (Stage 21c), or a zero backing (legacy file)
 	if err != nil {
 		if memSource != nil {
 			_ = memSource.Close() // fc.Restore would have owned it; we bailed before calling it
 		}
 		return nil, fmt.Errorf("prepare rootfs backing for %q: %w", tmpl.Name, err)
 	}
-	return healthyOrDestroy(fc.Restore(fc.NewID(), s.vendorDir, tmpl, s.net, memSource, rootfs))
-}
-
-// restoreHealthyWritable is restoreHealthy that also returns the VM's writable rootfs overlay, for the
-// Stage-22 layer producer: after the layer's command runs in-guest, the producer exports the overlay's
-// dirtied blocks as the child's rootfs diff. The overlay is owned by the VM (torn down by Destroy via the
-// backing's Close), so the caller must ExportToDiff before Destroy. --nbd s3 mode only (the overlay is nil
-// otherwise, which is why the producer guards on useNBD).
-func (s *server) restoreHealthyWritable(tmpl template.Template) (*fc.MicroVM, *block.Overlay, error) {
-	memSource, err := s.prepareRestore(tmpl)
-	if err != nil {
-		return nil, nil, fmt.Errorf("prepare restore artifacts for %q: %w", tmpl.Name, err)
-	}
-	rootfs, overlay, err := s.buildRootfsBacking(tmpl)
-	if err != nil {
-		if memSource != nil {
-			_ = memSource.Close()
-		}
-		return nil, nil, fmt.Errorf("prepare rootfs backing for %q: %w", tmpl.Name, err)
-	}
 	vm, err := healthyOrDestroy(fc.Restore(fc.NewID(), s.vendorDir, tmpl, s.net, memSource, rootfs))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return vm, overlay, nil
+	return &liveSandbox{vm: vm, overlay: overlay, baseBuildID: buildID}, nil
 }
 
-func (s *server) spawnHealthy(tmpl template.Template) (*fc.MicroVM, error) {
+func (s *server) spawnHealthy(tmpl template.Template) (*liveSandbox, error) {
 	if err := s.prepareSpawn(tmpl); err != nil {
 		return nil, fmt.Errorf("prepare spawn artifacts for %q: %w", tmpl.Name, err)
 	}
-	rootfs, _, err := s.buildRootfsBacking(tmpl)
+	rootfs, overlay, buildID, err := s.buildRootfsBacking(tmpl)
 	if err != nil {
 		return nil, fmt.Errorf("prepare rootfs backing for %q: %w", tmpl.Name, err)
 	}
-	return healthyOrDestroy(fc.Spawn(fc.NewID(), s.vendorDir, tmpl, s.net, rootfs))
+	vm, err := healthyOrDestroy(fc.Spawn(fc.NewID(), s.vendorDir, tmpl, s.net, rootfs))
+	if err != nil {
+		return nil, err
+	}
+	return &liveSandbox{vm: vm, overlay: overlay, baseBuildID: buildID}, nil
 }
 
 // LayeredSnapshot produces a layered template's snapshot by E2B's one-run-two-diffs model (Stage 22): it
@@ -318,10 +322,11 @@ func (s *server) LayeredSnapshot(ctx context.Context, baseName, baseBuildID, chi
 	// Resume the base over a WRITABLE overlay and wait for health, reusing the restore path a user create
 	// takes. The producer VM is unregistered -- we own its lifecycle and Destroy it below (Destroy also
 	// closes the overlay via the backing's Close, so ExportToDiff must run before then).
-	vm, overlay, err := s.restoreHealthyWritable(baseTmpl)
+	ls, err := s.restoreHealthy(baseTmpl)
 	if err != nil {
 		return fmt.Errorf("resume base %q for re-snapshot: %w", baseName, err)
 	}
+	vm, overlay := ls.vm, ls.overlay
 	defer vm.Destroy()
 
 	// Run the layer's commands IN THE GUEST (E2B's model), so the one snapshot below captures a mutually
@@ -533,8 +538,8 @@ func (s *server) destroyAll() {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id, vm := range s.sandboxes {
-		vm.Destroy()
+	for id, ls := range s.sandboxes {
+		ls.Destroy()
 		delete(s.sandboxes, id)
 	}
 }

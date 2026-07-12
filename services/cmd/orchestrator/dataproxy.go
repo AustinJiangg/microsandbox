@@ -20,7 +20,7 @@ func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing X-Sandbox-Id header"})
 		return
 	}
-	vm, ok := s.lookup(id)
+	ls, ok := s.lookup(id)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such sandbox: " + id})
 		return
@@ -34,11 +34,11 @@ func (s *server) handleData(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing or invalid X-Sandbox-Port header"})
 		return
 	}
-	if vm.Slot == nil {
+	if ls.vm.Slot == nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "sandbox has no network slot: " + id})
 		return
 	}
-	proxy.TCPProxy(vm.Slot.Addr(port)).ServeHTTP(w, r)
+	proxy.TCPProxy(ls.vm.Slot.Addr(port)).ServeHTTP(w, r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

@@ -34,11 +34,11 @@ func (g *sandboxService) Create(ctx context.Context, req *pb.SandboxCreateReques
 	}
 	// Stage 8 ignores cfg.Vcpu / cfg.MemMb: fc bakes in 1 vCPU / 512 MiB. Per-template
 	// resource limits are a later stage.
-	vm, err := g.srv.create(cfg.GetFromSnapshot(), tmpl)
+	ls, err := g.srv.create(cfg.GetFromSnapshot(), tmpl)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	return &pb.SandboxCreateResponse{SandboxId: vm.ID}, nil
+	return &pb.SandboxCreateResponse{SandboxId: ls.vm.ID}, nil
 }
 
 func (g *sandboxService) Delete(ctx context.Context, req *pb.SandboxDeleteRequest) (*emptypb.Empty, error) {

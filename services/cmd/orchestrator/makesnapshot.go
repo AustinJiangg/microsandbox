@@ -52,10 +52,11 @@ func (s *server) makeSnapshot(name string) error {
 
 	// Cold-start over NBD at a stable rootfs path (Stage 22 E1: Spawn binds the device over tmpl.Rootfs),
 	// health-probed. We own this VM (spawnHealthy does not register it); Destroy it when done.
-	vm, err := s.spawnHealthy(tmpl)
+	ls, err := s.spawnHealthy(tmpl)
 	if err != nil {
 		return fmt.Errorf("cold-start %q for snapshot: %w", name, err)
 	}
+	vm := ls.vm
 	defer vm.Destroy()
 
 	// Warm the Jupyter kernel over the code-interpreter port, so a restore skips the kernel cold start
