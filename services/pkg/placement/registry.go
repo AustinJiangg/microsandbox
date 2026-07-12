@@ -87,6 +87,16 @@ func (r *Registry) Pick(excluded map[string]struct{}) (*Node, error) {
 	return r.algo.Choose(r.snapshot(), excluded)
 }
 
+// PickPreferred chooses a node to RESUME a sandbox on (Stage 26): it prefers the sandbox's origin
+// node (where it was paused) when that node is still eligible, else falls back to BestOfK over the
+// fleet. The api's resume handler resolves the recorded origin address to a live *Node via
+// NodeByProxy (nil when the origin has left the fleet) and passes it here; a draining, unreachable,
+// or departed origin is dropped, so the sandbox relocates. excluded is the per-request failover set
+// (as in Pick). Returns ErrNoNode if the fallback finds nothing eligible.
+func (r *Registry) PickPreferred(preferred *Node, excluded map[string]struct{}) (*Node, error) {
+	return r.algo.ChoosePreferred(r.snapshot(), preferred, excluded)
+}
+
 // NodeByProxy returns the node whose data-proxy address is proxy (the catalog Route.Node), so
 // destroy can route Delete to the node actually holding the sandbox.
 func (r *Registry) NodeByProxy(proxy string) (*Node, bool) {

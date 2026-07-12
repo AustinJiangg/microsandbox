@@ -49,6 +49,34 @@ func (b *BestOfK) Choose(nodes []*Node, excluded map[string]struct{}) (*Node, er
 	return best, nil
 }
 
+// ChoosePreferred honors a preferred node when it is still eligible, else falls back to Choose
+// (BestOfK over the fleet). It is the placement primitive behind sandbox RESUME (Stage 26): a
+// paused sandbox prefers to come back on the node it was paused on (its origin), but only when that
+// node is still a valid target -- reachable AND not draining. When the origin is draining (Stage
+// 25), unreachable, or in the caller's excluded set (its Resume just failed), the affinity is
+// dropped and BestOfK re-places the sandbox on another eligible node -- so a sandbox naturally
+// relocates OFF a draining node on resume, which is exactly how E2B moves a sandbox off a node
+// (there is no server-driven migration loop; the relocation is this resume-time re-placement).
+//
+// It is the reduction of E2B's create_instance.go affinity branch composed with PlaceSandbox:
+//
+//	if isResume && nodeID != nil {
+//	    node = o.GetNode(clusterID, *nodeID)
+//	    if node != nil && node.Status() != api.NodeStatusReady { node = nil }  // drop the pin
+//	}
+//	node, err = placement.PlaceSandbox(ctx, algo, clusterNodes, node /*preferred*/, ...)
+//
+// preferred==nil (origin gone from the fleet) and a preferred that is not eligible both fall
+// through to Choose, matching PlaceSandbox using its preferred node only when non-nil.
+func (b *BestOfK) ChoosePreferred(nodes []*Node, preferred *Node, excluded map[string]struct{}) (*Node, error) {
+	if preferred != nil && preferred.Ready() && !preferred.Draining() {
+		if _, ex := excluded[preferred.ID]; !ex {
+			return preferred, nil
+		}
+	}
+	return b.Choose(nodes, excluded)
+}
+
 // sample returns up to K nodes drawn uniformly at random from nodes, skipping any that are
 // excluded, not ready, or draining. It is a partial Fisher-Yates over an index slice (each node is drawn
 // at most once); a skipped node is consumed from the pool but does not count toward K, so the

@@ -158,6 +158,86 @@ func TestChooseNoEligibleNode(t *testing.T) {
 	}
 }
 
+// --- ChoosePreferred: sandbox-resume affinity with a drain-aware fallback (Stage 26) ---
+
+func TestChoosePreferredHonorsEligibleOrigin(t *testing.T) {
+	origin := nodeWith("origin", 9) // busiest, but preferred -> still chosen while eligible
+	other := nodeWith("other", 0)   // emptier, yet not preferred
+	best, err := NewBestOfK(3).ChoosePreferred([]*Node{origin, other}, origin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if best.ID != "origin" {
+		t.Fatalf("an eligible origin must be honored regardless of load (resume affinity), got %s", best.ID)
+	}
+}
+
+func TestChoosePreferredDropsDrainingOrigin(t *testing.T) {
+	origin := nodeWith("origin", 0) // emptiest, but draining -> affinity dropped (the whole point)
+	origin.setDraining(true)
+	other := nodeWith("other", 5)
+	best, err := NewBestOfK(3).ChoosePreferred([]*Node{origin, other}, origin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if best.ID != "other" {
+		t.Fatalf("a draining origin must be dropped and the sandbox re-placed elsewhere, got %s", best.ID)
+	}
+}
+
+func TestChoosePreferredDropsNotReadyOrigin(t *testing.T) {
+	origin := nodeWith("origin", 0)
+	origin.ready.Store(false) // unreachable -> affinity dropped (E2B's Status() != Ready)
+	other := nodeWith("other", 5)
+	best, err := NewBestOfK(3).ChoosePreferred([]*Node{origin, other}, origin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if best.ID != "other" {
+		t.Fatalf("an unreachable origin must be dropped, got %s", best.ID)
+	}
+}
+
+func TestChoosePreferredDropsExcludedOrigin(t *testing.T) {
+	origin := nodeWith("origin", 0) // eligible, but its Resume just failed -> excluded -> dropped
+	other := nodeWith("other", 5)
+	best, err := NewBestOfK(3).ChoosePreferred([]*Node{origin, other}, origin, map[string]struct{}{"origin": {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if best.ID != "other" {
+		t.Fatalf("an excluded origin must be dropped (failover), got %s", best.ID)
+	}
+}
+
+func TestChoosePreferredNilFallsBackToBestOfK(t *testing.T) {
+	// Origin gone from the fleet -> caller passes nil -> behaves exactly like Choose (least-loaded).
+	a := nodeWith("a", 5)
+	b := nodeWith("b", 1)
+	best, err := NewBestOfK(3).ChoosePreferred([]*Node{a, b}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if best.ID != "b" {
+		t.Fatalf("nil preferred must fall back to the least-loaded node, got %s", best.ID)
+	}
+}
+
+func TestRegistryPickPreferred(t *testing.T) {
+	origin := NewNode("grpc-origin", "proxy-origin", &fakeRPC{}, DefaultCapacity)
+	other := NewNode("grpc-other", "proxy-other", &fakeRPC{}, DefaultCapacity)
+	reg := NewStaticRegistry([]*Node{origin, other}, len([]*Node{origin, other})+1)
+	// An eligible origin is honored (no poll, so both are ready with count 0).
+	if n, err := reg.PickPreferred(origin, nil); err != nil || n.ID != "grpc-origin" {
+		t.Fatalf("PickPreferred(eligible origin) = %v, %v; want grpc-origin", n, err)
+	}
+	// Once the origin drains, PickPreferred relocates to the other node.
+	origin.setDraining(true)
+	if n, err := reg.PickPreferred(origin, nil); err != nil || n.ID != "grpc-other" {
+		t.Fatalf("PickPreferred(draining origin) = %v, %v; want grpc-other", n, err)
+	}
+}
+
 func TestSampleInvariants(t *testing.T) {
 	// 6 nodes, 2 of them not-ready, one excluded -> 3 eligible. Sampling K=2 must return 2
 	// distinct, ready, non-excluded nodes; K=5 (> eligible) must return exactly the 3 eligible.
