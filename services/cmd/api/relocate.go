@@ -37,9 +37,10 @@ func newSnapshotBuildID() (string, error) {
 // it when the origin is draining. These two handlers are that mechanism's control plane; the
 // drain-aware node choice is placement.Registry.PickPreferred (Stage 26a). See docs/STAGE26_DESIGN.md.
 //
-// Scope: the real orchestrator's Pause/Resume return Unimplemented (a real per-sandbox live snapshot
-// is the Stage 20/22 producer, deferred -- D4), so on real VMs Pause here surfaces as 500. The
-// relocation SCHEDULING these handlers implement is verified in process against fake orchestrators
+// Scope: since Stage 26R the real orchestrator implements Pause -- a live checkpoint of the VM to
+// object storage, --nbd s3 mode only (FailedPrecondition otherwise); Resume stays Unimplemented
+// until 26R-d, so on real VMs a resume still surfaces as 500. The relocation SCHEDULING these
+// handlers implement is verified in process against fake orchestrators
 // (placement_integration_test.go), which is the multi-node story on one box (Stage 23/24 rationale).
 
 // handleSandboxPause: POST /sandboxes/{id}/pause -> checkpoint the sandbox and free its node so it

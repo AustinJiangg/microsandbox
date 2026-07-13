@@ -52,21 +52,41 @@ func (g *sandboxService) List(ctx context.Context, _ *emptypb.Empty) (*pb.Sandbo
 	return &pb.SandboxListResponse{SandboxIds: g.srv.list()}, nil
 }
 
-// Pause / Resume are the RPCs behind sandbox relocation (Stage 26). The api-side scheduling --
-// pause a sandbox, then resume it on another node when its origin is draining -- is fully
-// implemented and verified in process (cmd/api). The real per-sandbox live snapshot is
-// deliberately NOT wired here: the only way to checkpoint a running VM is fc.MicroVM.Snapshot,
-// the Stage 20/22 live-VM re-snapshot path (consistent only under v1.10.1 + --nbd + a writable
-// overlay, and so far used only for build-time template snapshots). Wiring it per-sandbox is a
-// clean follow-on that reuses that producer (fc.MicroVM.Snapshot + storage.PublishMemfileDiff /
-// PublishRootfsDiff) behind these same RPCs; until then the real orchestrator answers a clear
-// Unimplemented rather than pretend to persist state it hasn't. See docs/STAGE26_DESIGN.md D4.
+// Pause / Resume are the RPCs behind sandbox relocation (Stage 26). Since Stage 26R the real
+// orchestrator implements Pause: a live checkpoint of the running VM to object storage under the
+// api-minted build id, via the Stage 20/22 re-snapshot producer (server.pause, relocate.go). It
+// works only in --nbd s3 mode -- the checkpoint is COW diffs in the bucket and the rootfs diff
+// comes from the per-VM writable NBD overlay -- so other modes answer FailedPrecondition (the RPC
+// *is* implemented; the mode can't satisfy it -- design D3, deliberately distinct from
+// Unimplemented). Resume (the explicit-build-id restore) lands with 26R-d and answers
+// Unimplemented until then. See docs/STAGE26R_DESIGN.md.
 func (g *sandboxService) Pause(ctx context.Context, req *pb.SandboxPauseRequest) (*emptypb.Empty, error) {
-	return nil, status.Error(codes.Unimplemented,
-		"per-sandbox live pause is not wired on this orchestrator; it reuses the Stage 20/22 snapshot producer (deferred) -- see docs/STAGE26_DESIGN.md")
+	if g.srv.storage == nil || !g.srv.useNBD {
+		return nil, status.Error(codes.FailedPrecondition,
+			"per-sandbox pause requires --nbd s3 mode: the checkpoint is COW diffs in object storage and the rootfs diff needs the per-VM writable NBD overlay -- see docs/STAGE26R_DESIGN.md")
+	}
+	if req.GetBuildId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "pause needs the api-minted build_id to store the checkpoint under")
+	}
+	ls, ok := g.srv.lookup(req.GetSandboxId())
+	if !ok {
+		return nil, status.Error(codes.NotFound, "no such sandbox: "+req.GetSandboxId())
+	}
+	// In --nbd s3 mode every sandbox is created with a writable overlay + base build id
+	// (buildRootfsBacking); guard the invariant here rather than panic inside the producer.
+	if ls.overlay == nil || ls.baseBuildID == "" {
+		return nil, status.Error(codes.Internal, "sandbox has no writable overlay/base build id to checkpoint against")
+	}
+	if err := g.srv.pause(ctx, ls, req.GetBuildId()); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	// The checkpoint is durable; the paused VM is now redundant, so free the node's slot. A false
+	// here means a concurrent delete won the teardown race -- the checkpoint still stands.
+	g.srv.destroy(req.GetSandboxId())
+	return &emptypb.Empty{}, nil
 }
 
 func (g *sandboxService) Resume(ctx context.Context, req *pb.SandboxResumeRequest) (*pb.SandboxResumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented,
-		"per-sandbox resume is not wired on this orchestrator; it reuses the Stage 20/22 snapshot producer (deferred) -- see docs/STAGE26_DESIGN.md")
+		"per-sandbox resume is not wired on this orchestrator yet (Stage 26R-d) -- see docs/STAGE26R_DESIGN.md")
 }

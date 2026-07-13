@@ -518,6 +518,19 @@ func (vm *MicroVM) Snapshot(vmstatePath, memfilePath string) error {
 	return nil
 }
 
+// Unpause resumes a VM that Snapshot left Paused -- the same PATCH /vm {Resumed} the Restore
+// load-paused path issues. The per-sandbox pause (Stage 26R) calls it best-effort when a
+// checkpoint fails mid-way, so the failure degrades to "sandbox still running" rather than
+// leaving the vCPUs frozen; the build-time producer never needs it (it Destroys the VM either way).
+func (vm *MicroVM) Unpause() error {
+	apiSock := filepath.Join(vm.workdir, "api.sock")
+	if status, err := firecrackerAPI(apiSock, "PATCH", "/vm",
+		map[string]any{"state": "Resumed"}, 15*time.Second); err != nil || (status != 200 && status != 204) {
+		return fmt.Errorf("resume paused VM: status=%d err=%v", status, err)
+	}
+	return nil
+}
+
 // ConsoleTail grabs the tail of the guest serial log, for startup-failure
 // diagnostics only. Ported from client.py's _microvm_log.
 func (vm *MicroVM) ConsoleTail() string {

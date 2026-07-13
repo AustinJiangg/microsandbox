@@ -52,6 +52,13 @@ type liveSandbox struct {
 	vm          *fc.MicroVM
 	overlay     *block.Overlay // the VM's writable rootfs overlay; owned by the VM (closed by Destroy via the backing's Close)
 	baseBuildID string         // the build whose artifacts this VM booted from (ResolveAlias at create; the snapshot id after a resume)
+
+	// bakedRootfsPath is the host rootfs path this VM's drive was configured with -- what a
+	// re-snapshot of this VM bakes into its vmstate. A per-sandbox Pause records it as the
+	// checkpoint's rootfs.path so Resume binds the checkpoint's NBD device over exactly the path
+	// the vmstate references (Stage 26R): tmpl.Rootfs for a cold start or a template restored from
+	// its own snapshot, the base's recorded baked path for a layered child.
+	bakedRootfsPath string
 }
 
 // Destroy tears down the VM (satisfying pool.VM). The overlay needs no separate teardown --
@@ -263,7 +270,13 @@ func (s *server) restoreHealthy(tmpl template.Template) (*liveSandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &liveSandbox{vm: vm, overlay: overlay, baseBuildID: buildID}, nil
+	// The drive path the restored vmstate references: the backing's recorded baked path for a
+	// layered child, else the template's own rootfs (fc.Restore binds over the same fallback).
+	bakedPath := rootfs.BakedPath
+	if bakedPath == "" {
+		bakedPath = tmpl.Rootfs
+	}
+	return &liveSandbox{vm: vm, overlay: overlay, baseBuildID: buildID, bakedRootfsPath: bakedPath}, nil
 }
 
 func (s *server) spawnHealthy(tmpl template.Template) (*liveSandbox, error) {
@@ -278,7 +291,9 @@ func (s *server) spawnHealthy(tmpl template.Template) (*liveSandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &liveSandbox{vm: vm, overlay: overlay, baseBuildID: buildID}, nil
+	// Spawn always boots path_on_host=tmpl.Rootfs (Stage 22 E1: the NBD device is bound over it),
+	// so that is the path a re-snapshot of this VM would bake.
+	return &liveSandbox{vm: vm, overlay: overlay, baseBuildID: buildID, bakedRootfsPath: tmpl.Rootfs}, nil
 }
 
 // LayeredSnapshot produces a layered template's snapshot by E2B's one-run-two-diffs model (Stage 22): it
